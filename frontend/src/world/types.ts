@@ -1,6 +1,6 @@
 /** Shared data model — mirrors backend/app/world_state.py. */
 
-export type ObjectType = 'HOUSE' | 'CAR' | 'TREE' | 'BOX' | 'DEBRIS';
+export type ObjectType = 'HOUSE' | 'CAR' | 'TREE' | 'BOX' | 'DEBRIS' | 'ROCK';
 
 export type ObjectState =
   | 'INTACT' | 'MOVING' | 'FLOATING' | 'COLLIDING'
@@ -66,7 +66,7 @@ export interface SimEvent {
 }
 
 /** Add new object types here (+ backend defaults) without touching the core. */
-export const OBJECT_TYPES: ObjectType[] = ['HOUSE', 'CAR', 'TREE', 'BOX', 'DEBRIS'];
+export const OBJECT_TYPES: ObjectType[] = ['HOUSE', 'CAR', 'TREE', 'BOX', 'DEBRIS', 'ROCK'];
 
 export const OBJECT_COLORS: Record<string, number> = {
   HOUSE: 0xc9a27a,
@@ -74,4 +74,5 @@ export const OBJECT_COLORS: Record<string, number> = {
   TREE: 0x3f9d4e,
   BOX: 0xb08050,
   DEBRIS: 0x808080,
+  ROCK: 0x6b6b64,
 };

@@ -405,5 +405,68 @@ class TreeRootAnchorTests(unittest.TestCase):
         self.assertGreater(float(snapshot["radii"][0]), 0.0)
 
 
+class RiverbedRockTests(unittest.TestCase):
+    """v0.4 RiverLab (docs/04_TZ_v0.3_roadmap.md): ROCK reuses root_strength
+    (tuned so high it is permanently immovable) and the existing
+    footprint_radius/scale machinery, so 'effect scales with rock size'
+    needs no new property -- verify that's actually true, not assumed."""
+
+    def test_rock_never_moves_under_extreme_drag_and_impact(self) -> None:
+        world = WorldState()
+        world.add_object("ROCK", [0.0, 0.0, 0.0])
+        world.add_object("CAR", [-2.0, 0.0, 0.0])
+        events = EventLog()
+        rigid = ForceRigidBodySystem()
+        rigid.initialize(world, fluid=None, events=events)
+        car_idx = rigid.buffer.ids.index(next(o.id for o in world.objects.values() if o.type == "CAR"))
+        rigid.buffer.velocities[car_idx] = [20.0, 0.0, 0.0]  # ram it straight into the rock
+        extreme_flow = {"depths": np.array([5.0, 5.0], dtype=np.float32),
+                        "velocities": np.array([[20.0, 0.0, 0.0], [20.0, 0.0, 0.0]], dtype=np.float32)}
+        rock_idx = rigid.buffer.ids.index(next(o.id for o in world.objects.values() if o.type == "ROCK"))
+        start_pos = rigid.buffer.positions[rock_idx].copy()
+        for step in range(1, 300):
+            rigid.step(1 / 60, step / 60, extreme_flow)
+        np.testing.assert_allclose(rigid.buffer.positions[rock_idx], start_pos, atol=1e-4)
+        self.assertTrue(bool(rigid.buffer.rooted[rock_idx]))
+        rock = next(o for o in world.objects.values() if o.type == "ROCK")
+        self.assertEqual(rock.state, ObjectState.INTACT.value)
+
+    def test_rock_footprint_scales_with_object_scale(self) -> None:
+        world = WorldState()
+        small = world.add_object("ROCK", [-10.0, 0.0, 0.0])
+        big = world.add_object("ROCK", [10.0, 0.0, 0.0])
+        big.scale = [3.0, 3.0, 3.0]
+        rigid = ForceRigidBodySystem()
+        rigid.initialize(world, fluid=None, events=EventLog())
+        small_idx = rigid.buffer.index[small.id]
+        big_idx = rigid.buffer.index[big.id]
+        self.assertGreater(float(rigid.buffer.footprint_radii[big_idx]),
+                            float(rigid.buffer.footprint_radii[small_idx]) * 2.5)
+
+    def test_bigger_rock_disrupts_flow_more_than_smaller_rock(self) -> None:
+        def run(scale: float) -> np.ndarray:
+            world = WorldState()
+            w, h = world.terrain.width, world.terrain.height
+            xs = np.linspace(0.0, 2.5, w + 1, dtype=np.float32)
+            world.terrain.heights[:, :] = np.tile(xs, (h + 1, 1))
+            world.water.level = 1.0
+            solver = ShallowWaterFluidSolver()
+            solver.initialize(world)
+            base_radius = 1.0
+            for _ in range(60):
+                solver.set_boundaries(world.terrain, {"positions": [[-30.0, 0.0, 0.0]],
+                                                       "radii": [base_radius * scale]})
+                solver.advance(1 / 60, 8, 1 / 120)
+            return solver._depth.copy()
+
+        baseline = run(scale=0.01)  # negligible obstacle, close to "no rock"
+        small_rock = run(scale=1.0)
+        big_rock = run(scale=4.0)
+
+        disruption_small = float(np.abs(small_rock - baseline).sum())
+        disruption_big = float(np.abs(big_rock - baseline).sum())
+        self.assertGreater(disruption_big, disruption_small)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

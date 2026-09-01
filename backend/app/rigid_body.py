@@ -278,7 +278,13 @@ class ForceRigidBodySystem(_ArrayRigidBodySystem):
             return new_events, uprooted
 
         normal = diff / np.maximum(dist[..., None], 1e-6)
-        inv_mass = 1.0 / np.maximum(buf.masses, 1e-6)
+        # A still-rooted body (TREE, ROCK) must behave as infinitely heavy in
+        # collision response -- not just resist water drag. Using its real
+        # mass here was a real bug: a 2000kg ROCK still got physically
+        # shoved by a fast CAR's positional correction even though
+        # root_strength said it should be immovable; only the *velocity*
+        # path respected rootedness, not this position path.
+        inv_mass = np.where(buf.rooted, 0.0, 1.0 / np.maximum(buf.masses, 1e-6))
         total_inv_mass = inv_mass[:, None] + inv_mass[None, :]
 
         # positional correction: split overlap by inverse-mass ratio so the

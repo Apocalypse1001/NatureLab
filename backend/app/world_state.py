@@ -43,6 +43,7 @@ class ObjectType(str, enum.Enum):
     TREE = "TREE"
     BOX = "BOX"
     DEBRIS = "DEBRIS"
+    ROCK = "ROCK"
 
     @classmethod
     def register(cls, name: str) -> "ObjectType":
@@ -101,6 +102,15 @@ OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
     ObjectType.DEBRIS: {"mass": 10.0, "friction": 0.4, "buoyancy": 0.9, "drag": 0.4,
                         "foundation_height": 0.0, "damage_resistance": 0.2,
                         "footprint_radius": 0.7, "root_strength": 0.0},
+    # Riverbed rock (RiverLab, docs/04_TZ_v0.3_roadmap.md v0.4): not a Schauberger
+    # special case, just root_strength turned up so high it's permanently
+    # immovable by anything this sim can produce -- reuses 100% of the existing
+    # obstacle/root machinery. footprint_radius already scales with obj.scale
+    # (already editable in the UI), so "effect scales with rock size" falls
+    # out for free instead of needing a new property.
+    ObjectType.ROCK: {"mass": 2000.0, "friction": 0.9, "buoyancy": 0.0, "drag": 0.1,
+                      "foundation_height": 0.0, "damage_resistance": 1.0,
+                      "footprint_radius": 1.0, "root_strength": 1e8},
 }
 
 

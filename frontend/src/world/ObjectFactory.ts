@@ -66,6 +66,19 @@ const builders: Record<string, () => THREE.Group> = {
     g.add(rock);
     return g;
   },
+  ROCK: () => {
+    // Riverbed rock (RiverLab): rounder/larger than DEBRIS, sits low/half-
+    // buried since it is permanently anchored (root_strength), not tumbling
+    // free like a piece of debris.
+    const g = new THREE.Group();
+    const rock = new THREE.Mesh(
+      new THREE.DodecahedronGeometry(1.0, 0),
+      new THREE.MeshStandardMaterial({ color: OBJECT_COLORS.ROCK, flatShading: true, roughness: 1.0 }));
+    rock.position.y = 0.3;
+    rock.scale.y = 0.7;
+    g.add(rock);
+    return g;
+  },
 };
 
 export function registerObjectBuilder(type: string, build: () => THREE.Group): void {
