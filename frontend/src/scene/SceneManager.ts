@@ -19,6 +19,8 @@ export class SceneManager {
 
   private raycaster = new THREE.Raycaster();
   private _selectionHelper: THREE.BoxHelper | null = null;
+  private _waterTimeUniform: { value: number } | null = null;
+  private _clockStart = performance.now();
 
   constructor(canvas: HTMLCanvasElement, private terrain: TerrainGrid) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -61,14 +63,46 @@ export class SceneManager {
     // level, matching the original placeholder behaviour.
     const waterGeo = new THREE.PlaneGeometry(
       this.terrain.sizeM, this.terrain.sizeM, this.terrain.width, this.terrain.height);
-    this.waterMesh = new THREE.Mesh(waterGeo, new THREE.MeshStandardMaterial({
+    const waterMat = new THREE.MeshStandardMaterial({
       color: 0x2f7fd0, transparent: true, opacity: 0.55,
       roughness: 0.15, metalness: 0.1, depthWrite: false, side: THREE.DoubleSide,
-    }));
+    });
+    // Cheap cosmetic ripple: perturbs the already-real per-cell height
+    // (set in updateWaterField from backend depth data) with a small
+    // animated offset, GPU-side, so it doesn't touch the physics data or
+    // need a per-frame CPU vertex pass. Purely decorative -- see
+    // docs/04_TZ_v0.3_roadmap.md priorities: physics/visibility first,
+    // "beautiful" last. This is the first (cheap-tier) pass at that.
+    waterMat.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = { value: 0 };
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', `
+          #include <common>
+          uniform float uTime;
+        `)
+        .replace('#include <beginnormal_vertex>', `
+          #include <beginnormal_vertex>
+          float dRippleX = cos(position.x * 0.8 + uTime * 1.6) * 0.024;
+          float dRippleY = cos(position.y * 0.6 - uTime * 1.1) * 0.015;
+          objectNormal = normalize(objectNormal + vec3(-dRippleX, -dRippleY, 0.0));
+        `)
+        .replace('#include <begin_vertex>', `
+          #include <begin_vertex>
+          transformed.z += sin(position.x * 0.8 + uTime * 1.6) * 0.03
+                          + sin(position.y * 0.6 - uTime * 1.1) * 0.025;
+        `);
+      this._waterTimeUniform = shader.uniforms.uTime;
+    };
+    this.waterMesh = new THREE.Mesh(waterGeo, waterMat);
     this.waterMesh.rotation.x = -Math.PI / 2;
     this.scene.add(this.waterMesh);
 
-    // particle points buffer (filled from backend binary frames)
+    // particle points buffer (filled from backend binary frames). This is
+    // the original Warp-connectivity demo particle stream, unrelated to
+    // the real water field above -- kept simulating/streaming (tests and
+    // the Warp selftest depend on it) but hidden from view by default,
+    // see setParticles(): it visually read as unrelated "dust" once real
+    // water rendering existed, not as water.
     const positions = new Float32Array(1024 * 3);
     const pgeo = new THREE.BufferGeometry();
     pgeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
@@ -78,6 +112,7 @@ export class SceneManager {
       transparent: true, opacity: 0.9,
     }));
     this.points.frustumCulled = false;
+    this.points.visible = false;
     this.scene.add(this.points);
 
     this.scene.add(this.objectsRoot);
@@ -154,7 +189,14 @@ export class SceneManager {
     attr.array.set(buffer.subarray(0, count * 3));
     attr.needsUpdate = true;
     this.points.geometry.setDrawRange(0, count);
-    this.points.visible = count > 0;
+    // stays hidden regardless of count -- see the constructor note: this
+    // demo stream is superseded by the real water mesh, kept simulating
+    // for the Warp-connectivity tests, not for display.
+  }
+
+  /** Toggle the raw Warp-connectivity demo particle stream (debug use). */
+  setDebugParticlesVisible(visible: boolean): void {
+    this.points.visible = visible;
   }
 
   // ------------------------------------------------------------------ objects
@@ -225,6 +267,9 @@ export class SceneManager {
   render(): void {
     this.controls.update();
     if (this._selectionHelper) this._selectionHelper.update();
+    if (this._waterTimeUniform) {
+      this._waterTimeUniform.value = (performance.now() - this._clockStart) / 1000;
+    }
     this.renderer.render(this.scene, this.camera);
   }
 }
