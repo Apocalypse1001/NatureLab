@@ -15,6 +15,7 @@ export interface UICallbacks {
   removeSelected(): void;
   updateObject(id: string, patch: Partial<ObjectData>): void;
   setWaterLevel(v: number): void;
+  setErosion(enabled: boolean): void;
   setTracerVisible(visible: boolean): void;
   setTracerCount(count: number): void;
   setTool(tool: 'select' | 'raise' | 'lower'): void;
@@ -132,6 +133,17 @@ export class UI {
     water.append(slider);
     panel.append(water);
 
+    // RiverLab (v0.6.0): let the river cut and fill its own bed. Off by default
+    // -- with it on, the terrain the user built is no longer the terrain they
+    // get back, so it has to be a deliberate choice, not a hidden one.
+    const erosionRow = el('label', 'slider-row', 'Erosion (river reshapes the bed)');
+    const erosion = el('input', '') as HTMLInputElement;
+    erosion.id = 'water-erosion';
+    erosion.type = 'checkbox';
+    erosion.onchange = () => this.cb.setErosion(erosion.checked);
+    erosionRow.append(erosion);
+    panel.append(erosionRow);
+
     panel.append(el('h3', '', 'Flow visualization'));
     const tracerToggle = el('label', 'slider-row', 'Show physical tracers');
     const visible = el('input', '') as HTMLInputElement;
@@ -222,6 +234,11 @@ export class UI {
     this.statusEl.className = status === 'RUNNING' ? 'ok' : '';
   }
 
+  setErosionEnabled(enabled: boolean): void {
+    const box = this.root.querySelector<HTMLInputElement>('#water-erosion');
+    if (box) box.checked = enabled;
+  }
+
   setReservoirLevel(level: number): void {
     const slider = this.root.querySelector<HTMLInputElement>('#water-level');
     const output = this.root.querySelector<HTMLOutputElement>('#water-out');
@@ -234,7 +251,12 @@ export class UI {
   }
 
   setSimStats(state: { sim_fps: number; objects: number; particles: number;
-                       fluid?: { wet_cells?: number; volume_m3?: number } }): void {
+                       fluid?: { wet_cells?: number; volume_m3?: number;
+                                 erosion?: boolean } }): void {
+    // Keep the checkbox honest about what the solver is actually doing: the
+    // flag is streamed live, so a world loaded with erosion on -- or a state
+    // changed by anything other than this checkbox -- still shows correctly.
+    if (state.fluid?.erosion !== undefined) this.setErosionEnabled(state.fluid.erosion);
     this.simFpsEl.textContent = state.sim_fps.toFixed(1);
     this.objectsEl.textContent = String(state.objects);
     this.particlesEl.textContent = state.particles.toLocaleString();

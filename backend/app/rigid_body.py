@@ -198,11 +198,21 @@ class PlaceholderRigidBodySystem(RigidBodySystem):
     def unregister_body(self, object_id: str) -> None: self.buffer.unregister(object_id)
 
     def obstacle_snapshot(self) -> dict:
+        """What the fluid solver needs to know about bodies as boundaries.
+
+        `bed_heights` (v0.6.0) carries each body's `metadata.bed_height`: zero
+        for everything that acts as a wall, positive for a ROCK, which the
+        solver turns into a raised bed dome instead of a solid cell. Reported
+        for every body rather than only for ROCK so the solver decides what is
+        solid and what is bed from the data, not from a type name.
+        """
         objects = [self._world.objects[oid] for oid in self.buffer.ids]
         return {"ids": list(self.buffer.ids),
                 "positions": self.buffer.positions.copy(),
                 "rotations": self.buffer.rotations.copy(),
                 "types": [obj.type for obj in objects],
+                "bed_heights": [float(obj.metadata.get("bed_height", 0.0))
+                                for obj in objects],
                  "scales": self.buffer.scales.copy()}
 
     def _resolve_collisions(self, dynamic: np.ndarray) -> None:

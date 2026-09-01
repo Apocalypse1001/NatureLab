@@ -66,6 +66,22 @@ const builders: Record<string, () => THREE.Group> = {
     g.add(rock);
     return g;
   },
+  ROCK: () => {
+    // A riverbed boulder. The visible radius matches
+    // fluid_solver.ROCK_BASE_RADIUS_M so what the user sees is what the water
+    // feels: the solver raises the effective bed by a dome of exactly this
+    // footprint. Scaling the object scales both, horizontally and vertically.
+    const g = new THREE.Group();
+    const rock = new THREE.Mesh(
+      new THREE.IcosahedronGeometry(1.5, 1),
+      new THREE.MeshStandardMaterial({
+        color: OBJECT_COLORS.ROCK, flatShading: true, roughness: 0.95,
+      }));
+    rock.scale.y = 0.55;          // a dome, not a ball -- water passes over it
+    rock.position.y = 0.35;
+    g.add(rock);
+    return g;
+  },
   GAUGE: () => {
     const g = new THREE.Group();
     const material = new THREE.MeshStandardMaterial({
@@ -102,5 +118,5 @@ export function applyTransform(group: THREE.Group, obj: ObjectData): void {
 
 /** Approximate half-heights for placing objects on the selected tool. */
 export function objectHalfSize(type: string): number {
-  return { HOUSE: 0, CAR: 0, TREE: 0, BOX: 0, DEBRIS: 0, GAUGE: 0 }[type] ?? 0;
+  return { HOUSE: 0, CAR: 0, TREE: 0, BOX: 0, DEBRIS: 0, ROCK: 0, GAUGE: 0 }[type] ?? 0;
 }

@@ -14,6 +14,7 @@ export class WorldStore {
   terrain = new TerrainGrid();
   objects = new Map<string, ObjectData>();
   waterLevel = 0.5;
+  erosionEnabled = false;
   waterVisible = true;
   waterFrameTime = 0;
   waterFrameCount = 0;
@@ -40,6 +41,7 @@ export class WorldStore {
     this.terrain.loadHeights(world.terrain.heights);
     this.objects = new Map(world.objects.map((o) => [o.id, o]));
     this.waterLevel = world.water.level;
+    this.erosionEnabled = world.water.erosion_enabled ?? false;
     this.waterVisible = world.water.visible;
     this.waterFrameTime = 0;
     this.waterFrameCount = 0;

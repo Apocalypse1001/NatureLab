@@ -90,6 +90,7 @@ const ui = new UI(uiHost, {
     if (currentSimStatus === 'IDLE') sceneManager.setWater(v, store.waterVisible);
     net.send({ op: 'water_level', level: v });
   },
+  setErosion: (enabled) => net.send({ op: 'water_erosion', enabled }),
   setTracerVisible: (visible) => sceneManager.setTracerVisible(visible),
   setTracerCount: (count) => sceneManager.setTracerDisplayLimit(count),
   setTool: (tool) => editor.setTool(tool),
@@ -112,6 +113,7 @@ function applyWorld(world: WorldData, simStatus: string): void {
   sceneManager.setWater(store.waterLevel, store.waterVisible);
   sceneManager.clearTracers();
   ui.setReservoirLevel(store.waterLevel);
+  ui.setErosionEnabled(store.erosionEnabled);
   sceneManager.clearObjects();
   for (const obj of world.objects) sceneManager.setObject(obj);
   ui.refreshObjectList([...store.objects.values()], null);

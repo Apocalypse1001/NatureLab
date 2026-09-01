@@ -15,7 +15,7 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional
 from . import config, protocol
 from .compute_engine import ComputeEngine, create_engine
 from .events import EventLog, EventType
-from .fluid_solver import FluidSolver, create_fluid_solver
+from .fluid_solver import SOLID_OBSTACLE_TYPES, FluidSolver, create_fluid_solver
 from .persistence import load_world, save_world
 from .rigid_body import PlaceholderRigidBodySystem, RigidBodySystem
 from .world_state import WorldState, finite_number, vector3
@@ -58,6 +58,7 @@ class SimulationManager:
         self.terrain_revision = 0
         self.obstacle_revision = 0
         self._obstacle_snapshot: Optional[dict] = None
+        self._last_terrain_resync = 0.0
         self._gauges: Dict[str, GaugeRuntime] = {}
         self.selftest_result: Dict[str, Any] = {}
         try:
@@ -93,6 +94,20 @@ class SimulationManager:
             "fluid": self.fluid.diagnostics(),
         }
 
+    @staticmethod
+    def _affects_fluid_boundary(obj) -> bool:
+        """Does this object change what the fluid solver sees as a boundary?
+
+        True for solid walls (HOUSE) and for riverbed bodies (a positive
+        `bed_height`, i.e. ROCK). Both go through the same obstacle-revision
+        path, so adding, moving, scaling or deleting either one re-rasterizes
+        the solid mask AND the bed domes. This used to be a bare
+        `type == "HOUSE"` check in three places, which meant a ROCK could be
+        dragged across the map without the water ever noticing.
+        """
+        return (obj.type in SOLID_OBSTACLE_TYPES
+                or float(obj.metadata.get("bed_height", 0.0)) > 0.0)
+
     # ------------------------------------------------------------------ world edits
     def apply_object_add(self, obj: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(obj, dict):
@@ -113,7 +128,7 @@ class SimulationManager:
         self.rigid.register_body(created)
         if created.type == "GAUGE":
             self._gauges[created.id] = GaugeRuntime(next_history_time=self.sim_time)
-        if created.type == "HOUSE":
+        if self._affects_fluid_boundary(created):
             self.obstacle_revision += 1
             self._obstacle_snapshot = None
         return created.to_dict()
@@ -150,7 +165,8 @@ class SimulationManager:
         self.rigid.update_body(obj)
         if obj.type == "GAUGE" and "position" in fields:
             self._gauges[obj.id] = GaugeRuntime(next_history_time=self.sim_time)
-        if obj.type == "HOUSE" and any(key in fields for key in ("position", "rotation", "scale")):
+        if (self._affects_fluid_boundary(obj)
+                and any(key in fields for key in ("position", "rotation", "scale", "metadata"))):
             self.obstacle_revision += 1
             self._obstacle_snapshot = None
 
@@ -159,7 +175,7 @@ class SimulationManager:
         self.rigid.unregister_body(obj_id)
         self.world.objects.pop(obj_id, None)
         self._gauges.pop(obj_id, None)
-        if obj is not None and obj.type == "HOUSE":
+        if obj is not None and self._affects_fluid_boundary(obj):
             self.obstacle_revision += 1
             self._obstacle_snapshot = None
 
@@ -184,6 +200,11 @@ class SimulationManager:
         self.world.water.level = finite_number(level, "water.level")
         if hasattr(self.fluid, "set_level"):
             self.fluid.set_level(self.world.water.level)
+
+    def apply_water_erosion(self, enabled: bool) -> None:
+        """RiverLab erosion toggle. Read live each tick in _step_once(), so --
+        unlike a terrain brush -- it takes effect immediately while RUNNING."""
+        self.world.water.erosion_enabled = bool(enabled)
 
     # ------------------------------------------------------------------ clock control
     def start(self) -> None:
@@ -253,6 +274,7 @@ class SimulationManager:
         self.initial = None
         self.status = self.IDLE
         self.sim_time = 0.0
+        self._last_terrain_resync = 0.0
         self.fluid.initialize(self.world)
         self.rigid.initialize(self.world, self.fluid, self.events)
         self._reset_gauges()
@@ -271,6 +293,9 @@ class SimulationManager:
         dt = config.FIXED_DT
         if config.ENABLE_DEBUG_PARTICLES:
             self.engine.step_particles(dt)
+        if hasattr(self.fluid, "set_erosion"):
+            # read live, so the RiverLab toggle takes effect while RUNNING
+            self.fluid.set_erosion(self.world.water.erosion_enabled)
         if self._obstacle_snapshot is None:
             self._obstacle_snapshot = self.rigid.obstacle_snapshot()
         self.fluid.set_boundaries(self.world.terrain, self._obstacle_snapshot,
@@ -379,6 +404,30 @@ class SimulationManager:
                     await self._send_bytes(protocol.encode_water_height(heights, self.sim_time))
                 except Exception:
                     return
+            # RiverLab (v0.6.0): erosion mutates the bed on the GPU every tick,
+            # so without this the new channel would be physically real on the
+            # backend and invisible on screen -- the exact class of bug this
+            # project already hit once with water itself (see the architectural
+            # principle in docs/04_TZ_v0.3_roadmap.md). Reuses the terrain_patch
+            # message the frontend already applies, throttled because it is JSON
+            # on the text channel plus a full device-to-host readback.
+            if (self.status == self.RUNNING and self.world.water.erosion_enabled
+                    and hasattr(self.fluid, "get_terrain_heights")
+                    and self.sim_time - self._last_terrain_resync
+                    >= config.TERRAIN_RESYNC_INTERVAL_S):
+                self._last_terrain_resync = self.sim_time
+                eroded = self.fluid.get_terrain_heights()
+                if eroded.size == self.world.terrain.heights.size:
+                    self.world.terrain.heights = eroded.reshape(
+                        self.world.terrain.heights.shape)
+                    try:
+                        await self._send_text(json.dumps({
+                            "type": "terrain_patch",
+                            "heights": self.world.terrain.to_list(),
+                            "checksum": self.world.terrain.checksum(),
+                        }, separators=(",", ":")))
+                    except Exception:
+                        return
         moved = [(oid, obj.position, obj.state)
                  for oid, obj in self.world.objects.items()
                  if obj.state != "INTACT"]

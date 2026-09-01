@@ -1,4 +1,4 @@
-"""Reproducible NatureLab 0.5.0 physics and measurement regression tests."""
+"""Reproducible NatureLab physics and measurement regression tests."""
 from __future__ import annotations
 
 import asyncio
@@ -437,6 +437,284 @@ class Physics04Tests(unittest.IsolatedAsyncioTestCase):
             other.advance(1 / 60, 8, 1 / 120)
         self.assertTrue(np.allclose(self.manager.fluid._h.numpy(), other._h.numpy(),
                                     rtol=0.0, atol=1.0e-6))
+
+
+class RiverLabTests(unittest.IsolatedAsyncioTestCase):
+    """v0.6.0: sediment transport, erosion/deposition, and ROCK as riverbed.
+
+    Every test here follows the project's own acceptance rule (docs/04, section
+    2, item 4): change a cause and show the effect changes. A test that only
+    asserts "the solver did not crash" is not evidence of physics.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+        self.manager.attach(self._text, self._binary)
+        self.text_frames: list[str] = []
+        self.binary_frames: list[bytes] = []
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    async def _text(self, value: str) -> None:
+        self.text_frames.append(value)
+
+    async def _binary(self, value: bytes) -> None:
+        self.binary_frames.append(value)
+
+    def _bed(self) -> np.ndarray:
+        return self.manager.fluid.get_terrain_heights().reshape(101, 101)
+
+    def _depth(self) -> np.ndarray:
+        return np.asarray(self.manager.fluid._h.numpy(), dtype=np.float32).reshape(101, 101)
+
+    def _run(self, steps: int) -> None:
+        for _ in range(steps):
+            self.manager._step_once()
+
+    async def test_erosion_off_leaves_the_bed_exactly_as_built(self) -> None:
+        """The control for every other test here: with the toggle off, the
+        terrain the user built is bit-for-bit the terrain they get back, even
+        with water running over it for ten seconds."""
+        before = self.manager.world.terrain.heights.copy()
+        self.manager.apply_water_level(1.0)
+        self.manager.start()
+        self._run(600)
+        self.assertFalse(self.manager.world.water.erosion_enabled)
+        np.testing.assert_array_equal(self._bed(), before)
+
+    async def test_flowing_water_erodes_its_bed_and_carries_the_load(self) -> None:
+        """Cause: erosion on. Effect: the bed under the current is cut down and
+        the removed material is in suspension, not deleted."""
+        self.manager.apply_water_level(1.0)
+        self.manager.apply_water_erosion(True)
+        self.manager.start()
+        before = self._bed().copy()
+        self._run(600)
+        after = self._bed()
+        wet = self._depth() > 0.05
+        self.assertTrue(wet.any(), "no water reached the bed at all")
+        self.assertLess(float(after[wet].mean()), float(before[wet].mean()) - 1e-4,
+                        "wet bed was not eroded")
+        # dry ground must never erode -- there is no water there to do it
+        dry = self._depth() <= config.FLUID_DRY_DEPTH
+        np.testing.assert_allclose(after[dry], before[dry], atol=1e-6)
+        self.assertGreater(self.manager.fluid.diagnostics()["suspended_sediment"], 0.0)
+
+    async def test_faster_water_erodes_more_than_slower_water(self) -> None:
+        """The capacity law is capacity = k*|u|*h, so the same bed under a
+        deeper, faster inflow must lose more material. One cause changed: the
+        inflow height."""
+        losses = []
+        for level in (0.6, 2.0):
+            manager = SimulationManager()
+            manager.apply_water_level(level)
+            manager.apply_water_erosion(True)
+            manager.start()
+            before = manager.fluid.get_terrain_heights().copy()
+            for _ in range(600):
+                manager._step_once()
+            after = manager.fluid.get_terrain_heights()
+            losses.append(float(np.sum(before - after)))
+            manager.stop()
+        self.assertGreater(losses[1], losses[0] * 1.2,
+                           f"deeper/faster flow did not erode more: {losses}")
+
+    async def test_rock_is_bed_not_wall_and_deflects_the_current_sideways(self) -> None:
+        """A boulder must never enter the solid mask (that is a wall -- correct
+        for a house, wrong for a rock). It shows up as a raised bed instead, and
+        the proof it does something is lateral velocity, which is exactly zero
+        in the same straight channel without it."""
+        self.manager.apply_water_level(1.0)
+        self.manager.start()
+        self._run(600)
+        straight = float(np.abs(np.asarray(self.manager.fluid._v.numpy())).max())
+
+        rocky = SimulationManager()
+        rocky.apply_object_add({"type": "ROCK", "position": [-42.0, 0.0, 0.0]})
+        rocky.apply_water_level(1.0)
+        rocky.start()
+        for _ in range(600):
+            rocky._step_once()
+        deflected = float(np.abs(np.asarray(rocky.fluid._v.numpy())).max())
+        solid_cells = int(np.count_nonzero(rocky.fluid._obstacle_host))
+        bed_rise = float(rocky.fluid._bed_offset_host.max())
+        rocky.stop()
+
+        self.assertEqual(solid_cells, 0, "ROCK was rasterized as a solid wall")
+        self.assertGreater(bed_rise, 0.5, "ROCK did not raise the bed")
+        self.assertEqual(straight, 0.0, "the straight channel already had lateral flow")
+        self.assertGreater(deflected, 1e-3, "ROCK did not deflect the current")
+
+    async def test_taller_rock_deflects_more_than_a_flatter_one(self) -> None:
+        """Scale Y is already the "how much of the channel does this block"
+        control: same footprint, different height, measurably different
+        deflection. No extra UI knob, deliberately."""
+        deflection = []
+        for scale_y in (0.3, 1.0):
+            manager = SimulationManager()
+            rock = manager.apply_object_add({"type": "ROCK", "position": [-42.0, 0.0, 0.0]})
+            manager.apply_object_update(rock["id"], {"scale": [1.0, scale_y, 1.0]})
+            manager.apply_water_level(1.0)
+            manager.start()
+            for _ in range(600):
+                manager._step_once()
+            deflection.append(float(np.abs(np.asarray(manager.fluid._v.numpy())).max()))
+            manager.stop()
+        self.assertGreater(deflection[1], deflection[0] * 1.2,
+                           f"the taller rock did not deflect more: {deflection}")
+
+    async def test_deep_water_flows_over_a_rock_but_never_over_a_house(self) -> None:
+        """The whole reason a boulder is bed and not wall: submerge it deeply
+        enough and the river runs over the top of it. A house never lets water
+        through, at any depth."""
+        rocky = SimulationManager()
+        rocky.apply_object_add({"type": "ROCK", "position": [-42.0, 0.0, 0.0]})
+        rocky.apply_water_level(4.0)
+        rocky.start()
+        for _ in range(600):
+            rocky._step_once()
+        over_rock = float(np.asarray(rocky.fluid._h.numpy()).reshape(101, 101)[50, 8])
+        rocky.stop()
+
+        walled = SimulationManager()
+        walled.apply_object_add({"type": "HOUSE", "position": [-42.0, 0.0, 0.0]})
+        walled.apply_water_level(4.0)
+        walled.start()
+        for _ in range(600):
+            walled._step_once()
+        over_house = float(np.asarray(walled.fluid._h.numpy()).reshape(101, 101)[50, 8])
+        walled.stop()
+
+        self.assertGreater(over_rock, 0.1, "deep water did not pass over the rock")
+        self.assertEqual(over_house, 0.0, "water entered a solid house")
+
+    async def test_moving_a_rock_leaves_no_crater_behind(self) -> None:
+        """The dome is recomputed from live positions and never written into the
+        world's terrain, so relocating a boulder must leave no permanent mound
+        where it used to be."""
+        rock = self.manager.apply_object_add({"type": "ROCK", "position": [-42.0, 0.0, 0.0]})
+        self.manager.apply_water_level(1.0)
+        self.manager.start()
+        self._run(120)
+        raised_before = float(self.manager.fluid._bed_offset_host.reshape(101, 101)[50, 8])
+        self.manager.apply_object_update(rock["id"], {"position": [20.0, 0.0, 0.0]})
+        self._run(5)
+        offset = self.manager.fluid._bed_offset_host.reshape(101, 101)
+        self.assertGreater(raised_before, 0.1)
+        self.assertLess(float(offset[50, 8]), 1e-6, "the rock left a mound behind it")
+        self.assertGreater(float(offset[50, 70]), 0.1, "the rock did not raise its new bed")
+        # and the world's own terrain was never touched by the dome at all
+        self.assertEqual(float(self.manager.world.terrain.heights[50, 8]), 0.0)
+
+    async def test_the_river_does_not_dig_out_from_under_a_boulder(self) -> None:
+        """BED_EROSION_SHIELD: a boulder is bedrock. Without this the rock digs
+        a symmetric pit under itself, and the flank/lee asymmetry that actually
+        moves a channel is swamped by it."""
+        self.manager.apply_object_add({"type": "ROCK", "position": [-42.0, 0.0, 0.0]})
+        self.manager.apply_water_level(1.5)
+        self.manager.apply_water_erosion(True)
+        self.manager.start()
+        before = self._bed().copy()
+        self._run(900)
+        after = self._bed()
+        shielded = self.manager.fluid._bed_offset_host.reshape(101, 101) > config.BED_EROSION_SHIELD
+        self.assertTrue(shielded.any())
+        # The shield blocks erosion only. Sediment settling ON a boulder is real
+        # and is deliberately still allowed, so the honest assertion is that the
+        # bed under a rock never goes DOWN -- not that it never changes.
+        self.assertGreaterEqual(float((after[shielded] - before[shielded]).min()), -1e-6,
+                                "the river dug out from under the boulder")
+        # meanwhile the unshielded channel around it did erode, or this proves nothing
+        open_bed = (~shielded) & (self._depth() > 0.05)
+        self.assertLess(float(after[open_bed].mean()), float(before[open_bed].mean()))
+
+    async def test_erosion_streams_the_new_terrain_to_the_frontend(self) -> None:
+        """The architectural principle from docs/04: physical state that exists
+        on the backend must be visible on the frontend in the same commit. A
+        correct solver whose result never reaches the screen is, to the user,
+        indistinguishable from no physics at all."""
+        self.manager.apply_water_level(1.5)
+        self.manager.apply_water_erosion(True)
+        self.manager.start()
+        self._run(int(config.TERRAIN_RESYNC_INTERVAL_S * 60) + 30)
+        await self.manager._stream()
+        patches = [json.loads(f) for f in self.text_frames]
+        terrain = [p for p in patches if p.get("type") == "terrain_patch"]
+        self.assertTrue(terrain, "eroded terrain was never streamed")
+        self.assertEqual(terrain[-1]["checksum"], self.manager.world.terrain.checksum())
+        self.assertEqual(len(terrain[-1]["heights"]), 101 * 101)
+
+    async def test_erosion_does_not_re_upload_terrain_to_the_gpu(self) -> None:
+        """Erosion mutates the bed on the GPU every tick, so it must NOT go
+        through the host revision path -- that would re-upload the whole grid 60
+        times a second and stomp the live GPU state with a stale host copy."""
+        self.manager.apply_water_level(1.5)
+        self.manager.apply_water_erosion(True)
+        self.manager.start()
+        uploads = self.manager.fluid.terrain_gpu_uploads
+        before = self._bed().copy()
+        self._run(600)
+        self.assertEqual(self.manager.fluid.terrain_gpu_uploads, uploads)
+        self.assertFalse(np.array_equal(self._bed(), before),
+                         "nothing eroded, so this test proved nothing")
+
+    async def test_a_rock_changes_where_the_river_cuts_its_bed(self) -> None:
+        """The headline RiverLab acceptance test, in the River A vs River B form
+        docs/01_vision.md asks for: two identical channels, one boulder the only
+        difference, and the beds must end up measurably different. This is the
+        closed loop the vision names -- flow -> erosion -> terrain -> flow --
+        not just "a rock deflects water"."""
+        def cut(with_rock: bool) -> np.ndarray:
+            manager = SimulationManager()
+            if with_rock:
+                manager.apply_object_add({"type": "ROCK", "position": [-42.0, 0.0, 0.0]})
+            manager.apply_water_level(1.5)
+            manager.apply_water_erosion(True)
+            manager.start()
+            before = manager.fluid.get_terrain_heights().copy()
+            for _ in range(1200):
+                manager._step_once()
+            after = manager.fluid.get_terrain_heights()
+            manager.stop()
+            return (after - before).reshape(101, 101)
+
+        river_a = cut(False)
+        river_b = cut(True)
+        self.assertLess(float(river_a.min()), -0.01, "River A did not erode at all")
+        difference = np.abs(river_b - river_a)
+        self.assertGreater(int((difference > 0.01).sum()), 20,
+                           "the boulder changed almost nothing about the bed")
+        # and the change is concentrated at and downstream of the rock (column 8),
+        # not spread uniformly -- otherwise this is drift, not causation
+        near = difference[:, 6:20].max()
+        far = difference[:, 60:].max()
+        self.assertGreater(float(near), float(far) * 3.0,
+                           f"bed change was not localised to the rock: {near} vs {far}")
+
+    async def test_rock_survives_a_save_load_round_trip(self) -> None:
+        """bed_height reaches metadata via default_properties rather than a
+        hand-written key list, and a world saved before the property existed
+        backfills from the type defaults -- otherwise an older ROCK silently
+        comes back as a flat patch of riverbed."""
+        self.manager.apply_object_add({"type": "ROCK", "position": [-10.0, 0.0, 4.0]})
+        self.manager.save("rocktest")
+        self.manager.load("rocktest")
+        rock = next(o for o in self.manager.world.objects.values() if o.type == "ROCK")
+        self.assertGreater(float(rock.metadata["bed_height"]), 0.0)
+
+        legacy = WorldState.from_dict({
+            "terrain": {"width": 100, "height": 100, "cell_size": 1.0,
+                        "heights": self.manager.world.terrain.to_list()},
+            "water": {"level": 0.5, "visible": True},
+            "environment": self.manager.world.environment.to_dict(),
+            "objects": [{"id": "Rock_009", "type": "ROCK", "position": [0, 0, 0],
+                         "rotation": [0, 0, 0], "scale": [1, 1, 1], "metadata": {}}],
+        })
+        self.assertGreater(
+            float(legacy.objects["Rock_009"].metadata["bed_height"]), 0.0,
+            "a pre-v0.6.0 ROCK came back with no bed height")
 
 
 if __name__ == "__main__":

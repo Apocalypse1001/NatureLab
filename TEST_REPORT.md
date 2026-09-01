@@ -1,12 +1,9 @@
-# NatureLab 0.5.1 — TEST REPORT
+# NatureLab 0.6.0 — TEST REPORT
 
 Дата: 2026-09-02. Windows 11 Pro 10.0.26200, RTX 5090 32 GB (sm_120, mempool enabled),
 CUDA Toolkit 12.9 / driver 13.2, Python 3.12.7, NVIDIA Warp 1.17.0, Node v24.18.0.
 
-Все результаты ниже — фактический вывод команд на этой машине в этой сессии, а не
-перенос отчёта донорской сборки. Версия 0.5.1 не добавляет своей физики: это перенос
-GPU-движка 0.5.0 в git-репозиторий, поэтому основной смысл прогона — доказать, что
-движок работает **здесь** ровно так же, как работал там.
+Всё ниже — фактический вывод команд на этой машине в этой сессии.
 
 ## 1. Backend physics (CUDA / Warp)
 
@@ -15,132 +12,101 @@ python tests\test_backend.py
 ```
 
 ```text
-Ran 21 tests in 8.894s
+Ran 33 tests in 16.788s
 
 OK
-Warp 1.17.0 initialized:
-   CUDA Toolkit 12.9, Driver 13.2
-   Devices:
-     "cpu"      : "Intel64 Family 6 Model 198 Stepping 2, GenuineIntel"
-     "cuda:0"   : "NVIDIA GeForce RTX 5090" (32 GiB, sm_120, mempool enabled)
 ```
 
-| Physics regression | Result |
+**33 / 33 PASS** — 21 регрессионных теста движка 0.5.1 (ни один не изменён) плюс 12 новых
+приёмочных тестов RiverLab. Каждый новый тест построен по правилу проекта «изменил
+причину — изменилось следствие», а не «солвер не упал»:
+
+| RiverLab acceptance test | Что доказывает |
 |---|---|
-| Warp selftest 100 000 points на `cuda:0` | PASS |
-| Lake at rest: h постоянна, max velocity 0 | PASS |
-| Closed edge slug: ошибка объёма за 10 с | PASS |
-| Ridge 3 м блокирует 0.5 м воды | PASS |
-| HOUSE footprint отклоняет поток | PASS |
-| Rotated HOUSE — точная yaw-OBB маска | PASS |
-| MOVE/REMOVE HOUSE без phantom water | PASS |
-| Adaptive CFL увеличивает подшаги на глубоком/быстром поле | PASS |
-| Стартовая вода занимает только два столбца у западной кромки | PASS |
-| Runtime edge inflow создаёт физический поток вниз по течению | PASS |
-| BOX реагирует раньше CAR при равной глубине | PASS |
-| 3x3 footprint: частичное смачивание, приподнятый объект сухой | PASS |
-| Миграция buoyancy world v1 и валидация 0..1 | PASS |
-| Нулевая вода/поток оставляет объект строго INTACT | PASS |
-| Плавающие объекты разрешают столкновения | PASS |
-| GAUGE: точечный сэмпл, отсутствие влияния на поток, история, RESET | PASS |
-| Стриминг GPU tracers | PASS |
-| RESET и детерминированный replay | PASS |
-| Terrain edit во время RUNNING отклоняется | PASS |
-| START идемпотентен, RUNNING edit sequence + RESET | PASS |
-| Строгая валидация трансформаций и протокола | PASS |
+| `erosion_off_leaves_the_bed_exactly_as_built` | контроль: с выключенным тумблером рельеф бит-в-бит тот же после 10 с воды |
+| `flowing_water_erodes_its_bed_and_carries_the_load` | мокрое дно срезается, сухое — нет, снятый грунт во взвеси, а не удалён |
+| `faster_water_erodes_more_than_slower_water` | меняется только высота притока → суммарный вынос растёт ≥1.2× |
+| `a_rock_changes_where_the_river_cuts_its_bed` | **River A vs River B**: один валун — единственное отличие |
+| `rock_is_bed_not_wall_and_deflects_the_current_sideways` | ROCK не попал в маску солидов; в прямом канале боковая скорость строго 0, с камнем — нет |
+| `taller_rock_deflects_more_than_a_flatter_one` | `Scale Y` реально управляет перекрытием русла (≥1.2×) |
+| `deep_water_flows_over_a_rock_but_never_over_a_house` | глубокая вода переливается через валун; в дом не входит никогда |
+| `moving_a_rock_leaves_no_crater_behind` | купол транзиентный, рельеф мира не тронут |
+| `the_river_does_not_dig_out_from_under_a_boulder` | `BED_EROSION_SHIELD`: под камнем дно не опускается, вокруг — размывается |
+| `erosion_streams_the_new_terrain_to_the_frontend` | архитектурный принцип: состояние бэкенда видно на фронтенде |
+| `erosion_does_not_re_upload_terrain_to_the_gpu` | счётчик загрузок не растёт, но дно изменилось |
+| `rock_survives_a_save_load_round_trip` | `bed_height` доходит через `default_properties`; мир до v0.6.0 добирает его из дефолтов |
 
-**21 / 21 PASS.**
+## 2. Главный причинный результат — River A vs River B
 
-## 2. Browser + WebSocket E2E
+Два одинаковых канала, отличие ровно одно: в River B добавлен валун. 60 с модельного
+времени, эрозия включена.
+
+```text
+River A (без камня)  изменение дна: min -0.7885  max +0.0759
+River B (один камень) изменение дна: min -0.7933  max +0.2170
+разница, вызванная только камнем: max |dz| = 0.5053 м в точке (50, 8)
+  подветренная зона, ряд 50, столбец 12: A -0.1443   B -0.3214
+  клеток, где камень изменил дно более чем на 1 см: 194
+```
+
+Камень более чем удвоил глубину размыва прямо за собой и втрое увеличил максимальное
+осаждение по карте. Отдельно отмечу честно: на 60 с подветренная зона **размывается**, а
+не заносится — переход к осаждению в тени за камнем наступает позже, когда поток
+перестраивается. Это измерено, а не подогнано под учебную картинку.
+
+## 3. Browser + WebSocket E2E
 
 ```bat
 node tests\e2e.mjs
 ```
 
 ```text
-PASS  frontend + WebSocket
-PASS  strict WebSocket root validation
-PASS  Warp selftest (cuda:0)
-PASS  dynamic particle buffer >120k
-PASS  terrain frontend/backend checksum
-PASS  Warp shallow-water heightfield
-PASS  dry and HOUSE water triangles masked
-PASS  initial wave starts at left map edge
-PASS  flow tracer display controls
-PASS  GPU flow tracers follow fluid velocity
-PASS  GAUGE depth, speed, arrival and history
-PASS  runtime Water level updates fluid field
-PASS  START idempotent
-PASS  floating objects resolve collisions
-PASS  RUNNING edit sequence + RESET integrity
-PASS  rotation xyz round-trip
-PASS  no browser errors
-NatureLab 0.5.1 E2E: PASS
+NatureLab 0.6.0 E2E: PASS
 ```
 
-**17 / 17 PASS.** Строка версии читается с работающего backend (`/api/status`), а не
-захардкожена — раньше она осталась бы `0.5.0` после бампа.
+**17 / 17 PASS.**
 
-## 3. Агентский драйвер (живое приложение)
+## 4. Агентский драйвер (живое приложение)
 
 ```bat
 node .claude\skills\run-naturelab\driver.mjs --smoke
 ```
 
 ```text
-ok SMOKE PASS  sim=RUNNING t = 5.3s objects=1 triangles=27444 depth 1m flat -> west 0.556m / east 0m
+ok SMOKE PASS  sim=RUNNING t = 5.3s objects=1 triangles=27044 depth 1m flat -> west 0.556m / east 0m
 ```
 
-Сценарий с тремя объектами, edge inflow 1.5 м, 20 с симуляции:
+Сценарий с двумя валунами, домом, притоком 1.5 м и включённой эрозией, 25 с:
 
 ```text
-t= 6s   {"cells":10201,"wet":2525,"max":1.5,"mean":0.296,"westMean":1.148,"eastMean":0,"drawnTriangles":4800}
-t=20s   {"cells":10201,"wet":6329,"max":1.5,"mean":0.631,"westMean":1.329,"eastMean":0,"drawnTriangles":12309}
+{"cells":10201,"wet":7333,"max":2.467,"mean":0.818,"westMean":1.734,"eastMean":0,
+ "drawnTriangles":14343}
+средняя высота рельефа во фронтенде: -0.0409 м
 ```
 
-Смоченных клеток 2525 → 6329 за 14 с — фронт физически движется, а не заливает карту
-мгновенно. Скриншот `t20.png` показывает воду с чёткой неровной кромкой фронта на
-западной половине и сухой рельеф на восточной; событие `Car_001 OBJECT_FLOATING
-(gpu_buoyancy_supports_weight)` в логе. FPS 57, Sim FPS 58.5.
+Отрицательная средняя высота **во фронтенде** — прямое доказательство, что размытое дно
+дошло до экрана, а не осталось на бэкенде. Скриншот `riverlab.png`: заголовок
+`NatureLab 0.6.0`, кнопка `Rock`, два купола-валуна в потоке, чёткая кромка фронта,
+FPS 53 / Sim FPS 59.0, RTX 5090.
 
-## 4. Прямой прогон солвера (без сервера и браузера)
+Проверено отдельно: чекбокс `Erosion` отражает живое состояние солвера даже когда флаг
+меняют мимо UI (сырой WebSocket-операцией) — `document.querySelector('#water-erosion').checked → true`.
 
-```text
-t=  10s  wet= 3030  vol=  2290.4 m3  vmax=2.605 m/s  substeps=1
-t=  20s  wet= 5151  vol=  3484.0 m3  vmax=2.023 m/s  substeps=1
-t=  30s  wet= 6868  vol=  4311.3 m3  vmax=1.587 m/s  substeps=1
-```
-
-Объём растёт монотонно (вода поступает только через кромку-источник), максимальная
-скорость физически правдоподобна (1.5–2.6 м/с), CFL держит один подшаг.
-
-## 5. Проверка релизного архива
+## 5. Релизный архив
 
 ```bat
-python tools\make_release.py
+python tools\make_release.py 0.6.0
 ```
 
-```text
-releases\NatureLab_v0.5.1.zip  57 files  0.3 MB
-```
-
-SHA-256 записан в `releases/CHECKSUMS.txt`. Внутрь архива этот файл намеренно не
-кладётся: контрольная сумма архива не может лежать в нём самом — она бы
-самоинвалидировалась при каждой пересборке.
-
-Архив распакован во временный каталог и запущен оттуда **без пересборки фронтенда**:
-
-```text
-GET /  -> 200
-{"app":"NatureLab","backend":"online","engine":{"version":"0.5.1","engine":"warp",
- "warp_available":true,"cuda":true,"device":"cuda:0","gpu_name":"NVIDIA GeForce RTX 5090", ...}}
-```
-
-**PASS** — требование «распаковал и запустил любую версию» выполняется.
+SHA-256 записан в `releases/CHECKSUMS.txt` (внутрь архива не кладётся — иначе бы
+самоинвалидировался при каждой пересборке).
 
 ## Не проверено
 
 - `tests\run_all.bat` целиком и `tests\test_launcher.ps1` — требуют собранного
   `NatureLab.exe` (PyInstaller). `build_exe.bat` в этой сессии не запускался.
-- 30-минутный soak — донорская сборка проходила его (108 000 шагов, 849.3 шага/с);
-  здесь код тот же, но повторно на этой машине не прогонялся.
+- Долгий soak на эрозии: самый длинный прогон здесь — 60 с модельного времени.
+  Поведение на десятках минут непрерывного размыва не измерялось.
+- Перенос сдвига осадка полулагранжев и **не является строго консервативным** — это
+  заявлено в докстринге кернела, а не подразумевается. Тесты проверяют причинность
+  (где грунт снят и где положен), а не тождество сохранения, которого эта схема не даёт.

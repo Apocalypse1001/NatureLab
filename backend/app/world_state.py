@@ -43,6 +43,7 @@ class ObjectType(str, enum.Enum):
     TREE = "TREE"
     BOX = "BOX"
     DEBRIS = "DEBRIS"
+    ROCK = "ROCK"
     GAUGE = "GAUGE"
 
     @classmethod
@@ -95,6 +96,16 @@ OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
                          "ground_contact_area": 0.1, "cross_sectional_area": 0.2,
                          "is_static": False,
                           "foundation_height": 0.0, "damage_resistance": 0.2},
+    # A riverbed boulder: part of the bed, not a rigid body and not a wall.
+    # `bed_height` is what the fluid solver raises the effective bed by; the
+    # dome's radius comes from the object's horizontal scale and its height
+    # from the vertical one, so Scale Y in the properties panel is already the
+    # control for "how much of the channel does this rock block".
+    ObjectType.ROCK:  {"mass": 4000.0, "friction": 0.9, "buoyancy": 0.0,
+                       "volume_m3": 1.5, "drag_coefficient": 0.9,
+                       "ground_contact_area": 3.0, "cross_sectional_area": 1.5,
+                       "is_static": True, "bed_height": 0.8,
+                       "foundation_height": 0.0, "damage_resistance": 1.0},
     ObjectType.GAUGE: {"mass": 1.0, "friction": 0.0, "buoyancy": 0.0,
                        "volume_m3": 1.0, "drag_coefficient": 1.0,
                        "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
@@ -103,11 +114,21 @@ OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
 }
 
 
+# Properties that live as real columns on WorldObject rather than in metadata.
+# Everything else in default_properties() lands in metadata automatically -- the
+# list used to be written out by hand in add_object(), which meant every new
+# property (bed_height was the one that bit) silently never reached an object.
+_COLUMN_PROPERTIES = frozenset({
+    "mass", "friction", "buoyancy", "volume_m3", "drag_coefficient",
+    "ground_contact_area", "cross_sectional_area", "is_static",
+})
+
+
 def default_properties(obj_type: str) -> Dict[str, float]:
     base = {"mass": 100.0, "friction": 0.5, "buoyancy": 1.0,
             "volume_m3": 0.1, "drag_coefficient": 1.0,
             "ground_contact_area": 0.5, "cross_sectional_area": 0.5,
-            "is_static": False,
+            "is_static": False, "bed_height": 0.0,
             "foundation_height": 0.0, "damage_resistance": 0.5}
     base.update(OBJECT_DEFAULTS.get(ObjectType.register(obj_type), {}))
     return base
@@ -170,6 +191,14 @@ class WorldObject:
         metadata = values.get("metadata", {})
         if not isinstance(metadata, dict):
             raise ValueError("metadata must be an object")
+        # Backfill metadata keys the saved world predates, from this type's
+        # defaults rather than from zero. A ROCK saved before v0.6.0 has no
+        # bed_height; defaulting it to 0 would silently turn the boulder into a
+        # flat patch of riverbed with no effect at all, which reads as "the
+        # feature is broken" rather than "this save is older".
+        for key, fallback in default_properties(values["type"]).items():
+            if key not in _COLUMN_PROPERTIES and key not in metadata:
+                metadata[key] = fallback
         values["metadata"] = metadata
         return WorldObject(**values)
 
@@ -245,9 +274,14 @@ class TerrainGrid:
 class WaterState:
     level: float = 0.5          # meters above terrain datum
     visible: bool = True
+    # RiverLab (v0.6.0): let the river cut and fill its own bed. Off by default
+    # so an existing FloodLab experiment behaves exactly as it did in 0.5.1 and
+    # the terrain the user built stays the terrain they built.
+    erosion_enabled: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"level": self.level, "visible": self.visible}
+        return {"level": self.level, "visible": self.visible,
+                "erosion_enabled": self.erosion_enabled}
 
 
 @dataclass
@@ -282,8 +316,7 @@ class WorldState:
             ground_contact_area=props["ground_contact_area"],
             cross_sectional_area=props["cross_sectional_area"],
             is_static=props["is_static"],
-            metadata={"foundation_height": props["foundation_height"],
-                      "damage_resistance": props["damage_resistance"]},
+            metadata={key: props[key] for key in props if key not in _COLUMN_PROPERTIES},
         )
         self.objects[obj.id] = obj
         return obj

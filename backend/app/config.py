@@ -9,7 +9,7 @@ from pathlib import Path
 # running build always says which version it is -- the donor 0.5.0 tree carried
 # no version string anywhere, which made "which build am I looking at?"
 # answerable only by file timestamps.
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_DIR = BACKEND_DIR.parent
@@ -46,3 +46,36 @@ WATER_DENSITY = 1000.0
 RIGID_STOP_SPEED = 1.0e-3
 GAUGE_HISTORY_CAPACITY = 600
 GAUGE_HISTORY_INTERVAL = 0.1
+
+# --------------------------------------------------------------- RiverLab (v0.6.0)
+# Sediment transport / erosion / deposition on the same grid as h/u/v.
+# capacity = SEDIMENT_CAPACITY_SCALE * |velocity| * depth: a cell carrying less
+# than its capacity picks material up off the bed, a cell carrying more drops it.
+# On the pre-0.5.1 diffusion solver this had to use a flux surrogate in place of
+# velocity (see docs/05_audit_v0.4_water.md, P1-1); with the Warp solver |u| is a
+# real m/s, so the capacity law is the textbook one rather than a proxy.
+#
+# Deliberately slow relative to a single flood: real fluvial erosion is slow
+# compared with one flood event, and keeping it slow means a short FloodLab run
+# is not measurably disturbed while a longer RiverLab "River A vs River B"
+# comparison still shows a clear difference.
+SEDIMENT_CAPACITY_SCALE = 0.05   # capacity = this * |velocity| * depth
+SEDIMENT_ERODE_RATE = 0.3        # fraction of the capacity gap eroded per second
+SEDIMENT_DEPOSIT_RATE = 0.3      # fraction of the excess deposited per second
+SEDIMENT_MAX_BED_CHANGE = 0.02   # m per second, clamp so one tick cannot dig a pit
+TERRAIN_RESYNC_INTERVAL_S = 1.0  # how often eroded terrain is re-broadcast while RUNNING
+
+# Riverbed rocks (ROCK). A boulder is not a rigid body with mass and buoyancy and
+# it is not a wall either -- it is part of the bed. So ROCK is deliberately NOT
+# rasterized into the binary solid mask (which is an infinitely tall wall, right
+# for a house, wrong for a boulder); instead it raises the *effective* bed by a
+# dome of `bed_height`. Everything the RiverLab item asks for falls out of that
+# one choice: flow is deflected around the dome near the bed, deep water still
+# passes over it, the effect scales with both the rock's size and where it sits,
+# and the flanks scour while the lee fills -- which is what makes a channel move.
+#
+# The dome lives in a separate array from the erodible bed, so erosion can mutate
+# the terrain under a rock while the dome itself is recomputed from live positions
+# every tick -- a rock that is moved or deleted therefore leaves no crater.
+BED_DOME_EXPONENT = 0.5      # 0.5 = hemispherical profile; 1.0 would be a cone
+BED_EROSION_SHIELD = 0.05    # bed offset (m) above which the terrain under a rock is unerodible

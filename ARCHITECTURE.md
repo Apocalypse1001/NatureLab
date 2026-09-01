@@ -1,4 +1,4 @@
-# NatureLab 0.5.1 - Architecture
+# NatureLab 0.6.0 - Architecture
 
 Проектная документация, которая объясняет *почему* архитектура такая, живёт в `docs/`:
 [`01_vision.md`](docs/01_vision.md) (цели и критерий качества),
@@ -71,6 +71,34 @@ little-endian float32 data. `WATER_HEIGHT` contains absolute Y elevations in row
 enters the fluid obstacle mask or collision pairs. SimulationManager records depth, absolute
 surface, horizontal speed and first wave-arrival time. Incremental samples are streamed in
 `sim_state`; backend and frontend histories are bounded to 600 entries at 10 Hz simulation time.
+
+## Sediment and bed (RiverLab, v0.6.0)
+
+The bed is deliberately split into three GPU arrays:
+
+```text
+_bed_terrain   erodible ground -- OWNED BY THE SOLVER, mutated every tick
+_bed_offset    ROCK domes -- rebuilt from live positions, never written to the world
+_bed           their sum -- the only one the flow kernels read
+```
+
+That split is what makes two otherwise conflicting requirements coexist. Erosion has
+to change the ground permanently, so `_bed_terrain` cannot stay a copy of
+`world.terrain` re-uploaded on a revision bump; a rock has to change the flow without
+leaving a crater when it moves, so its dome must be transient. Keeping them apart also
+means the existing, already-verified flow kernels were not touched: they still take a
+single `bed` array.
+
+`terrain_revision` therefore now means "the HOST changed the terrain" (brush, load,
+reset) and never fires for erosion. The eroded bed reaches the world -- and the screen
+-- through a throttled device-to-host readback plus the existing `terrain_patch`
+message, once per `TERRAIN_RESYNC_INTERVAL_S`.
+
+Whether a body is a wall or a riverbed is decided from data, not from a type name:
+`_is_solid()` treats anything carrying a positive `metadata.bed_height` as bed, and
+everything in `SOLID_OBSTACLE_TYPES` as wall. `SimulationManager._affects_fluid_boundary()`
+uses the same rule to decide when adding, moving, scaling or deleting an object must
+bump `obstacle_revision`.
 
 ## Versioning and releases
 

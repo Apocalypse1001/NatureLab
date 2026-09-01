@@ -119,6 +119,9 @@ async def _dispatch(ws: WebSocket, msg: dict) -> dict | None:
             patch = manager.apply_terrain_brush(msg["x"], msg["z"], msg["radius"],
                                                 msg["strength"])
             return {"type": "terrain_patch", **patch}
+        if op == "water_erosion":
+            manager.apply_water_erosion(bool(msg.get("enabled", False)))
+            return {"type": "ack", "op": op}
         if op == "water_level":
             manager.apply_water_level(msg["level"])
             return {"type": "ack", "op": op}

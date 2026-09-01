@@ -121,6 +121,123 @@ if WARP_IMPORTED:
 
 
     @wp.kernel
+    def _combine_bed(bed_terrain: wp.array(dtype=float),
+                     bed_offset: wp.array(dtype=float),
+                     bed: wp.array(dtype=float)):
+        """Effective bed = erodible terrain + rock domes.
+
+        Kept as a separate array so the flow kernels keep taking a single `bed`
+        (they are unchanged from the verified 0.5.1 versions), while erosion may
+        mutate `bed_terrain` freely and rock domes stay a transient overlay that
+        is rebuilt from live positions. That separation is what makes a moved or
+        deleted rock leave no crater behind.
+        """
+        idx = wp.tid()
+        bed[idx] = bed_terrain[idx] + bed_offset[idx]
+
+
+    @wp.kernel
+    def _erode_deposit(h: wp.array(dtype=float), u: wp.array(dtype=float),
+                       v: wp.array(dtype=float), bed_terrain: wp.array(dtype=float),
+                       bed_offset: wp.array(dtype=float),
+                       sediment: wp.array(dtype=float),
+                       solid: wp.array(dtype=wp.int32),
+                       next_sediment: wp.array(dtype=float),
+                       dt: float, capacity_scale: float, erode_rate: float,
+                       deposit_rate: float, max_change: float, shield: float,
+                       height_min: float, dry: float):
+        """Capacity-based exchange between the bed and suspended sediment.
+
+        capacity = scale * |velocity| * depth. Under capacity the flow picks
+        material up, over capacity it drops it. Water depth is deliberately NOT
+        adjusted for the material moved (the standard treatment in this
+        algorithm class): sediment volume is small next to water volume, and
+        leaving `h` alone keeps water mass conservation exactly intact, which
+        several existing tests rely on.
+        """
+        idx = wp.tid()
+        if solid[idx] != 0 or h[idx] <= dry:
+            next_sediment[idx] = sediment[idx]
+            return
+        speed = wp.sqrt(u[idx] * u[idx] + v[idx] * v[idx])
+        capacity = capacity_scale * speed * h[idx]
+        gap = capacity - sediment[idx]
+        limit = max_change * dt
+        if gap > 0.0:
+            amount = wp.min(gap * erode_rate * dt, limit)
+            # never dig through the world floor
+            amount = wp.min(amount, wp.max(0.0, bed_terrain[idx] - height_min))
+            # a boulder is bedrock: the river scours around it, not through it.
+            # Without this the rock digs a symmetric pit under itself and the
+            # flank-scour / lee-fill asymmetry that moves a channel is swamped.
+            if bed_offset[idx] > shield:
+                amount = 0.0
+            bed_terrain[idx] = bed_terrain[idx] - amount
+            next_sediment[idx] = sediment[idx] + amount
+        else:
+            amount = wp.min(wp.min(-gap, sediment[idx]) * deposit_rate * dt, limit)
+            bed_terrain[idx] = bed_terrain[idx] + amount
+            next_sediment[idx] = sediment[idx] - amount
+
+
+    @wp.kernel
+    def _advect_sediment(sediment: wp.array(dtype=float),
+                         next_sediment: wp.array(dtype=float),
+                         u: wp.array(dtype=float), v: wp.array(dtype=float),
+                         h: wp.array(dtype=float), solid: wp.array(dtype=wp.int32),
+                         width: int, height: int, dx: float, dt: float, dry: float):
+        """Semi-Lagrangian transport of suspended load by the real velocity field.
+
+        Back-traces one step and bilinearly samples, skipping solid/dry cells so
+        material is never drawn out of a wall or a dry bank. Semi-Lagrangian is
+        stable at any timestep but is not strictly conservative -- acceptable and
+        standard here, and stated rather than assumed: the acceptance tests below
+        check causal behaviour (where material is picked up and dropped), not a
+        conservation identity this scheme cannot provide.
+        """
+        idx = wp.tid()
+        i = idx % width
+        j = idx // width
+        if solid[idx] != 0 or h[idx] <= dry:
+            next_sediment[idx] = sediment[idx]
+            return
+        x = float(i) - u[idx] * dt / dx
+        z = float(j) - v[idx] * dt / dx
+        x = wp.clamp(x, 0.0, float(width - 1))
+        z = wp.clamp(z, 0.0, float(height - 1))
+        i0 = int(wp.floor(x))
+        j0 = int(wp.floor(z))
+        i1 = wp.min(i0 + 1, width - 1)
+        j1 = wp.min(j0 + 1, height - 1)
+        fx = x - float(i0)
+        fz = z - float(j0)
+        total = float(0.0)
+        weight = float(0.0)
+        for corner in range(4):
+            ci = i0
+            cj = j0
+            w = (1.0 - fx) * (1.0 - fz)
+            if corner == 1:
+                ci = i1
+                w = fx * (1.0 - fz)
+            if corner == 2:
+                cj = j1
+                w = (1.0 - fx) * fz
+            if corner == 3:
+                ci = i1
+                cj = j1
+                w = fx * fz
+            cidx = cj * width + ci
+            if solid[cidx] == 0 and h[cidx] > dry:
+                total = total + w * sediment[cidx]
+                weight = weight + w
+        if weight > 1.0e-6:
+            next_sediment[idx] = total / weight
+        else:
+            next_sediment[idx] = sediment[idx]
+
+
+    @wp.kernel
     def _advect_flow_tracers(particles: wp.array(dtype=wp.vec3),
                              h: wp.array(dtype=float), u: wp.array(dtype=float),
                              v: wp.array(dtype=float), bed: wp.array(dtype=float),
@@ -270,6 +387,17 @@ if WARP_IMPORTED:
             sample_velocity[n] = wp.vec3(0.0, 0.0, 0.0)
 
 
+# Body types that act as solid walls for the flow. A body carrying a positive
+# `bed_height` is riverbed instead and is excluded regardless of this set --
+# see WarpShallowWaterSolver._is_solid.
+SOLID_OBSTACLE_TYPES = frozenset({"HOUSE"})
+
+# A ROCK of scale 1 raises the bed over this radius, in metres. Matches the
+# radius of the ROCK mesh in frontend/src/world/ObjectFactory.ts so what the
+# user sees is what the water feels.
+ROCK_BASE_RADIUS_M = 1.5
+
+
 class FluidSolver:
     def initialize(self, world) -> None: ...
     def set_boundaries(self, terrain, obstacles: dict, terrain_revision=0,
@@ -347,8 +475,18 @@ class WarpShallowWaterSolver(FluidSolver):
         self._h = self._u = self._v = None
         self._next_h = self._next_u = self._next_v = None
         self._bed = self._obstacles = None
+        # v0.6.0 RiverLab: the bed is split in two. `_bed_terrain` is the real,
+        # erodible ground the solver now OWNS (erosion mutates it every tick, so
+        # it can no longer be a straight copy of world.terrain uploaded on a
+        # revision bump); `_bed_offset` holds ROCK domes, rebuilt from live
+        # positions whenever the obstacle set changes and never written back into
+        # the world. `_bed` is their sum and is what every flow kernel reads.
+        self._bed_terrain = self._bed_offset = None
+        self._sediment = self._next_sediment = None
         self._obstacle_host = np.zeros(0, dtype=np.int32)
+        self._bed_offset_host = np.zeros(0, dtype=np.float32)
         self._bed_host = np.zeros(0, dtype=np.float32)
+        self._erosion_enabled = True
         self._level = 0.5
         self._source_enabled = True
         self._seen_terrain_revision = -1
@@ -384,7 +522,12 @@ class WarpShallowWaterSolver(FluidSolver):
         self._next_h = wp.empty(self._count, dtype=float, device=self.device)
         self._next_u = wp.empty(self._count, dtype=float, device=self.device)
         self._next_v = wp.empty(self._count, dtype=float, device=self.device)
-        self._bed = wp.array(self._bed_host, dtype=float, device=self.device)
+        self._bed_terrain = wp.array(self._bed_host, dtype=float, device=self.device)
+        self._bed_offset_host = np.zeros(self._count, dtype=np.float32)
+        self._bed_offset = wp.array(self._bed_offset_host, dtype=float, device=self.device)
+        self._bed = wp.array(self._bed_host.copy(), dtype=float, device=self.device)
+        self._sediment = wp.zeros(self._count, dtype=float, device=self.device)
+        self._next_sediment = wp.empty(self._count, dtype=float, device=self.device)
         self._obstacles = wp.array(self._obstacle_host, dtype=wp.int32, device=self.device)
         self._diag_max_depth = wp.zeros(1, dtype=float, device=self.device)
         self._diag_max_speed = wp.zeros(1, dtype=float, device=self.device)
@@ -412,6 +555,7 @@ class WarpShallowWaterSolver(FluidSolver):
         tracers = np.column_stack((tracer_x, tracer_y, tracer_z)).astype(np.float32)
         tracers[depth[tracer_idx] <= config.FLUID_DRY_DEPTH, 1] = -100.0
         self._flow_particles = wp.array(tracers, dtype=wp.vec3, device=self.device)
+        self._recombine_bed()
         self._measure()
 
     def _build_obstacle_mask(self, terrain, obstacles: dict) -> np.ndarray:
@@ -420,8 +564,9 @@ class WarpShallowWaterSolver(FluidSolver):
         rotations = obstacles.get("rotations", [])
         scales = obstacles.get("scales", [])
         types = obstacles.get("types", [])
+        bed_heights = obstacles.get("bed_heights", [])
         for n, position in enumerate(positions):
-            if n >= len(types) or types[n] != "HOUSE":
+            if n >= len(types) or not self._is_solid(types[n], bed_heights, n):
                 continue
             scale = scales[n] if n < len(scales) else [1.0, 1.0, 1.0]
             yaw = float(rotations[n][1]) if n < len(rotations) else 0.0
@@ -453,6 +598,58 @@ class WarpShallowWaterSolver(FluidSolver):
                             and abs(local_z) <= half_z + epsilon):
                         mask[row * self._width + column] = 1
         return mask
+
+    @staticmethod
+    def _is_solid(obj_type: str, bed_heights, index: int) -> bool:
+        """Does this body act as an infinitely tall wall for the flow?
+
+        Expressed as data rather than a hard-coded type check (it used to be
+        literally `types[n] != "HOUSE"`), because v0.6.0 introduces the opposite
+        case: a body with `bed_height > 0` is riverbed, not wall, and must never
+        be rasterized into the solid mask however tall it looks. GAUGE stays out
+        of the mask too -- a measuring stick must not divert the water it
+        measures, which is asserted by its own test.
+        """
+        if index < len(bed_heights) and float(bed_heights[index]) > 0.0:
+            return False
+        return obj_type in SOLID_OBSTACLE_TYPES
+
+    def _build_bed_offset(self, terrain, obstacles: dict) -> np.ndarray:
+        """Raised-bed domes for riverbed bodies (ROCK), in grid order.
+
+        Radius comes from the body's horizontal scale and height from its
+        vertical one, so `Scale Y` in the properties panel is already the
+        "how much of the channel does this block" control -- no extra UI knob,
+        deliberately. The dome tapers as (1 - r^2/R^2)^BED_DOME_EXPONENT, i.e.
+        hemispherical at the default exponent.
+        """
+        offset = np.zeros(self._count, dtype=np.float32)
+        positions = obstacles.get("positions", []) if obstacles else []
+        if len(positions) == 0:
+            return offset
+        scales = obstacles.get("scales", [])
+        bed_heights = obstacles.get("bed_heights", [])
+        grid = offset.reshape(self._height, self._width)
+        yy, xx = np.mgrid[0:self._height, 0:self._width]
+        for n, position in enumerate(positions):
+            height = float(bed_heights[n]) if n < len(bed_heights) else 0.0
+            if height <= 0.0:
+                continue
+            scale = scales[n] if n < len(scales) else (1.0, 1.0, 1.0)
+            radius_m = ROCK_BASE_RADIUS_M * max(float(scale[0]), float(scale[2]))
+            radius_cells = max(1.0, radius_m / terrain.cell_size)
+            gx = float(position[0]) / terrain.cell_size + terrain.width / 2
+            gz = float(position[2]) / terrain.cell_size + terrain.height / 2
+            inside = np.clip(1.0 - ((xx - gx) ** 2 + (yy - gz) ** 2)
+                             / radius_cells ** 2, 0.0, 1.0)
+            dome = (height * float(scale[1])) * inside ** config.BED_DOME_EXPONENT
+            np.maximum(grid, dome.astype(np.float32), out=grid)
+        return offset
+
+    def _recombine_bed(self) -> None:
+        wp.launch(_combine_bed, dim=self._count,
+                  inputs=[self._bed_terrain, self._bed_offset, self._bed],
+                  device=self.device)
 
     def _remap_obstacles(self, new_mask: np.ndarray) -> None:
         h, u, v = self._host_fields()
@@ -486,11 +683,21 @@ class WarpShallowWaterSolver(FluidSolver):
 
     def set_boundaries(self, terrain, obstacles: dict, terrain_revision=0,
                        obstacle_revision=0) -> None:
+        """Re-upload only what a revision bump says actually changed.
+
+        A revision bump means the HOST changed the terrain -- a brush stroke, a
+        loaded world, a reset. It deliberately does NOT cover erosion: the
+        solver owns `_bed_terrain` while RUNNING and mutates it on the GPU every
+        tick, so bumping a revision for erosion would both re-upload needlessly
+        and stomp the GPU-side state with a stale host copy. That is also why
+        the "600 unchanged steps do not increase the upload counters" test keeps
+        holding with erosion switched on.
+        """
         self._terrain = terrain
         changed = False
         if terrain_revision != self._seen_terrain_revision:
             self._bed_host = np.ascontiguousarray(terrain.heights, dtype=np.float32).ravel().copy()
-            self._bed = wp.array(self._bed_host, dtype=float, device=self.device)
+            self._bed_terrain = wp.array(self._bed_host, dtype=float, device=self.device)
             self._seen_terrain_revision = terrain_revision
             self.terrain_gpu_uploads += 1
             changed = True
@@ -500,11 +707,36 @@ class WarpShallowWaterSolver(FluidSolver):
                 self._remap_obstacles(new_mask)
                 self._obstacle_host = new_mask
                 self._obstacles = wp.array(new_mask, dtype=wp.int32, device=self.device)
+            new_offset = self._build_bed_offset(terrain, obstacles)
+            if not np.array_equal(new_offset, self._bed_offset_host):
+                self._bed_offset_host = new_offset
+                self._bed_offset = wp.array(new_offset, dtype=float, device=self.device)
             self._seen_obstacle_revision = obstacle_revision
             self.obstacle_gpu_uploads += 1
             changed = True
         if changed:
+            self._recombine_bed()
             self._measure()
+
+    def set_erosion(self, enabled: bool) -> None:
+        """RiverLab erosion on/off, read live each tick by SimulationManager.
+
+        Off leaves the bed exactly as the user built it, which is what a short
+        FloodLab experiment wants; on lets the river cut its own channel.
+        """
+        self._erosion_enabled = bool(enabled)
+
+    def get_terrain_heights(self) -> np.ndarray:
+        """Current erodible bed, in TerrainGrid order, read back from the GPU.
+
+        Rock domes are excluded on purpose -- they are not terrain, and writing
+        them back would leave a permanent crater-and-mound the moment the rock
+        moves. Called on a throttle (config.TERRAIN_RESYNC_INTERVAL_S), not per
+        tick: it is a device-to-host copy of the whole grid.
+        """
+        if self._bed_terrain is None:
+            return np.zeros(0, dtype=np.float32)
+        return np.asarray(self._bed_terrain.numpy(), dtype=np.float32)
 
     def _measure(self) -> None:
         if self._h is None:
@@ -556,6 +788,33 @@ class WarpShallowWaterSolver(FluidSolver):
                           self._bed, self._obstacles, self._width,
                           self._height, config.FLUID_SOURCE_COLUMNS,
                           self._level], device=self.device)
+            if self._erosion_enabled:
+                # RiverLab (v0.6.0): pick material up where the flow is fast and
+                # deep, drop it where it slows, then carry the suspended load
+                # with the same velocity field. Runs AFTER the depth/source
+                # update so it sees this substep's real h/u/v, and the bed is
+                # recombined immediately so the next substep's velocity step
+                # already feels the freshly cut channel -- that closed loop
+                # (flow -> erosion -> terrain -> flow) is the whole point.
+                wp.launch(_erode_deposit, dim=self._count,
+                          inputs=[self._h, self._u, self._v, self._bed_terrain,
+                                  self._bed_offset, self._sediment, self._obstacles,
+                                  self._next_sediment, dt,
+                                  config.SEDIMENT_CAPACITY_SCALE,
+                                  config.SEDIMENT_ERODE_RATE,
+                                  config.SEDIMENT_DEPOSIT_RATE,
+                                  config.SEDIMENT_MAX_BED_CHANGE,
+                                  config.BED_EROSION_SHIELD,
+                                  config.HEIGHT_MIN, config.FLUID_DRY_DEPTH],
+                          device=self.device)
+                self._sediment, self._next_sediment = self._next_sediment, self._sediment
+                wp.launch(_advect_sediment, dim=self._count,
+                          inputs=[self._sediment, self._next_sediment, self._u,
+                                  self._v, self._h, self._obstacles, self._width,
+                                  self._height, float(self._terrain.cell_size), dt,
+                                  config.FLUID_DRY_DEPTH], device=self.device)
+                self._sediment, self._next_sediment = self._next_sediment, self._sediment
+                self._recombine_bed()
             wp.launch(_advect_flow_tracers, dim=config.FLOW_TRACER_COUNT,
                       inputs=[self._flow_particles, self._h, self._u, self._v,
                               self._bed, self._obstacles, self._width, self._height,
@@ -672,7 +931,11 @@ class WarpShallowWaterSolver(FluidSolver):
         return np.asarray(self._flow_particles.numpy(), dtype=np.float32)
 
     def diagnostics(self) -> dict:
+        suspended = (float(np.asarray(self._sediment.numpy()).sum())
+                     if self._sediment is not None else 0.0)
         return {"solver": "warp_shallow_water", "device": self.device,
+                "erosion": self._erosion_enabled,
+                "suspended_sediment": suspended,
                 "grid": [self._width, self._height], "substeps": self.last_substeps,
                 "terrain_gpu_uploads": self.terrain_gpu_uploads,
                 "obstacle_gpu_uploads": self.obstacle_gpu_uploads,
