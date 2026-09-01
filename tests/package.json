@@ -1,0 +1,12 @@
+{
+  "name": "naturelab-foundation-tests",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "test": "node e2e.mjs"
+  },
+  "dependencies": {
+    "puppeteer-core": "25.9.0"
+  }
+}

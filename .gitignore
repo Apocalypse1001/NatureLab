@@ -1,0 +1,21 @@
+# build artifacts (rebuildable via build_exe.bat / npm run build)
+NatureLab.exe
+frontend/dist/
+frontend/node_modules/
+tests/node_modules/
+runtime/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# logs / local run artifacts
+*.log
+*.err
+data/*.json
+!data/.gitkeep
+
+# os
+.DS_Store
+Thumbs.db
