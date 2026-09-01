@@ -201,6 +201,94 @@ class ShallowWaterSolverTests(unittest.TestCase):
         self.assertAlmostEqual(float(samples["depths"][1]), 1.2, places=1)
 
 
+class SedimentErosionTests(unittest.TestCase):
+    """v0.4 RiverLab: capacity-based erosion/deposition + sediment transport
+    (docs/04_TZ_v0.3_roadmap.md v0.4). Fast flow should erode terrain and
+    carry sediment downstream; terrain change must feed back into the flow
+    it came from (same mutate-in-place mechanism already proven for
+    obstacles/terrain.brush), and total solid material (terrain + suspended
+    sediment) must not appear from nowhere."""
+
+    @staticmethod
+    def _make_channel(slope: float, depth: float = 0.5) -> tuple[WorldState, ShallowWaterFluidSolver]:
+        """A sloped bed with UNIFORM water depth, not solver.initialize()'s
+        default hydrostatic fill. initialize() sets depth = water_level -
+        terrain, which makes the water SURFACE flat by construction (total
+        height = terrain + (level - terrain) = level everywhere) -- zero
+        gradient, zero flow, from the very first tick. A real channel has
+        roughly uniform depth following the slope, which is what actually
+        drives sustained flow (found by direct measurement in this session:
+        speed was exactly 0.0 at every step with the hydrostatic fill)."""
+        world = WorldState()
+        w, h = world.terrain.width, world.terrain.height
+        xs = np.linspace(0.0, slope, w + 1, dtype=np.float32)
+        world.terrain.heights[:, :] = np.tile(xs, (h + 1, 1))
+        solver = ShallowWaterFluidSolver()
+        solver.initialize(world)
+        solver._depth[:, :] = depth
+        return world, solver
+
+    def test_fast_flow_erodes_terrain_and_carries_sediment(self) -> None:
+        world, solver = self._make_channel(slope=3.0)
+        start_terrain = world.terrain.heights.copy()
+        for _ in range(600):
+            solver.set_boundaries(world.terrain, {})
+            solver.advance(1 / 60, 8, 1 / 120)
+        eroded = (world.terrain.heights < start_terrain - 1e-4).any()
+        self.assertTrue(eroded, "fast flow over erodible terrain should lower it somewhere")
+        self.assertGreater(float(solver.get_sediment_grid().sum()), 0.0)
+
+    def test_solid_material_conserved_by_erosion_and_deposition(self) -> None:
+        world, solver = self._make_channel(slope=3.0)
+        solver.set_boundaries(world.terrain, {})
+        start_total = solver.total_solid_material()
+        for _ in range(600):
+            solver.set_boundaries(world.terrain, {})
+            solver.advance(1 / 60, 8, 1 / 120)
+        end_total = solver.total_solid_material()
+        self.assertAlmostEqual(end_total, start_total, delta=max(1e-3, abs(start_total) * 1e-3))
+
+    def test_terrain_change_feeds_back_into_flow(self) -> None:
+        """The same mechanism already proven for obstacles/manual brushing
+        (docs/04_TZ_v0.3_roadmap.md 'Главный критерий качества'): once
+        erosion has measurably reshaped the bed, the flow computed next
+        tick must actually reflect the new shape, not the original one."""
+        world, solver = self._make_channel(slope=3.0)
+        for _ in range(600):
+            solver.set_boundaries(world.terrain, {})
+            solver.advance(1 / 60, 8, 1 / 120)
+        eroded_terrain = world.terrain.heights.copy()
+        depth_on_eroded_bed = solver._depth.copy()
+
+        # replay the same run on a solver that never erodes (frozen terrain
+        # snapshot from the start) and confirm the resulting depth differs
+        fresh_world, solver2 = self._make_channel(slope=3.0)
+        frozen_terrain = fresh_world.terrain.heights.copy()
+        for _ in range(600):
+            fresh_world.terrain.heights[:, :] = frozen_terrain  # pin the bed, no erosion feedback
+            solver2.set_boundaries(fresh_world.terrain, {})
+            solver2.advance(1 / 60, 8, 1 / 120)
+
+        self.assertFalse(np.array_equal(eroded_terrain, frozen_terrain))
+        self.assertFalse(np.allclose(depth_on_eroded_bed, solver2._depth))
+
+    def test_rock_changes_local_erosion_pattern(self) -> None:
+        """Ties to the user's Schauberger-riverbed-rock request: a rock on
+        the bed must change WHERE erosion happens, not just add a static
+        hole with no consequence for the sediment mechanic."""
+        def run(with_rock: bool) -> np.ndarray:
+            world, solver = self._make_channel(slope=3.0)
+            obstacles = {"positions": [[-20.0, 0.0, 0.0]], "radii": [3.0]} if with_rock else {}
+            for _ in range(600):
+                solver.set_boundaries(world.terrain, obstacles)
+                solver.advance(1 / 60, 8, 1 / 120)
+            return world.terrain.heights.copy()
+
+        without_rock = run(with_rock=False)
+        with_rock = run(with_rock=True)
+        self.assertFalse(np.allclose(without_rock, with_rock))
+
+
 class ForceRigidBodyTests(unittest.TestCase):
     """v0.3: gravity/buoyancy/drag/friction replacing the buoyancy-threshold
     placeholder. See docs/04_TZ_v0.3_roadmap.md milestone v0.3 and

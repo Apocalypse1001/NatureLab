@@ -37,6 +37,7 @@ class SimulationManager:
         self.speed = 1.0
         self.sim_fps = 0.0
         self._flush_final_frame = False
+        self._last_terrain_resync = 0.0
         self._steps_in_window = 0
         self._fps_window_start = time.perf_counter()
         self._task: Optional[asyncio.Task] = None
@@ -141,6 +142,7 @@ class SimulationManager:
         self.rigid.initialize(self.world, self.fluid, self.events)
         self.engine.init_particles(config.PARTICLE_COUNT, self.world.water.level)
         self.sim_time = 0.0
+        self._last_terrain_resync = 0.0
         self.status = self.RUNNING
         self.events.record(self.sim_time, EventType.SIM_STARTED, cause="user",
                            particles=config.PARTICLE_COUNT,
@@ -159,6 +161,7 @@ class SimulationManager:
             self.world = self.initial.clone()
         self.status = self.IDLE
         self.sim_time = 0.0
+        self._last_terrain_resync = 0.0
         self.events.record(self.sim_time, EventType.SIM_RESET, cause="user")
         self.fluid.initialize(self.world)
         self.rigid.initialize(self.world, self.fluid, self.events)
@@ -186,6 +189,7 @@ class SimulationManager:
         self.initial = None
         self.status = self.IDLE
         self.sim_time = 0.0
+        self._last_terrain_resync = 0.0
         self.fluid.initialize(self.world)
         self.rigid.initialize(self.world, self.fluid, self.events)
         self.engine.init_particles(config.PARTICLE_COUNT, self.world.water.level)
@@ -246,6 +250,28 @@ class SimulationManager:
                 try:
                     await self._send_bytes(protocol.encode_float_frame(
                         protocol.FrameKind.WATER_HEIGHT, depth_grid, self.sim_time))
+                except Exception:
+                    return
+            if (self.status == self.RUNNING
+                    and self.sim_time - self._last_terrain_resync >= config.TERRAIN_RESYNC_INTERVAL_S):
+                # RiverLab (v0.4): erosion/deposition mutates world.terrain
+                # directly each tick (see ShallowWaterFluidSolver), but the
+                # existing terrain sync is otherwise only a reply to an
+                # explicit terrain_brush op -- without this, erosion would
+                # be physically real on the backend and invisible on the
+                # frontend, the exact class of bug already found and fixed
+                # for water (see docs/04_TZ_v0.3_roadmap.md "Архитектурный
+                # принцип"). Reuses the existing terrain_patch message the
+                # frontend already knows how to apply, just throttled
+                # (every TERRAIN_RESYNC_INTERVAL_S) since it's JSON, not
+                # the binary bulk path.
+                self._last_terrain_resync = self.sim_time
+                try:
+                    await self._send_text(json.dumps({
+                        "type": "terrain_patch",
+                        "heights": self.world.terrain.to_list(),
+                        "checksum": self.world.terrain.checksum(),
+                    }, separators=(",", ":")))
                 except Exception:
                     return
         moved = [(oid, obj.position, obj.state)

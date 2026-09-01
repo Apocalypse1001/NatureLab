@@ -35,6 +35,18 @@ FLUID_FLOW_GAIN = 1.6          # outflow rate per meter of height difference (1/
 FLUID_OBSTACLE_RADIUS_M = 1.2  # fallback footprint if an object has no footprint_radius
 FLUID_MIN_DEPTH = 1e-4         # below this, a cell is treated as dry
 
+# Sediment transport / erosion / deposition (v0.4 RiverLab). See
+# fluid_solver.ShallowWaterFluidSolver._step and
+# docs/04_TZ_v0.3_roadmap.md v0.4. Tuned deliberately slow relative to a
+# single flood event -- real fluvial erosion is slow compared to one flood,
+# and it keeps short FloodLab-style runs (seconds of sim time) from being
+# measurably disturbed while still being clearly visible over the longer
+# runs a RiverLab "River A vs River B" comparison would actually use.
+SEDIMENT_CAPACITY_SCALE = 0.05  # capacity = this * flow_speed * depth
+SEDIMENT_ERODE_RATE = 0.3       # fraction of the capacity gap eroded per second
+SEDIMENT_DEPOSIT_RATE = 0.3     # fraction of the excess deposited per second
+TERRAIN_RESYNC_INTERVAL_S = 1.0  # how often erosion-driven terrain changes are re-broadcast
+
 # Rigid body force model (v0.3): gravity + buoyancy + hydrodynamic drag +
 # ground friction. See backend/app/rigid_body.py:ForceRigidBodySystem and
 # docs/04_TZ_v0.3_roadmap.md.

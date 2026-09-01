@@ -209,8 +209,33 @@ buoyancy). `metadata.foundation_height` — ранее сохранялось, �
 Фронтенд: палитра/геометрия (`DodecahedronGeometry`, приплюснут и наполовину погружён — не
 перекатывается, как DEBRIS).
 
+## v0.4 RiverLab: эрозия, перенос осадка, обратная связь в русло
+
+`ShallowWaterFluidSolver` теперь считает `sediment` (то же поле, что depth/velocity):
+capacity = скорость×глубина (упрощённая real-time hydraulic erosion, в духе того же класса
+техники, что и сам shallow-water solver — Mei et al.); где capacity>текущий sediment —
+эрозия (terrain понижается, sediment растёт), где меньше — осаждение (наоборот). Перенос
+осадка использует **те же** flux-значения, что уже двигают воду — не отдельный adverction-солвер.
+`terrain.heights` мутируется по ссылке, поэтому эрозия реально меняет русло и это меняет
+дальнейший поток — тот же механизм, что уже доказан для ручного brush/препятствий.
+
+Terrain теперь **стримится во время RUNNING** (не только как ответ на ручной brush) —
+переиспользует существующий JSON `terrain_patch` канал и уже готовый frontend-обработчик,
+раз в `config.TERRAIN_RESYNC_INTERVAL_S` (1с). Без этого эрозия была бы реальной физикой,
+невидимой на экране — тот же класс бага, что уже был найден и исправлен для воды.
+
+**Два честных нюанса, найденных при тестировании (не решены в этом коммите):**
+- `ShallowWaterFluidSolver.initialize()` заполняет глубину как `water_level - terrain`, что
+  даёт абсолютно плоскую водную поверхность с первого тика — **нулевой поток**, пока что-то
+  (объект, ручное редактирование terrain) не создаст неровность. Пользователь, поставивший
+  только наклон terrain и уровень воды без единого объекта, ничего текущего не увидит.
+- Слайдер Water Level во время RUNNING не влияет на `ShallowWaterFluidSolver` — тот читает
+  `world.water.level` только один раз при `initialize()`.
+
 ## Placeholder (намеренно)
 
-- `OBJECT_TRANSFORMS`, `TERRAIN_PATCH` (потоковый), `EVENTS` (бинарный) bulk frame kinds
-  подготовлены как типизированный контракт, но ещё не стримятся (PARTICLES и WATER_HEIGHT — стримятся).
-- RiverLab, VolcanoLab, эрозия, разрушение зданий/машин (DAMAGED health-модель) и replay не реализованы.
+- `OBJECT_TRANSFORMS`, `EVENTS` (бинарный) bulk frame kinds подготовлены как типизированный
+  контракт, но ещё не стримятся (PARTICLES, WATER_HEIGHT стримятся; TERRAIN — через JSON,
+  не через зарезервированный бинарный `TERRAIN_PATCH` kind).
+- RiverLab пока без деревьев-у-берега/тени (см. `docs/04_TZ_v0.3_roadmap.md`), VolcanoLab,
+  разрушение зданий/машин (DAMAGED health-модель) и replay не реализованы.

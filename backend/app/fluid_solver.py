@@ -136,6 +136,7 @@ class ShallowWaterFluidSolver(FluidSolver):
         self._depth: np.ndarray = np.zeros((1, 1), dtype=np.float32)
         self._flow_x: np.ndarray = np.zeros((1, 1), dtype=np.float32)
         self._flow_z: np.ndarray = np.zeros((1, 1), dtype=np.float32)
+        self._sediment: np.ndarray = np.zeros((1, 1), dtype=np.float32)
         self._obstacle_mask: np.ndarray = np.zeros((1, 1), dtype=bool)
         self._time = 0.0
         self.last_substeps = 0
@@ -149,6 +150,7 @@ class ShallowWaterFluidSolver(FluidSolver):
             0.0, world.water.level - self._terrain.heights).astype(np.float32)
         self._flow_x = np.zeros(shape, dtype=np.float32)
         self._flow_z = np.zeros(shape, dtype=np.float32)
+        self._sediment = np.zeros(shape, dtype=np.float32)
         self._obstacle_mask = np.zeros(shape, dtype=bool)
         self._time = 0.0
 
@@ -157,6 +159,7 @@ class ShallowWaterFluidSolver(FluidSolver):
         if self._depth.shape != terrain.heights.shape:
             # terrain resized (e.g. loaded world) -> reinitialise the field flat
             self._depth = np.zeros(terrain.heights.shape, dtype=np.float32)
+            self._sediment = np.zeros(terrain.heights.shape, dtype=np.float32)
         self._obstacle_mask = self._rasterize_obstacles(terrain, obstacles)
         self._depth[self._obstacle_mask] = 0.0
 
@@ -230,6 +233,54 @@ class ShallowWaterFluidSolver(FluidSolver):
         self._depth = new_depth.astype(np.float32)
         self._flow_x = (flow_right - flow_left).astype(np.float32)
         self._flow_z = (flow_down - flow_up).astype(np.float32)
+        self._erode_and_transport_sediment(dt, depth, flow_right, flow_left, flow_down, flow_up)
+
+    def _erode_and_transport_sediment(self, dt: float, old_depth: np.ndarray,
+                                      flow_right: np.ndarray, flow_left: np.ndarray,
+                                      flow_down: np.ndarray, flow_up: np.ndarray) -> None:
+        """RiverLab (v0.4): capacity-based erosion/deposition + advection.
+
+        Standard real-time hydraulic erosion (capacity ~ speed * depth;
+        erode when under capacity, deposit when over) -- see
+        docs/04_TZ_v0.3_roadmap.md v0.4. Terrain is mutated in place
+        (self._terrain IS world.terrain by reference), so erosion feeds
+        back into flow exactly like a manual terrain.brush() would.
+        Deliberately slow (config.SEDIMENT_*_RATE) relative to a single
+        flood event -- see the config module docstring for why.
+        """
+        speed = np.sqrt((flow_right - flow_left) ** 2 + (flow_down - flow_up) ** 2)
+        capacity = config.SEDIMENT_CAPACITY_SCALE * speed * old_depth
+        sediment = self._sediment
+        diff = capacity - sediment
+
+        erode = np.where(diff > 0, diff * config.SEDIMENT_ERODE_RATE * dt, 0.0)
+        # never erode below the world's bedrock floor
+        erode = np.minimum(erode, np.maximum(0.0, self._terrain.heights - config.HEIGHT_MIN))
+        # never erode terrain that's carrying no water at all (dry banks)
+        erode[old_depth <= config.FLUID_MIN_DEPTH] = 0.0
+
+        deposit = np.where(diff < 0, np.minimum(-diff, sediment) * config.SEDIMENT_DEPOSIT_RATE * dt, 0.0)
+        deposit = np.minimum(deposit, sediment)
+
+        self._terrain.heights = (self._terrain.heights - erode + deposit).astype(np.float32)
+        sediment = sediment + erode - deposit
+
+        concentration = sediment / np.maximum(old_depth, 1e-6)
+        sed_out_right = flow_right * dt * concentration
+        sed_out_left = flow_left * dt * concentration
+        sed_out_down = flow_down * dt * concentration
+        sed_out_up = flow_up * dt * concentration
+
+        sed_in_left = np.pad(sed_out_right, ((0, 0), (1, 0)))[:, :-1]
+        sed_in_right = np.pad(sed_out_left, ((0, 0), (0, 1)))[:, 1:]
+        sed_in_up = np.pad(sed_out_down, ((1, 0), (0, 0)))[:-1, :]
+        sed_in_down = np.pad(sed_out_up, ((0, 1), (0, 0)))[1:, :]
+        sed_inflow = sed_in_left + sed_in_right + sed_in_up + sed_in_down
+        sed_outflow = sed_out_right + sed_out_left + sed_out_down + sed_out_up
+
+        new_sediment = np.maximum(0.0, sediment - sed_outflow + sed_inflow)
+        new_sediment[self._obstacle_mask] = 0.0
+        self._sediment = new_sediment.astype(np.float32)
 
     # ------------------------------------------------------------------ readback
     def sample_for_bodies(self, positions: np.ndarray, radii: Optional[np.ndarray] = None) -> dict:
@@ -293,6 +344,18 @@ class ShallowWaterFluidSolver(FluidSolver):
     def get_depth_grid(self) -> Optional[np.ndarray]:
         return self._depth
 
+    def get_sediment_grid(self) -> np.ndarray:
+        return self._sediment
+
     def total_volume(self) -> float:
         """Sum of water depth over all cells; used by conservation tests."""
         return float(self._depth.sum())
+
+    def total_solid_material(self) -> float:
+        """terrain height + suspended sediment, summed over all cells.
+
+        Erosion/deposition only transfers material between the two -- this
+        sum should stay constant (up to sediment carried across a closed
+        world edge and clamped there, same caveat as total_volume).
+        """
+        return float(self._terrain.heights.sum() + self._sediment.sum())

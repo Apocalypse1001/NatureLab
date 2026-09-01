@@ -70,6 +70,29 @@ backend применяет sample к float32 TerrainGrid и отвечает `te
 и SHA-256 над little-endian float32 bytes. Frontend заменяет локальные heights. Автотест
 сравнивает checksum числовых массивов.
 
+v0.4: `terrain.heights` может также меняться физически (erosion/deposition, см. Sediment ниже),
+не только через ручной brush. `SimulationManager._stream()` шлёт тот же JSON `terrain_patch`
+проактивно во время RUNNING (раз в `config.TERRAIN_RESYNC_INTERVAL_S`), не только как ответ на
+`terrain_brush` op — frontend-обработчик идентичен для обоих случаев (диспетчеризация по типу
+сообщения, не по тому, был ли это ответ на конкретный запрос).
+
+## Sediment transport (RiverLab, v0.4)
+
+`ShallowWaterFluidSolver._sediment` — то же поле, что depth, на той же сетке. Каждый substep,
+после расчёта потока: `capacity = SEDIMENT_CAPACITY_SCALE * speed * depth`; где capacity выше
+текущего sediment — эрозия (`terrain -= amount; sediment += amount`, ограничено bedrock floor и
+только на мокрых клетках); где ниже — осаждение (наоборот). Перенос осадка переиспользует уже
+посчитанные и уже clamped flow-значения (не отдельный adverction solver) — концентрация
+(`sediment/depth`) переносится пропорционально объёму воды, ушедшему в каждом направлении, что
+автоматически гарантирует: клетка не может отдать больше осадка, чем в ней есть (то же
+рассуждение о сохранении, что уже используется для depth).
+
+`terrain.heights` мутируется по ссылке (тот же объект, что `world.terrain`) — значит erosion
+автоматически меняет дальнейший flow тем же путём, что и ручной `terrain.brush()`. Намеренно
+медленно (см. docstring `config.SEDIMENT_*_RATE`) — реальная эрозия медленна относительно
+одного паводка; должна быть заметна на длинных RiverLab-сравнениях (River A vs River B), не
+искажать короткие FloodLab-сценарии.
+
 ## Bulk protocol v2
 
 Header (16 bytes): `NL | version:u8 | kind:u8 | count:u32 | time_ms:u64`.
