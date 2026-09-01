@@ -17,6 +17,7 @@
  *   send <json>         raw WebSocket op, e.g. send {"op":"start"}
  *   eval <js>           evaluate in the page, JSON-printed. `__NL` is in scope.
  *   depth               water depth field stats (min/mean/max, wet cells)
+ *   frametime [n]       measured ms/frame over n rendered frames (default 120)
  *   wait <ms>
  *   ss [name]           screenshot -> shots/<name>.png  (default: shot)
  *   quit
@@ -286,6 +287,34 @@ async function handle(line) {
         return v === undefined ? null : JSON.parse(JSON.stringify(v));
       }, arg));
     case 'depth': return JSON.stringify(await depthStats());
+    case 'frametime': {
+      // The real cost of a bigger map is not socket throughput, it is the
+      // per-frame main-thread work: rewriting every water vertex Z and
+      // recomputing normals at the stream rate. Measure it in the page rather
+      // than inferring it from triangle counts.
+      const frames = parseInt(arg, 10) || 120;
+      return JSON.stringify(await page.evaluate(async (n) => {
+        const samples = [];
+        await new Promise((done) => {
+          let last = performance.now();
+          let seen = 0;
+          const tick = () => {
+            const now = performance.now();
+            samples.push(now - last);
+            last = now;
+            if (++seen >= n) return done();
+            requestAnimationFrame(tick);
+          };
+          requestAnimationFrame(tick);
+        });
+        samples.sort((a, b) => a - b);
+        const at = (q) => Math.round(samples[Math.floor(samples.length * q)] * 100) / 100;
+        const info = globalThis.__NL.sceneManager.renderer.info.render;
+        return { frames: samples.length, medianMs: at(0.5), p95Ms: at(0.95),
+                 worstMs: Math.round(samples[samples.length - 1] * 100) / 100,
+                 triangles: info.triangles, drawCalls: info.calls };
+      }, frames));
+    }
     case 'wait': await sleep(parseInt(arg, 10) || 0); return `waited ${arg}ms`;
     case 'ss': return await screenshot(rest[0]);
     case 'backendlog': return backendLog.join('').split('\n').slice(-15).join(' | ');

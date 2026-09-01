@@ -27,7 +27,11 @@ RELEASES = ROOT / "releases"
 
 # Directory names pruned anywhere in the tree.
 SKIP_DIRS = {".git", "node_modules", "__pycache__", "releases", "build",
-             ".pytest_cache", ".mypy_cache", "shots", ".vite"}
+             ".pytest_cache", ".mypy_cache", "shots", ".vite",
+             # third-party reference implementations kept for study, not part of
+             # the product -- 69 MB of DEM samples and demo GIFs that would
+             # otherwise dominate a 0.3 MB release
+             "reference"}
 # Paths (relative to ROOT) pruned specifically. `dist/` at the root is
 # PyInstaller output; `frontend/dist/` is the served bundle and IS included.
 SKIP_PATHS = {Path("dist")}

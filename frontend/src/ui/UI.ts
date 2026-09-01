@@ -152,10 +152,14 @@ export class UI {
     tracerToggle.append(visible);
     panel.append(tracerToggle);
     const tracerCount = el('div', 'slider-row');
-    tracerCount.innerHTML = '<label>Visible tracers <output id="tracer-count-out">8000</output></label>';
+    tracerCount.innerHTML =
+      '<label>Visible tracers <output id="tracer-count-out">36000</output></label>';
     const count = el('input', '') as HTMLInputElement;
-    count.id = 'tracer-count'; count.type = 'range'; count.min = '0'; count.max = '8000';
-    count.step = '500'; count.value = '8000';
+    // Ceiling follows the backend's FLOW_TRACER_COUNT: a slider that maxed out
+    // at the old 8 000 would have silently hidden three quarters of the tracers
+    // the solver is actually advecting after the v0.7.0 bump to 36 000.
+    count.id = 'tracer-count'; count.type = 'range'; count.min = '0'; count.max = '36000';
+    count.step = '1000'; count.value = '36000';
     count.oninput = () => {
       this.root.querySelector('#tracer-count-out')!.textContent = count.value;
       this.cb.setTracerCount(parseInt(count.value, 10));

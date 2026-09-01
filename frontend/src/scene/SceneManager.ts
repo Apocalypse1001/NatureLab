@@ -21,8 +21,9 @@ export class SceneManager {
   private _selectionHelper: THREE.BoxHelper | null = null;
   private waterBaseIndices: Uint16Array | Uint32Array;
   private waterDynamicIndices: Uint16Array | Uint32Array;
+  private gridHelper: THREE.GridHelper;
   private tracersVisible = true;
-  private tracerDisplayLimit = 8000;
+  private tracerDisplayLimit = 36000;   // matches config.FLOW_TRACER_COUNT
   private receivedTracerCount = 0;
 
   constructor(canvas: HTMLCanvasElement, private terrain: TerrainGrid) {
@@ -30,20 +31,24 @@ export class SceneManager {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setClearColor(0x0e1420);
 
-    this.scene.fog = new THREE.Fog(0x0e1420, 120, 400);
+    // Camera framing, fog and zoom limits are derived from the world size, not
+    // fixed numbers: they were tuned for a 100 m map and left the 200 m map
+    // half out of frame and inside the fog when it was doubled in v0.7.0.
+    const span = terrain.sizeM;
+    this.scene.fog = new THREE.Fog(0x0e1420, span * 1.2, span * 4);
 
     this.camera = new THREE.PerspectiveCamera(55, 1, 0.1, 1000);
-    this.camera.position.set(60, 55, 60);
+    this.camera.position.set(span * 0.6, span * 0.55, span * 0.6);
 
     this.controls = new OrbitControls(this.camera, canvas);
     this.controls.enableDamping = true;
-    this.controls.maxDistance = 300;
+    this.controls.maxDistance = span * 3;
 
     this.scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x3a3226, 0.7));
     const sun = new THREE.DirectionalLight(0xffffff, 1.2);
     sun.position.set(60, 90, 30);
     this.scene.add(sun);
-    this.scene.add(new THREE.AxesHelper(10));
+    this.scene.add(new THREE.AxesHelper(span * 0.1));
 
     // terrain mesh (geometry rebuilt from the logical grid)
     const geo = new THREE.PlaneGeometry(
@@ -55,9 +60,10 @@ export class SceneManager {
     this.terrainMesh.rotation.x = -Math.PI / 2;
     this.scene.add(this.terrainMesh);
 
-    const grid = new THREE.GridHelper(this.terrain.sizeM, this.terrain.width, 0x223344, 0x1b2836);
-    grid.position.y = 0.05;
-    this.scene.add(grid);
+    this.gridHelper = new THREE.GridHelper(
+      this.terrain.sizeM, this.terrain.width, 0x223344, 0x1b2836);
+    this.gridHelper.position.y = 0.05;
+    this.scene.add(this.gridHelper);
 
     // Water vertices share terrain ordering, allowing direct bulk frame updates.
     const waterGeometry = new THREE.PlaneGeometry(this.terrain.sizeM, this.terrain.sizeM,
@@ -104,8 +110,23 @@ export class SceneManager {
   }
 
   // ------------------------------------------------------------------ terrain
+  /**
+   * Apply a terrain grid to the scene.
+   *
+   * If the grid RESOLUTION changed -- a different world size, a loaded world
+   * built at another scale -- the meshes are rebuilt, not just re-heighted.
+   * Before v0.7.0 this method only rewrote vertex Z, which worked purely
+   * because the frontend's default TerrainGrid happened to match the backend's.
+   * Doubling the map to 200 m exposed it: the backend streamed 40 401 heights
+   * into a 10 201-vertex mesh, `setWaterHeights` rejected every frame on the
+   * size check, and the water simply never appeared.
+   */
   rebuildTerrain(terrain: TerrainGrid): void {
+    const resized = terrain.width !== this.terrain.width
+      || terrain.height !== this.terrain.height
+      || terrain.cellSize !== this.terrain.cellSize;
     this.terrain = terrain;
+    if (resized) this.rebuildGridGeometry();
     const geo = this.terrainMesh.geometry as THREE.PlaneGeometry;
     const pos = geo.attributes.position;
     const w = terrain.width, h = terrain.height;
@@ -117,6 +138,44 @@ export class SceneManager {
     }
     pos.needsUpdate = true;
     geo.computeVertexNormals();
+  }
+
+  /** Rebuild every piece of geometry whose resolution follows the grid. */
+  private rebuildGridGeometry(): void {
+    const { sizeM, width, height } = this.terrain;
+
+    this.terrainMesh.geometry.dispose();
+    this.terrainMesh.geometry = new THREE.PlaneGeometry(sizeM, sizeM, width, height);
+
+    const waterGeometry = new THREE.PlaneGeometry(sizeM, sizeM, width, height);
+    const sourceIndices = waterGeometry.index!.array;
+    // Mirror whatever index width Three.js chose rather than assuming one.
+    // 201x201 = 40 401 vertices still fits Uint16 (max 65 535), so the doubled
+    // map did NOT need the 32-bit path -- but 401x401 would, and hard-coding
+    // Uint16 here is exactly the kind of thing that fails silently later.
+    this.waterBaseIndices = sourceIndices instanceof Uint32Array
+      ? new Uint32Array(sourceIndices) : new Uint16Array(sourceIndices);
+    this.waterDynamicIndices = sourceIndices instanceof Uint32Array
+      ? new Uint32Array(sourceIndices.length) : new Uint16Array(sourceIndices.length);
+    waterGeometry.setIndex(new THREE.BufferAttribute(this.waterDynamicIndices, 1));
+    waterGeometry.setDrawRange(0, 0);
+    this.waterMesh.geometry.dispose();
+    this.waterMesh.geometry = waterGeometry;
+
+    this.scene.remove(this.gridHelper);
+    this.gridHelper.geometry.dispose();
+    this.gridHelper = new THREE.GridHelper(sizeM, width, 0x223344, 0x1b2836);
+    this.gridHelper.position.y = 0.05;
+    this.scene.add(this.gridHelper);
+
+    // camera framing and fog follow the world, see the constructor note
+    this.scene.fog = new THREE.Fog(0x0e1420, sizeM * 1.2, sizeM * 4);
+    this.camera.far = sizeM * 6;
+    this.camera.position.set(sizeM * 0.6, sizeM * 0.55, sizeM * 0.6);
+    this.camera.updateProjectionMatrix();
+    this.controls.maxDistance = sizeM * 3;
+    this.controls.target.set(0, 0, 0);
+    this.controls.update();
   }
 
   setWater(level: number, visible: boolean): void {

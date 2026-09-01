@@ -64,12 +64,16 @@ try {
   // Dynamic visualization capacity is independent from simulation count.
   const dynamic = await page.evaluate(() => {
     const count = 150001;
-    window.__NL.sceneManager.setParticles(new Float32Array(count * 3), count);
-    const attr = window.__NL.sceneManager.points.geometry.attributes.position;
-    return { count: window.__NL.sceneManager.points.geometry.drawRange.count, capacity: attr.count };
+    const sm = window.__NL.sceneManager;
+    const limit = Number(document.querySelector('#tracer-count').value);
+    sm.setParticles(new Float32Array(count * 3), count);
+    const attr = sm.points.geometry.attributes.position;
+    return { count: sm.points.geometry.drawRange.count, capacity: attr.count, limit };
   });
-  assert(dynamic.count === 8000 && dynamic.capacity >= 150001,
-    'particle capacity/display limit are not independent');
+  // the drawn count follows the UI's display limit, whatever it is set to --
+  // asserting a literal 8000 broke the moment the tracer ceiling was raised
+  assert(dynamic.count === dynamic.limit && dynamic.capacity >= 150001,
+    `particle capacity/display limit are not independent (${JSON.stringify(dynamic)})`);
   report('dynamic particle buffer >120k');
 
   // Terrain commands are authoritative: patch replaces local float32 values.
@@ -88,12 +92,21 @@ try {
   report('terrain frontend/backend checksum');
 
   // Baseline world and idempotent repeated PLAY.
+  // Grid geometry is read from the running app, never hard-coded: this file
+  // used to spell out 10201 and 101, which silently became wrong the moment the
+  // world was resized (v0.7.0, 100 m -> 200 m).
+  const GRID = await page.evaluate(() => window.__NL.store.terrain.width + 1);
+  const VERTS = GRID * GRID;
+  // Five metres in from the inflow edge, at any map size. Spelled as -45 before
+  // v0.7.0, which meant "near the edge" on a 100 m map and "55 m downstream" on
+  // a 200 m one -- the wavefront never arrived and the wait simply timed out.
+  const NEAR_INLET = await page.evaluate(() => -window.__NL.store.terrain.sizeM / 2 + 5);
   await page.evaluate(() => window.__NL.editor.addObject('HOUSE'));
   await waitFor(() => page.evaluate(() => window.__NL.store.objects.size === 1));
   const baseline = await page.evaluate(() => JSON.stringify([...window.__NL.store.objects.values()]));
   await page.evaluate(() => window.__NL.net.send({ op: 'start' }));
   await waitFor(() => page.evaluate(() => document.querySelector('#sim-status')?.textContent === 'RUNNING'));
-  await waitFor(() => page.evaluate(() => window.__NL.store.waterFrameCount === 10201));
+  await waitFor(() => page.evaluate((n) => window.__NL.store.waterFrameCount === n, VERTS));
   const water = await page.evaluate(() => {
     const attr = window.__NL.sceneManager.waterMesh.geometry.attributes.position;
     const values = [];
@@ -101,20 +114,21 @@ try {
     return { count: attr.count, min: Math.min(...values), max: Math.max(...values),
       time: window.__NL.store.waterFrameTime };
   });
-  assert(water.count === 10201 && water.max > water.min && water.time >= 0,
+  assert(water.count === VERTS && water.max > water.min && water.time >= 0,
     'dynamic WATER_HEIGHT surface was not rendered');
   report('Warp shallow-water heightfield');
-  const maskedWater = await page.evaluate(() => {
+  const maskedWater = await page.evaluate(({ grid, verts }) => {
     const geometry = window.__NL.sceneManager.waterMesh.geometry;
     const positions = geometry.attributes.position;
     const indices = geometry.index.array;
     const terrain = window.__NL.store.terrain.heights;
     const used = geometry.drawRange.count;
     let maxWetColumn = -1;
-    let valid = used > 0 && used < 60000;
+    // an upper bound proportional to the grid, not a number tuned to one size
+    let valid = used > 0 && used < verts * 6;
     for (let vertex = 0; vertex < positions.count; vertex++) {
       if (positions.getZ(vertex) > terrain[vertex] + 1e-4) {
-        maxWetColumn = Math.max(maxWetColumn, vertex % 101);
+        maxWetColumn = Math.max(maxWetColumn, vertex % grid);
       }
     }
     for (let i = 0; i < used; i++) {
@@ -122,7 +136,7 @@ try {
       if (!(positions.getZ(vertex) > terrain[vertex] + 1e-4)) valid = false;
     }
     return { used, valid, maxWetColumn };
-  });
+  }, { grid: GRID, verts: VERTS });
   assert(maskedWater.valid, 'dry or solid water triangles remain visible');
   assert(maskedWater.maxWetColumn < 10, 'initial water did not start at the map edge');
   report('dry and HOUSE water triangles masked');
@@ -164,12 +178,12 @@ try {
     [...window.__NL.store.objects.keys()].some((id) => id.startsWith('Gauge_'))));
   const gaugeId = await page.evaluate(() =>
     [...window.__NL.store.objects.keys()].find((id) => id.startsWith('Gauge_')));
-  await page.evaluate((id) => {
+  await page.evaluate(({ id, x }) => {
     const gauge = window.__NL.store.objects.get(id);
-    gauge.position = [-45, 0, 0];
+    gauge.position = [x, 0, 0];
     window.__NL.sceneManager.setObject(gauge);
-    window.__NL.net.send({ op: 'object_update', id, fields: { position: [-45, 0, 0] } });
-  }, gaugeId);
+    window.__NL.net.send({ op: 'object_update', id, fields: { position: [x, 0, 0] } });
+  }, { id: gaugeId, x: NEAR_INLET });
   await waitFor(() => page.evaluate((id) => {
     const gauge = window.__NL.store.gauges.get(id);
     return gauge?.latest?.water_depth_m > 0 && gauge.arrival_time_s != null;
@@ -211,8 +225,10 @@ try {
     [...window.__NL.store.objects.keys()].filter((id) => id.startsWith('Car_')).length === 2));
   const carIds = await page.evaluate(() =>
     [...window.__NL.store.objects.keys()].filter((id) => id.startsWith('Car_')));
-  await page.evaluate((ids) => ids.forEach((id) => window.__NL.net.send({ op: 'object_update', id,
-    fields: { position: [-45, 0, 5], rotation: [0, 0.5, 0] } })), carIds);
+  await page.evaluate(({ ids, x }) => ids.forEach((id) => window.__NL.net.send({
+    op: 'object_update', id,
+    fields: { position: [x, 0, 5], rotation: [0, 0.5, 0] } })),
+    { ids: carIds, x: NEAR_INLET });
   await waitFor(() => page.evaluate((ids) => {
     const cars = ids.map((id) => window.__NL.store.objects.get(id));
     if (cars.some((car) => car?.state !== 'FLOATING')) return false;

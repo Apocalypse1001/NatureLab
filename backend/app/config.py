@@ -9,7 +9,7 @@ from pathlib import Path
 # running build always says which version it is -- the donor 0.5.0 tree carried
 # no version string anywhere, which made "which build am I looking at?"
 # answerable only by file timestamps.
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_DIR = BACKEND_DIR.parent
@@ -20,8 +20,14 @@ HOST = "127.0.0.1"
 PORT = 8756
 
 # World / terrain
-WORLD_SIZE_M = 100.0          # 100 x 100 meters
-TERRAIN_CELLS = 100           # grid resolution in cells per side
+# v0.7.0: doubled from 100 m at the user's request -- a river needs room to
+# meander, and at 100 m a channel that curves at all runs out of map. Cell size
+# is deliberately held at 1 m rather than stretched, so channel detail, single
+# boulders and narrow side-channels stay as legible as they were; the cost is
+# 4x the cells (40 401 vertices), which the RTX 5090 does not notice and the
+# browser main thread does -- see TEST_REPORT.md for the measured frame times.
+WORLD_SIZE_M = 200.0          # 200 x 200 meters
+TERRAIN_CELLS = 200           # grid resolution in cells per side
 TERRAIN_CELL_SIZE = WORLD_SIZE_M / TERRAIN_CELLS
 HEIGHT_MIN = -20.0
 HEIGHT_MAX = 60.0
@@ -34,7 +40,13 @@ STREAM_HZ = 30.0              # how often particle frames are pushed to clients
 PARTICLE_COUNT = 100_000
 VISUALIZATION_PARTICLE_LIMIT = 25_000
 ENABLE_DEBUG_PARTICLES = False
-FLOW_TRACER_COUNT = 8_000
+# Scaled with the map area (4x cells) and then raised again on top of that:
+# the user's report was that it is "not always clear the water is moving", and
+# tracer density is the thing that communicates it. These are advected by the
+# real velocity field on the GPU, not decorative sprites -- the cost is one
+# kernel over this many particles per substep plus 12 bytes each per stream
+# frame (~430 KB/s at 30 Hz), not a per-particle CPU update.
+FLOW_TRACER_COUNT = 36_000
 FLUID_MAX_SUBSTEPS = 8
 FLUID_STABILITY_DT = 1.0 / 120.0
 FLUID_CFL = 0.45

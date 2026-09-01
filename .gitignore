@@ -25,3 +25,6 @@ Thumbs.db
 
 # release archives (rebuildable via tools/make_release.py; kept out of git for size)
 releases/*.zip
+
+# third-party reference implementations (study material, not project source)
+reference/

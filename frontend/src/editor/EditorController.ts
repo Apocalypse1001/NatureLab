@@ -101,7 +101,7 @@ export class EditorController {
 
   addObject(type: ObjectType): void {
     const idx = this.store.objects.size;
-    const spacing = 18;
+    const spacing = this.store.terrain.sizeM * 0.18;
     const x = ((idx % 3) - 1) * spacing;
     const z = (Math.floor(idx / 3) - 1) * spacing;
     const y = this.store.terrain.heightAt(x, z);

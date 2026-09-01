@@ -1,4 +1,4 @@
-# NatureLab 0.6.0 - Architecture
+# NatureLab 0.7.0 - Architecture
 
 Проектная документация, которая объясняет *почему* архитектура такая, живёт в `docs/`:
 [`01_vision.md`](docs/01_vision.md) (цели и критерий качества),
@@ -20,7 +20,7 @@ RigidStateBuffer -> Warp force integration -> compact transforms/states
 
 ## Fluid
 
-Grid 101x101 follows terrain vertices. Velocity and continuity use ping-pong Warp arrays.
+Grid 201x201 follows terrain vertices. Velocity and continuity use ping-pong Warp arrays.
 Outer faces and solid faces have zero normal flux; tangential edge velocity remains valid.
 Face discharge uses water above the maximum neighboring bed elevation.
 
@@ -99,6 +99,23 @@ Whether a body is a wall or a riverbed is decided from data, not from a type nam
 everything in `SOLID_OBSTACLE_TYPES` as wall. `SimulationManager._affects_fluid_boundary()`
 uses the same rule to decide when adding, moving, scaling or deleting an object must
 bump `obstacle_revision`.
+
+## World size
+
+`WORLD_SIZE_M` and `TERRAIN_CELLS` are the only two numbers that define the domain;
+everything else derives from them. That includes the frontend: `SceneManager` rebuilds
+terrain, water, grid helper, camera framing, fog and zoom limits whenever the grid
+resolution it is handed differs from the one it currently holds, so a resize is a
+config edit rather than a coordinated change across both sides.
+
+Two things that are *not* derived and are worth knowing before the next resize:
+
+- Water mesh indices follow whatever width Three.js picks. 201x201 = 40 401 vertices
+  still fits Uint16 (max 65 535); 401x401 would not, and the code mirrors the chosen
+  array type rather than assuming either.
+- `_build_obstacle_mask` and `_build_bed_offset` each allocate an `np.mgrid` over the
+  whole grid per call. That is fine at the current rate (only on an obstacle-revision
+  bump) and would not be if anything ever needed them per tick.
 
 ## Versioning and releases
 
