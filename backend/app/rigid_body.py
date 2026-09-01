@@ -216,10 +216,86 @@ class ForceRigidBodySystem(_ArrayRigidBodySystem):
 
     `drag` is a per-object scalar proxy (Cd * area), not a full aerodynamic
     breakdown -- see the causal- vs engineering-realism note in
-    docs/04_TZ_v0.3_roadmap.md section 3. Object-object collision is not
-    handled here yet (two floating bodies can overlap) -- that is a
-    follow-up, not silently claimed as done.
+    docs/04_TZ_v0.3_roadmap.md section 3. Body<->body contact is resolved by
+    _resolve_collisions() as disk-in-XZ-plane impulses (mass-weighted, no
+    rotation/torque) -- an interim response so bodies stop passing through
+    each other, not the full rigid-body engine a later Warp port would add.
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._active_contacts: set = set()
+
+    def initialize(self, world, fluid, events: EventLog) -> None:
+        super().initialize(world, fluid, events)
+        self._active_contacts = set()
+
+    def _resolve_collisions(self, n: int) -> List[Tuple[int, int, float]]:
+        """Mass-weighted impulse + positional correction for overlapping
+        footprints (disks of radius footprint_radii in the XZ plane -- the
+        same radius the fluid solver already carves obstacles with).
+
+        Returns (i, j, impact_speed) for pairs whose contact just started
+        this tick, so the caller can emit one OBJECT_COLLISION event per
+        contact instead of every tick two bodies stay touching.
+        """
+        buf = self.buffer
+        if n < 2:
+            self._active_contacts = set()
+            return []
+        pos_xz = buf.positions[:, [0, 2]]
+        diff = pos_xz[:, None, :] - pos_xz[None, :, :]
+        dist = np.linalg.norm(diff, axis=-1)
+        np.fill_diagonal(dist, np.inf)
+        radius_sum = buf.footprint_radii[:, None] + buf.footprint_radii[None, :]
+        # dist is +inf on the diagonal, so raw overlap there is -inf; clamp
+        # to 0 up front rather than relying on np.where's unselected branch
+        # to mask it out later (0 * -inf is NaN even though it gets discarded).
+        overlap = np.where(np.isfinite(dist), radius_sum - dist, 0.0)
+        colliding = overlap > 0
+        current_contacts: set = set()
+        new_events: List[Tuple[int, int, float]] = []
+        if not colliding.any():
+            self._active_contacts = current_contacts
+            return new_events
+
+        normal = diff / np.maximum(dist[..., None], 1e-6)
+        inv_mass = 1.0 / np.maximum(buf.masses, 1e-6)
+        total_inv_mass = inv_mass[:, None] + inv_mass[None, :]
+
+        # positional correction: split overlap by inverse-mass ratio so the
+        # heavier body moves less (a HOUSE barely budges against a BOX)
+        frac_i = np.where(colliding, inv_mass[:, None] / np.maximum(total_inv_mass, 1e-9), 0.0)
+        push = normal * (overlap * frac_i)[..., None]
+        pos_xz = pos_xz + push.sum(axis=1)
+        buf.positions[:, 0] = pos_xz[:, 0]
+        buf.positions[:, 2] = pos_xz[:, 1]
+
+        # velocity impulse along the contact normal (Newton's third law falls
+        # out automatically: impulse[i,j] == -impulse[j,i] by construction)
+        vel_xz = buf.velocities[:, [0, 2]]
+        rel_vel = vel_xz[:, None, :] - vel_xz[None, :, :]
+        vel_along_normal = np.sum(rel_vel * normal, axis=-1)
+        approaching = colliding & (vel_along_normal < 0)
+        restitution = config.RIGID_COLLISION_RESTITUTION
+        j_impulse = np.where(approaching,
+                             -(1 + restitution) * vel_along_normal / np.maximum(total_inv_mass, 1e-9),
+                             0.0)
+        impulse = normal * j_impulse[..., None]
+        vel_xz = vel_xz + (impulse * inv_mass[:, None, None]).sum(axis=1)
+        buf.velocities[:, 0] = vel_xz[:, 0]
+        buf.velocities[:, 2] = vel_xz[:, 1]
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if not colliding[i, j]:
+                    continue
+                key = frozenset((buf.ids[i], buf.ids[j]))
+                current_contacts.add(key)
+                if key not in self._active_contacts:
+                    new_events.append((i, j, float(abs(vel_along_normal[i, j]))))
+        self._active_contacts = current_contacts
+        return new_events
 
     def step(self, dt: float, sim_time: float, fluid_samples=None) -> List[str]:
         if self._world is None or not self.buffer.ids:
@@ -291,6 +367,12 @@ class ForceRigidBodySystem(_ArrayRigidBodySystem):
 
         buf.velocities = new_velocities.astype(np.float32)
         buf.positions = (buf.positions + buf.velocities * dt).astype(np.float32)
+        collision_pairs = self._resolve_collisions(n)
+        for i, j, speed in collision_pairs:
+            oid_i, oid_j = buf.ids[i], buf.ids[j]
+            if self._events:
+                self._events.record(sim_time, EventType.OBJECT_COLLISION, oid_i,
+                                    cause="body_contact", other=oid_j, impact_speed=speed)
         new_speed = np.linalg.norm(buf.velocities[:, [0, 2]], axis=1)
 
         floating_mask = contact_fraction < config.RIGID_FLOAT_CONTACT_THRESHOLD

@@ -270,6 +270,54 @@ class ForceRigidBodyTests(unittest.TestCase):
         self.assertNotEqual(box_low.state, box_high.state)
         self.assertEqual(box_high.state, ObjectState.INTACT.value)
 
+    def test_bodies_do_not_pass_through_each_other(self) -> None:
+        """v0.3 interim collision: two disks pushed together by water drag
+        must not end up overlapping past their combined footprint radius."""
+        world = WorldState()
+        box_a = world.add_object("BOX", [-2.0, 0.0, 0.0])
+        box_b = world.add_object("BOX", [2.0, 0.0, 0.0])
+        rigid = ForceRigidBodySystem()
+        rigid.initialize(world, fluid=None, events=EventLog())
+        samples = {"depths": np.array([0.6, 0.6], dtype=np.float32),
+                   "velocities": np.array([[3.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32)}
+        for step in range(1, 400):
+            rigid.step(1 / 60, step / 60, samples)
+        separation = abs(box_a.position[0] - box_b.position[0])
+        min_separation = 2 * world.objects[box_a.id].metadata["footprint_radius"]
+        self.assertGreaterEqual(separation, min_separation - 0.05)
+
+    def test_collision_conserves_momentum_and_reduces_relative_speed(self) -> None:
+        """Heavier body barely moves; lighter one bounces back -- and total
+        momentum along the contact normal is conserved by construction.
+        Calls _resolve_collisions directly (not step()) so ground friction
+        -- a legitimate external force -- doesn't muddy a momentum check
+        that is specifically about the collision response itself."""
+        world = WorldState()
+        world.add_object("BOX", [-1.0, 0.0, 0.0])   # mass 50
+        world.add_object("HOUSE", [1.0, 0.0, 0.0])  # mass 20000
+        rigid = ForceRigidBodySystem()
+        rigid.initialize(world, fluid=None, events=EventLog())
+        rigid.buffer.velocities[0] = [4.0, 0.0, 0.0]  # light body moving toward heavy one
+        momentum_before = (rigid.buffer.masses[:, None] * rigid.buffer.velocities).sum(axis=0)
+        rigid._resolve_collisions(2)
+        momentum_after = (rigid.buffer.masses[:, None] * rigid.buffer.velocities).sum(axis=0)
+        np.testing.assert_allclose(momentum_before, momentum_after, atol=1e-3)
+        self.assertLess(abs(float(rigid.buffer.velocities[1, 0])), 0.05,
+                        "house should barely move from a 50kg box impact")
+
+    def test_collision_event_fires_once_per_contact_not_every_tick(self) -> None:
+        world = WorldState()
+        box_a = world.add_object("BOX", [-0.5, 0.0, 0.0])
+        world.add_object("BOX", [0.5, 0.0, 0.0])
+        events = EventLog()
+        rigid = ForceRigidBodySystem()
+        rigid.initialize(world, fluid=None, events=events)
+        samples = {"depths": np.zeros(2, dtype=np.float32), "velocities": np.zeros((2, 3), dtype=np.float32)}
+        for step in range(1, 60):
+            rigid.step(1 / 60, step / 60, samples)
+        collisions = [e for e in events.all() if e["type"] == "OBJECT_COLLISION"]
+        self.assertEqual(len(collisions), 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

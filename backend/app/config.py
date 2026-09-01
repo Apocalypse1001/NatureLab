@@ -42,3 +42,8 @@ RIGID_REFERENCE_DEPTH_M = 1.0     # depth at which buoyancy coefficient reaches 
 RIGID_WATER_DRAG_SCALE = 1500.0   # N per (drag_coeff * m/s), tuned so a CAR moves at flood depth
 RIGID_FLOAT_CONTACT_THRESHOLD = 0.15  # ground contact fraction below which a body is FLOATING
 RIGID_MOVE_EPS_MPS = 0.02         # speed below which a body counts as "at rest"
+
+# Impulse-based body<->body collision (v0.3 interim -- disk footprints in the
+# XZ plane, mass-weighted, no rotation/torque). A full warp.sim rigid-body
+# port is a separate scoped future milestone; see docs/04_TZ_v0.3_roadmap.md.
+RIGID_COLLISION_RESTITUTION = 0.2  # 0 = perfectly inelastic, 1 = perfectly elastic
