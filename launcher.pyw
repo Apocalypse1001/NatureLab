@@ -1,4 +1,4 @@
-"""NatureLab 0.2 launcher: non-recursive backend ownership and shutdown."""
+"""NatureLab 0.5.0 launcher: non-recursive backend ownership and shutdown."""
 from __future__ import annotations
 
 import os
@@ -115,7 +115,7 @@ def main() -> None:
 
     import tkinter as tk
     root = tk.Tk()
-    root.title("NatureLab 0.2")
+    root.title("NatureLab 0.5.0")
     root.resizable(False, False)
     tk.Label(root, text=f"NatureLab is running\n{URL}", padx=28, pady=16).pack()
     tk.Button(root, text="Stop NatureLab", width=20, command=root.destroy).pack(pady=(0, 16))

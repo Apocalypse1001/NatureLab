@@ -43,6 +43,11 @@ def encode_particles(positions: np.ndarray, sim_time: float) -> bytes:
     return encode_float_frame(FrameKind.PARTICLES, positions, sim_time)
 
 
+def encode_water_height(heights: np.ndarray, sim_time: float) -> bytes:
+    """Encode absolute surface elevations in terrain-vertex row-major order."""
+    return encode_float_frame(FrameKind.WATER_HEIGHT, heights, sim_time)
+
+
 def decode_frame(payload: bytes) -> tuple[FrameKind, int, float, np.ndarray]:
     if len(payload) < HEADER.size:
         raise ValueError("truncated frame header")

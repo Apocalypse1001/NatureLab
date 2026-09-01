@@ -66,17 +66,17 @@ const builders: Record<string, () => THREE.Group> = {
     g.add(rock);
     return g;
   },
-  ROCK: () => {
-    // Riverbed rock (RiverLab): rounder/larger than DEBRIS, sits low/half-
-    // buried since it is permanently anchored (root_strength), not tumbling
-    // free like a piece of debris.
+  GAUGE: () => {
     const g = new THREE.Group();
-    const rock = new THREE.Mesh(
-      new THREE.DodecahedronGeometry(1.0, 0),
-      new THREE.MeshStandardMaterial({ color: OBJECT_COLORS.ROCK, flatShading: true, roughness: 1.0 }));
-    rock.position.y = 0.3;
-    rock.scale.y = 0.7;
-    g.add(rock);
+    const material = new THREE.MeshStandardMaterial({
+      color: OBJECT_COLORS.GAUGE, emissive: 0x123c4a, emissiveIntensity: 0.8,
+    });
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 2.4, 10), material);
+    pole.position.y = 1.2;
+    const marker = new THREE.Mesh(new THREE.TorusGeometry(0.35, 0.07, 8, 24), material);
+    marker.position.y = 2.2;
+    marker.rotation.x = Math.PI / 2;
+    g.add(pole, marker);
     return g;
   },
 };
@@ -102,5 +102,5 @@ export function applyTransform(group: THREE.Group, obj: ObjectData): void {
 
 /** Approximate half-heights for placing objects on the selected tool. */
 export function objectHalfSize(type: string): number {
-  return { HOUSE: 0, CAR: 0, TREE: 0, BOX: 0, DEBRIS: 0 }[type] ?? 0;
+  return { HOUSE: 0, CAR: 0, TREE: 0, BOX: 0, DEBRIS: 0, GAUGE: 0 }[type] ?? 0;
 }

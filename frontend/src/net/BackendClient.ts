@@ -1,4 +1,4 @@
-/** WebSocket client: JSON control/state messages + binary particle frames. */
+/** WebSocket client: JSON control/state messages + versioned bulk frames. */
 import type { EngineInfo, ObjectData, SimStateMessage, WorldData } from '../world/types';
 
 export type BackendStatus = 'connecting' | 'connected' | 'disconnected';
@@ -116,12 +116,13 @@ export class BackendClient {
     if (!components || buffer.byteLength !== 16 + count * components * 4) return;
     const floats = new Float32Array(buffer, 16, count * components);
     if (kind === 0) this.particleHandler?.(floats, count);
-    else if (kind === 1) this.waterHeightHandler?.(floats, count);
-    // remaining scaffolding kinds are dispatched here as they get implemented
+    if (kind === 1) this.waterHeightHandler?.(floats, count,
+      Number(view.getBigUint64(8, true)) / 1000);
   }
 
   particleHandler: ((positions: Float32Array, count: number) => void) | null = null;
-  waterHeightHandler: ((depths: Float32Array, count: number) => void) | null = null;
+  waterHeightHandler: ((heights: Float32Array, count: number,
+                         simTime: number) => void) | null = null;
 
   send(op: Record<string, unknown>): boolean {
     if (this.ws?.readyState === WebSocket.OPEN) {

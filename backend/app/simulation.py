@@ -8,18 +8,31 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from . import config, protocol
 from .compute_engine import ComputeEngine, create_engine
 from .events import EventLog, EventType
-from .fluid_solver import FluidSolver, ShallowWaterFluidSolver
+from .fluid_solver import FluidSolver, create_fluid_solver
 from .persistence import load_world, save_world
-from .rigid_body import ForceRigidBodySystem, RigidBodySystem
+from .rigid_body import PlaceholderRigidBodySystem, RigidBodySystem
 from .world_state import WorldState, finite_number, vector3
 
 SendText = Callable[[str], Coroutine[None, None, None]]
 SendBytes = Callable[[bytes], Coroutine[None, None, None]]
+
+
+@dataclass
+class GaugeRuntime:
+    arrival_time: Optional[float] = None
+    latest: Optional[Dict[str, Any]] = None
+    history: deque = field(default_factory=lambda: deque(
+        maxlen=config.GAUGE_HISTORY_CAPACITY))
+    pending: deque = field(default_factory=lambda: deque(
+        maxlen=config.GAUGE_HISTORY_CAPACITY))
+    next_history_time: float = 0.0
 
 
 class SimulationManager:
@@ -29,20 +42,23 @@ class SimulationManager:
         self.world = WorldState()
         self.initial: Optional[WorldState] = None
         self.engine: ComputeEngine = create_engine()
-        self.fluid: FluidSolver = ShallowWaterFluidSolver()
-        self.rigid: RigidBodySystem = ForceRigidBodySystem()
+        self.fluid: FluidSolver = create_fluid_solver(self.engine.device)
+        self.rigid: RigidBodySystem = PlaceholderRigidBodySystem()
         self.events = EventLog()
         self.status = self.IDLE
         self.sim_time = 0.0
         self.speed = 1.0
         self.sim_fps = 0.0
         self._flush_final_frame = False
-        self._last_terrain_resync = 0.0
         self._steps_in_window = 0
         self._fps_window_start = time.perf_counter()
         self._task: Optional[asyncio.Task] = None
         self._send_text: Optional[SendText] = None
         self._send_bytes: Optional[SendBytes] = None
+        self.terrain_revision = 0
+        self.obstacle_revision = 0
+        self._obstacle_snapshot: Optional[dict] = None
+        self._gauges: Dict[str, GaugeRuntime] = {}
         self.selftest_result: Dict[str, Any] = {}
         try:
             self.selftest_result = self.engine.selftest()
@@ -58,12 +74,15 @@ class SimulationManager:
         if self._task is not None and not self._task.done():
             return
         try:
-            self._task = asyncio.create_task(self._loop())
+            loop = asyncio.get_running_loop()
         except RuntimeError:  # no running loop (headless/test use)
             self._task = None
+            return
+        self._task = loop.create_task(self._loop())
 
     def engine_info(self) -> Dict[str, Any]:
         return {
+            "version": config.VERSION,
             "engine": self.engine.kind,
             "warp_available": self.engine.warp_available,
             "cuda": self.engine.cuda,
@@ -71,6 +90,7 @@ class SimulationManager:
             "gpu_name": self.engine.device_name,
             "selftest": self.selftest_result,
             "dt": config.FIXED_DT,
+            "fluid": self.fluid.diagnostics(),
         }
 
     # ------------------------------------------------------------------ world edits
@@ -81,10 +101,21 @@ class SimulationManager:
                                         vector3(obj.get("position", [0, 0, 0]), "position"))
         created.rotation = vector3(obj.get("rotation", [0, 0, 0]), "rotation")
         created.scale = vector3(obj.get("scale", [1, 1, 1]), "scale", positive=True)
-        for key in ("mass", "friction", "buoyancy"):
+        for key in ("mass", "friction", "buoyancy", "volume_m3",
+                    "drag_coefficient", "ground_contact_area", "cross_sectional_area"):
             if key in obj:
-                setattr(created, key, finite_number(obj[key], key))
+                value = finite_number(obj[key], key)
+                if key not in ("friction", "buoyancy") and value <= 0.0:
+                    raise ValueError(f"{key} must be greater than zero")
+                if key == "buoyancy" and not 0.0 <= value <= 1.0:
+                    raise ValueError("buoyancy must be between 0 and 1")
+                setattr(created, key, value)
         self.rigid.register_body(created)
+        if created.type == "GAUGE":
+            self._gauges[created.id] = GaugeRuntime(next_history_time=self.sim_time)
+        if created.type == "HOUSE":
+            self.obstacle_revision += 1
+            self._obstacle_snapshot = None
         return created.to_dict()
 
     def apply_object_update(self, obj_id: str, fields: Dict[str, Any]) -> None:
@@ -98,8 +129,18 @@ class SimulationManager:
                 setattr(obj, key, vector3(value, key))
             elif key == "scale":
                 obj.scale = vector3(value, key, positive=True)
-            elif key in ("mass", "friction", "buoyancy", "damage"):
-                setattr(obj, key, finite_number(value, key))
+            elif key in ("mass", "friction", "buoyancy", "damage", "volume_m3",
+                         "drag_coefficient", "ground_contact_area",
+                         "cross_sectional_area"):
+                number = finite_number(value, key)
+                if key in ("mass", "volume_m3", "drag_coefficient",
+                           "ground_contact_area", "cross_sectional_area") and number <= 0.0:
+                    raise ValueError(f"{key} must be greater than zero")
+                if key == "friction" and number < 0.0:
+                    raise ValueError("friction must be non-negative")
+                if key == "buoyancy" and not 0.0 <= number <= 1.0:
+                    raise ValueError("buoyancy must be between 0 and 1")
+                setattr(obj, key, number)
             elif key == "metadata":
                 if not isinstance(value, dict):
                     raise ValueError("metadata must be an object")
@@ -107,13 +148,25 @@ class SimulationManager:
             else:
                 raise ValueError(f"field is not editable: {key}")
         self.rigid.update_body(obj)
+        if obj.type == "GAUGE" and "position" in fields:
+            self._gauges[obj.id] = GaugeRuntime(next_history_time=self.sim_time)
+        if obj.type == "HOUSE" and any(key in fields for key in ("position", "rotation", "scale")):
+            self.obstacle_revision += 1
+            self._obstacle_snapshot = None
 
     def apply_object_remove(self, obj_id: str) -> None:
+        obj = self.world.objects.get(obj_id)
         self.rigid.unregister_body(obj_id)
         self.world.objects.pop(obj_id, None)
+        self._gauges.pop(obj_id, None)
+        if obj is not None and obj.type == "HOUSE":
+            self.obstacle_revision += 1
+            self._obstacle_snapshot = None
 
     def apply_terrain_brush(self, x: float, z: float, radius: float,
                             strength: float) -> Dict[str, Any]:
+        if self.status == self.RUNNING:
+            raise ValueError("terrain editing is disabled while simulation is RUNNING")
         x = finite_number(x, "terrain.x")
         z = finite_number(z, "terrain.z")
         radius = finite_number(radius, "terrain.radius")
@@ -123,27 +176,14 @@ class SimulationManager:
         if abs(strength) > 10.0:
             raise ValueError("terrain.strength out of range")
         self.world.terrain.brush(x, z, radius, strength)
+        self.terrain_revision += 1
         return {"heights": self.world.terrain.to_list(),
                 "checksum": self.world.terrain.checksum()}
 
     def apply_water_level(self, level: float) -> None:
         self.world.water.level = finite_number(level, "water.level")
-
-    def apply_water_flow(self, enabled: bool) -> None:
-        """Continuous river current toggle -- read live each tick in
-        _step_once(), so unlike water_level this takes effect immediately
-        even while RUNNING."""
-        self.world.water.flow_enabled = bool(enabled)
-
-    def apply_environment_temperature(self, value: float) -> None:
-        """Baseline water temperature (v0.4 RiverLab, Schauberger hypothesis).
-
-        Read live each tick by ShallowWaterFluidSolver.set_environment() --
-        no re-init needed, unlike water_level which only takes effect at
-        start()/reset() (see docs/04_TZ_v0.3_roadmap.md v0.4 "честные
-        нюансы" for that separate, still-open gap).
-        """
-        self.world.environment.temperature = finite_number(value, "environment.temperature")
+        if hasattr(self.fluid, "set_level"):
+            self.fluid.set_level(self.world.water.level)
 
     # ------------------------------------------------------------------ clock control
     def start(self) -> None:
@@ -156,12 +196,16 @@ class SimulationManager:
         self.initial = self.world.clone()
         self.fluid.initialize(self.world)
         self.rigid.initialize(self.world, self.fluid, self.events)
-        self.engine.init_particles(config.PARTICLE_COUNT, self.world.water.level)
+        self._reset_gauges()
+        self._obstacle_snapshot = self.rigid.obstacle_snapshot()
+        self.fluid.set_boundaries(self.world.terrain, self._obstacle_snapshot,
+                                  self.terrain_revision, self.obstacle_revision)
+        if config.ENABLE_DEBUG_PARTICLES:
+            self.engine.init_particles(config.PARTICLE_COUNT, self.world.water.level)
         self.sim_time = 0.0
-        self._last_terrain_resync = 0.0
         self.status = self.RUNNING
         self.events.record(self.sim_time, EventType.SIM_STARTED, cause="user",
-                           particles=config.PARTICLE_COUNT,
+                           particles=config.PARTICLE_COUNT if config.ENABLE_DEBUG_PARTICLES else 0,
                            engine=self.engine.kind, device=self.engine.device)
         if self._task is None or self._task.done():
             self._ensure_loop()
@@ -177,11 +221,15 @@ class SimulationManager:
             self.world = self.initial.clone()
         self.status = self.IDLE
         self.sim_time = 0.0
-        self._last_terrain_resync = 0.0
         self.events.record(self.sim_time, EventType.SIM_RESET, cause="user")
         self.fluid.initialize(self.world)
         self.rigid.initialize(self.world, self.fluid, self.events)
-        self.engine.init_particles(config.PARTICLE_COUNT, self.world.water.level)
+        self._reset_gauges()
+        self._obstacle_snapshot = self.rigid.obstacle_snapshot()
+        self.fluid.set_boundaries(self.world.terrain, self._obstacle_snapshot,
+                                  self.terrain_revision, self.obstacle_revision)
+        if config.ENABLE_DEBUG_PARTICLES:
+            self.engine.init_particles(config.PARTICLE_COUNT, self.world.water.level)
 
     def set_speed(self, value: float) -> None:
         value = finite_number(value, "speed")
@@ -205,27 +253,86 @@ class SimulationManager:
         self.initial = None
         self.status = self.IDLE
         self.sim_time = 0.0
-        self._last_terrain_resync = 0.0
         self.fluid.initialize(self.world)
         self.rigid.initialize(self.world, self.fluid, self.events)
-        self.engine.init_particles(config.PARTICLE_COUNT, self.world.water.level)
+        self._reset_gauges()
+        self.terrain_revision += 1
+        self.obstacle_revision += 1
+        self._obstacle_snapshot = self.rigid.obstacle_snapshot()
+        self.fluid.set_boundaries(self.world.terrain, self._obstacle_snapshot,
+                                  self.terrain_revision, self.obstacle_revision)
+        if config.ENABLE_DEBUG_PARTICLES:
+            self.engine.init_particles(config.PARTICLE_COUNT, self.world.water.level)
         self.events.record(self.sim_time, EventType.WORLD_LOADED, cause="user",
                            name=name)
 
     # ------------------------------------------------------------------ physics loop
     def _step_once(self) -> None:
         dt = config.FIXED_DT
-        self.engine.step_particles(dt)
-        self.fluid.set_boundaries(self.world.terrain, self.rigid.obstacle_snapshot())
-        self.fluid.set_environment(self.world.environment.temperature, self.rigid.shade_snapshot())
-        self.fluid.set_bed_obstructions(self.rigid.bed_snapshot())
-        self.fluid.set_river_flow(self.world.water.flow_enabled)
+        if config.ENABLE_DEBUG_PARTICLES:
+            self.engine.step_particles(dt)
+        if self._obstacle_snapshot is None:
+            self._obstacle_snapshot = self.rigid.obstacle_snapshot()
+        self.fluid.set_boundaries(self.world.terrain, self._obstacle_snapshot,
+                                  self.terrain_revision, self.obstacle_revision)
         self.fluid.advance(dt, config.FLUID_MAX_SUBSTEPS, config.FLUID_STABILITY_DT)
-        samples = self.fluid.sample_for_bodies(self.rigid.buffer.positions,
-                                               self.rigid.buffer.footprint_radii)
+        samples = self.fluid.sample_for_bodies(
+            self.rigid.buffer.positions, self.rigid.buffer.velocities,
+            self.rigid.buffer.drag_coefficients, self.rigid.buffer.cross_areas,
+            self.rigid.buffer.body_heights, self.rigid.buffer.rotations,
+            self.rigid.buffer.half_extents)
         self.rigid.step(dt, self.sim_time, samples)
         self.sim_time += dt
+        self._update_gauges(self.sim_time)
         self._steps_in_window += 1
+
+    def _reset_gauges(self) -> None:
+        self._gauges = {oid: GaugeRuntime()
+                        for oid, obj in self.world.objects.items()
+                        if obj.type == "GAUGE"}
+
+    def _update_gauges(self, sample_time: float) -> None:
+        for oid, runtime in self._gauges.items():
+            fluid_sample = self.rigid.latest_fluid_samples.get(oid)
+            if fluid_sample is None:
+                continue
+            depth = float(fluid_sample["depth"])
+            velocity = fluid_sample["velocity"]
+            speed = float((velocity[0] ** 2 + velocity[2] ** 2) ** 0.5)
+            wet = depth > config.FLUID_DRY_DEPTH
+            sample = {
+                "time_s": round(sample_time, 3),
+                "water_depth_m": depth,
+                "surface_elevation_m": float(fluid_sample["surface"]) if wet else None,
+                "speed_m_s": speed,
+            }
+            runtime.latest = sample
+            if wet and runtime.arrival_time is None:
+                runtime.arrival_time = sample_time
+                self.events.record(sample_time, EventType.WATER_ENTERED_AREA, oid,
+                                   cause="gauge_depth_threshold_crossed",
+                                   threshold_m=config.FLUID_DRY_DEPTH,
+                                   water_depth_m=depth,
+                                   surface_elevation_m=sample["surface_elevation_m"],
+                                   speed_m_s=speed)
+            if sample_time + 1.0e-9 >= runtime.next_history_time:
+                runtime.history.append(sample)
+                runtime.pending.append(sample)
+                while runtime.next_history_time <= sample_time + 1.0e-9:
+                    runtime.next_history_time += config.GAUGE_HISTORY_INTERVAL
+
+    def _serialize_gauges(self) -> List[Dict[str, Any]]:
+        result = []
+        for oid, runtime in self._gauges.items():
+            result.append({
+                "id": oid,
+                "arrival_time_s": (round(runtime.arrival_time, 3)
+                                   if runtime.arrival_time is not None else None),
+                "latest": runtime.latest,
+                "samples": list(runtime.pending),
+            })
+            runtime.pending.clear()
+        return result
 
     async def _loop(self) -> None:
         interval = 1.0 / config.STREAM_HZ
@@ -255,42 +362,21 @@ class SimulationManager:
     async def _stream(self) -> None:
         if self._send_text is None or self._send_bytes is None:
             return
+        particle_count = 0
         if self.status == self.RUNNING or self._flush_final_frame:
             if self.status == self.PAUSED:
                 self._flush_final_frame = False
-            positions = self.engine.visualization_positions(config.VISUALIZATION_PARTICLE_LIMIT)
+            positions = self.fluid.get_flow_particles()
+            particle_count = len(positions)
             if len(positions):
                 try:
                     await self._send_bytes(protocol.encode_particles(positions, self.sim_time))
                 except Exception:
                     return  # client disconnected; the loop must survive
-            depth_grid = self.fluid.get_depth_grid()
-            if depth_grid is not None:
+            heights = self.fluid.get_water_height_field()
+            if len(heights):
                 try:
-                    await self._send_bytes(protocol.encode_float_frame(
-                        protocol.FrameKind.WATER_HEIGHT, depth_grid, self.sim_time))
-                except Exception:
-                    return
-            if (self.status == self.RUNNING
-                    and self.sim_time - self._last_terrain_resync >= config.TERRAIN_RESYNC_INTERVAL_S):
-                # RiverLab (v0.4): erosion/deposition mutates world.terrain
-                # directly each tick (see ShallowWaterFluidSolver), but the
-                # existing terrain sync is otherwise only a reply to an
-                # explicit terrain_brush op -- without this, erosion would
-                # be physically real on the backend and invisible on the
-                # frontend, the exact class of bug already found and fixed
-                # for water (see docs/04_TZ_v0.3_roadmap.md "Архитектурный
-                # принцип"). Reuses the existing terrain_patch message the
-                # frontend already knows how to apply, just throttled
-                # (every TERRAIN_RESYNC_INTERVAL_S) since it's JSON, not
-                # the binary bulk path.
-                self._last_terrain_resync = self.sim_time
-                try:
-                    await self._send_text(json.dumps({
-                        "type": "terrain_patch",
-                        "heights": self.world.terrain.to_list(),
-                        "checksum": self.world.terrain.checksum(),
-                    }, separators=(",", ":")))
+                    await self._send_bytes(protocol.encode_water_height(heights, self.sim_time))
                 except Exception:
                     return
         moved = [(oid, obj.position, obj.state)
@@ -303,11 +389,13 @@ class SimulationManager:
             "speed": self.speed,
             "sim_fps": round(self.sim_fps, 1),
             "objects": len(self.world.objects),
-            "particles": min(config.PARTICLE_COUNT, config.VISUALIZATION_PARTICLE_LIMIT)
-            if self.status != self.IDLE else 0,
+            "particles": particle_count,
+            "gauge_history_capacity": config.GAUGE_HISTORY_CAPACITY,
+            "gauges": self._serialize_gauges(),
             "events": self.events.take_pending(),
             "moved_objects": [{"id": oid, "position": [float(round(p, 3)) for p in pos],
-                               "state": state} for oid, pos, state in moved],
+                                "state": state} for oid, pos, state in moved],
+            "fluid": self.fluid.diagnostics(),
         }
         try:
             await self._send_text(json.dumps(message, separators=(",", ":")))

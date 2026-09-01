@@ -2,11 +2,11 @@
  *  The backend stays authoritative for simulation; this store mirrors the
  *  editor state and applies streamed simulation updates. */
 import { TerrainGrid } from './TerrainGrid';
-import type { ObjectData, WorldData } from './types';
+import type { GaugeSample, GaugeState, ObjectData, WorldData } from './types';
 
 export type StoreEvent =
   | 'objects-changed' | 'object-updated' | 'terrain-changed'
-  | 'water-changed' | 'world-replaced' | 'selection-changed';
+  | 'water-changed' | 'world-replaced' | 'selection-changed' | 'gauge-updated';
 
 type Listener = (payload?: unknown) => void;
 
@@ -15,8 +15,12 @@ export class WorldStore {
   objects = new Map<string, ObjectData>();
   waterLevel = 0.5;
   waterVisible = true;
-  waterFlowEnabled = false;   // continuous river current, see backend WaterState
+  waterFrameTime = 0;
+  waterFrameCount = 0;
   selectedId: string | null = null;
+  gauges = new Map<string, GaugeState>();
+  gaugeHistory = new Map<string, GaugeSample[]>();
+  gaugeHistoryCapacity = 600;
 
   private listeners = new Map<StoreEvent, Set<Listener>>();
 
@@ -37,8 +41,11 @@ export class WorldStore {
     this.objects = new Map(world.objects.map((o) => [o.id, o]));
     this.waterLevel = world.water.level;
     this.waterVisible = world.water.visible;
-    this.waterFlowEnabled = world.water.flow_enabled ?? false;
+    this.waterFrameTime = 0;
+    this.waterFrameCount = 0;
     this.selectedId = null;
+    this.gauges.clear();
+    this.gaugeHistory.clear();
     this.emit('world-replaced');
   }
 
@@ -57,6 +64,8 @@ export class WorldStore {
 
   removeObject(id: string): void {
     if (!this.objects.delete(id)) return;
+    this.gauges.delete(id);
+    this.gaugeHistory.delete(id);
     if (this.selectedId === id) this.select(null);
     this.emit('objects-changed');
   }
@@ -78,8 +87,15 @@ export class WorldStore {
     this.emit('water-changed');
   }
 
-  setWaterFlow(enabled: boolean): void {
-    this.waterFlowEnabled = enabled;
-    this.emit('water-changed');
+  applyGaugeStates(states: GaugeState[], capacity: number): void {
+    this.gaugeHistoryCapacity = capacity;
+    for (const state of states) {
+      this.gauges.set(state.id, state);
+      const history = this.gaugeHistory.get(state.id) ?? [];
+      history.push(...state.samples);
+      if (history.length > capacity) history.splice(0, history.length - capacity);
+      this.gaugeHistory.set(state.id, history);
+      this.emit('gauge-updated', state.id);
+    }
   }
 }

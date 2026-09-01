@@ -1,4 +1,4 @@
-"""Fluid solver contract with boundary coupling and internal substeps."""
+"""Warp shallow-water solver with revision-driven GPU coupling."""
 from __future__ import annotations
 
 import math
@@ -7,527 +7,682 @@ from typing import Optional
 import numpy as np
 
 from . import config
+from .compute_engine import WARP_IMPORTED, wp
+
+
+if WARP_IMPORTED:
+    @wp.kernel
+    def _velocity_step(h: wp.array(dtype=float), u: wp.array(dtype=float),
+                       v: wp.array(dtype=float), bed: wp.array(dtype=float),
+                       solid: wp.array(dtype=wp.int32),
+                       next_u: wp.array(dtype=float), next_v: wp.array(dtype=float),
+                       width: int, height: int, dx: float, dt: float,
+                       gravity: float, dry: float, damping: float,
+                       max_velocity: float):
+        idx = wp.tid()
+        i = idx % width
+        j = idx // width
+        if solid[idx] != 0 or h[idx] <= dry:
+            next_u[idx] = 0.0
+            next_v[idx] = 0.0
+        else:
+            eta = bed[idx] + h[idx]
+            eta_l = eta
+            eta_r = eta
+            eta_d = eta
+            eta_u = eta
+            if i > 0 and solid[idx - 1] == 0:
+                eta_l = bed[idx - 1] + h[idx - 1]
+                if h[idx - 1] <= dry and bed[idx - 1] >= eta:
+                    eta_l = eta
+            if i < width - 1 and solid[idx + 1] == 0:
+                eta_r = bed[idx + 1] + h[idx + 1]
+                if h[idx + 1] <= dry and bed[idx + 1] >= eta:
+                    eta_r = eta
+            if j > 0 and solid[idx - width] == 0:
+                eta_d = bed[idx - width] + h[idx - width]
+                if h[idx - width] <= dry and bed[idx - width] >= eta:
+                    eta_d = eta
+            if j < height - 1 and solid[idx + width] == 0:
+                eta_u = bed[idx + width] + h[idx + width]
+                if h[idx + width] <= dry and bed[idx + width] >= eta:
+                    eta_u = eta
+
+            decay = wp.max(0.0, 1.0 - damping * dt)
+            ux = (u[idx] - gravity * dt * (eta_r - eta_l) / (2.0 * dx)) * decay
+            vz = (v[idx] - gravity * dt * (eta_u - eta_d) / (2.0 * dx)) * decay
+            if i == 0 or i == width - 1:
+                ux = 0.0
+            if j == 0 or j == height - 1:
+                vz = 0.0
+            next_u[idx] = wp.clamp(ux, -max_velocity, max_velocity)
+            next_v[idx] = wp.clamp(vz, -max_velocity, max_velocity)
+
+
+    @wp.func
+    def _face_flux(velocity: float, h_from: float, bed_from: float,
+                   bed_other: float) -> float:
+        available = wp.max(0.0, bed_from + h_from - wp.max(bed_from, bed_other))
+        return velocity * available
+
+
+    @wp.kernel
+    def _depth_step(h: wp.array(dtype=float), u: wp.array(dtype=float),
+                    v: wp.array(dtype=float), bed: wp.array(dtype=float),
+                    solid: wp.array(dtype=wp.int32), next_h: wp.array(dtype=float),
+                    width: int, height: int, dx: float, dt: float):
+        idx = wp.tid()
+        i = idx % width
+        j = idx // width
+        if solid[idx] != 0:
+            next_h[idx] = 0.0
+        else:
+            q_right = float(0.0)
+            q_left = float(0.0)
+            q_up = float(0.0)
+            q_down = float(0.0)
+            if i < width - 1 and solid[idx + 1] == 0:
+                face = 0.5 * (u[idx] + u[idx + 1])
+                if face >= 0.0:
+                    q_right = _face_flux(face, h[idx], bed[idx], bed[idx + 1])
+                else:
+                    q_right = _face_flux(face, h[idx + 1], bed[idx + 1], bed[idx])
+            if i > 0 and solid[idx - 1] == 0:
+                face = 0.5 * (u[idx - 1] + u[idx])
+                if face >= 0.0:
+                    q_left = _face_flux(face, h[idx - 1], bed[idx - 1], bed[idx])
+                else:
+                    q_left = _face_flux(face, h[idx], bed[idx], bed[idx - 1])
+            if j < height - 1 and solid[idx + width] == 0:
+                face = 0.5 * (v[idx] + v[idx + width])
+                if face >= 0.0:
+                    q_up = _face_flux(face, h[idx], bed[idx], bed[idx + width])
+                else:
+                    q_up = _face_flux(face, h[idx + width], bed[idx + width], bed[idx])
+            if j > 0 and solid[idx - width] == 0:
+                face = 0.5 * (v[idx - width] + v[idx])
+                if face >= 0.0:
+                    q_down = _face_flux(face, h[idx - width], bed[idx - width], bed[idx])
+                else:
+                    q_down = _face_flux(face, h[idx], bed[idx], bed[idx - width])
+            value = h[idx] - dt * ((q_right - q_left) + (q_up - q_down)) / dx
+            next_h[idx] = wp.max(0.0, value)
+
+
+    @wp.kernel
+    def _apply_source(h: wp.array(dtype=float), bed: wp.array(dtype=float),
+                      solid: wp.array(dtype=wp.int32), width: int, height: int,
+                      source_columns: int, level: float):
+        idx = wp.tid()
+        if idx < width * height:
+            i = idx % width
+            if i < source_columns and solid[idx] == 0:
+                h[idx] = wp.max(0.0, level - bed[idx])
+
+
+    @wp.kernel
+    def _advect_flow_tracers(particles: wp.array(dtype=wp.vec3),
+                             h: wp.array(dtype=float), u: wp.array(dtype=float),
+                             v: wp.array(dtype=float), bed: wp.array(dtype=float),
+                             solid: wp.array(dtype=wp.int32), width: int, height: int,
+                             source_columns: int, dx: float, dt: float, dry: float):
+        n = wp.tid()
+        p = particles[n]
+        i = int(wp.floor(p.x / dx + float(width - 1) * 0.5 + 0.5))
+        j = int(wp.floor(p.z / dx + float(height - 1) * 0.5 + 0.5))
+        valid = i > 0 and i < width - 1 and j > 0 and j < height - 1
+        if valid:
+            idx = j * width + i
+            valid = solid[idx] == 0 and h[idx] > dry
+        if valid:
+            nx = p.x + u[idx] * dt
+            nz = p.z + v[idx] * dt
+            ni = int(wp.floor(nx / dx + float(width - 1) * 0.5 + 0.5))
+            nj = int(wp.floor(nz / dx + float(height - 1) * 0.5 + 0.5))
+            if ni > 0 and ni < width - 1 and nj > 0 and nj < height - 1:
+                next_idx = nj * width + ni
+                if solid[next_idx] == 0 and h[next_idx] > dry:
+                    particles[n] = wp.vec3(nx, bed[next_idx] + h[next_idx] + 0.08, nz)
+                else:
+                    particles[n] = wp.vec3(p.x, bed[idx] + h[idx] + 0.08, p.z)
+        else:
+            rows = wp.max(1, height - 2)
+            si = wp.min(width - 2, wp.max(1, source_columns - 1))
+            sj = 1 + n % rows
+            subcell = float((n // rows) % 64) / 64.0 - 0.5
+            spawn_idx = sj * width + si
+            sx = (float(si) - float(width - 1) * 0.5) * dx
+            sz = (float(sj) + subcell - float(height - 1) * 0.5) * dx
+            sy = -100.0
+            if solid[spawn_idx] == 0 and h[spawn_idx] > dry:
+                sy = bed[spawn_idx] + h[spawn_idx] + 0.08
+            particles[n] = wp.vec3(sx, sy, sz)
+
+
+    @wp.kernel
+    def _clear_diagnostics(max_depth: wp.array(dtype=float),
+                           max_speed: wp.array(dtype=float),
+                           max_wave: wp.array(dtype=float),
+                           volume: wp.array(dtype=float), wet: wp.array(dtype=wp.int32)):
+        max_depth[0] = 0.0
+        max_speed[0] = 0.0
+        max_wave[0] = 0.0
+        volume[0] = 0.0
+        wet[0] = 0
+
+
+    @wp.kernel
+    def _reduce_diagnostics(h: wp.array(dtype=float), u: wp.array(dtype=float),
+                            v: wp.array(dtype=float), solid: wp.array(dtype=wp.int32),
+                            gravity: float, area: float, dry: float,
+                            max_depth: wp.array(dtype=float),
+                            max_speed: wp.array(dtype=float),
+                            max_wave: wp.array(dtype=float),
+                            volume: wp.array(dtype=float), wet: wp.array(dtype=wp.int32)):
+        idx = wp.tid()
+        if solid[idx] == 0:
+            depth = wp.max(0.0, h[idx])
+            speed = wp.sqrt(u[idx] * u[idx] + v[idx] * v[idx])
+            wave = wp.max(wp.abs(u[idx]), wp.abs(v[idx])) + wp.sqrt(gravity * depth)
+            wp.atomic_max(max_depth, 0, depth)
+            wp.atomic_max(max_speed, 0, speed)
+            wp.atomic_max(max_wave, 0, wave)
+            wp.atomic_add(volume, 0, depth * area)
+            if depth > dry:
+                wp.atomic_add(wet, 0, 1)
+
+
+    @wp.kernel
+    def _sample_bodies(h: wp.array(dtype=float), u: wp.array(dtype=float),
+                       v: wp.array(dtype=float), bed: wp.array(dtype=float),
+                       solid: wp.array(dtype=wp.int32),
+                       positions: wp.array(dtype=wp.vec3),
+                       rotations: wp.array(dtype=wp.vec3),
+                       half_extents: wp.array(dtype=wp.vec2),
+                       body_velocities: wp.array(dtype=wp.vec3),
+                       drag: wp.array(dtype=float), cross_area: wp.array(dtype=float),
+                       body_height: wp.array(dtype=float),
+                       sample_depth: wp.array(dtype=float),
+                       sample_immersion: wp.array(dtype=float),
+                       sample_surface: wp.array(dtype=float),
+                       sample_support: wp.array(dtype=float),
+                       sample_velocity: wp.array(dtype=wp.vec3),
+                       sample_force: wp.array(dtype=wp.vec3),
+                       width: int, height: int, dx: float, rho: float):
+        n = wp.tid()
+        p = positions[n]
+        extent = half_extents[n]
+        yaw = rotations[n].y
+        c = wp.cos(yaw)
+        s = wp.sin(yaw)
+        support = -1.0e20
+        for sample in range(9):
+            sx = float(sample % 3 - 1) * extent.x
+            sz = float(sample // 3 - 1) * extent.y
+            x = p.x + c * sx + s * sz
+            z = p.z - s * sx + c * sz
+            i = int(wp.floor(x / dx + float(width - 1) * 0.5 + 0.5))
+            j = int(wp.floor(z / dx + float(height - 1) * 0.5 + 0.5))
+            if i >= 0 and i < width and j >= 0 and j < height:
+                support = wp.max(support, bed[j * width + i])
+        if support < -1.0e10:
+            support = p.y
+        base_y = wp.max(p.y, support)
+        total_depth = float(0.0)
+        total_immersion = float(0.0)
+        total_surface = float(0.0)
+        wet_samples = int(0)
+        total_flow = wp.vec3(0.0, 0.0, 0.0)
+        total_force = wp.vec3(0.0, 0.0, 0.0)
+        for sample in range(9):
+            sx = float(sample % 3 - 1) * extent.x
+            sz = float(sample // 3 - 1) * extent.y
+            x = p.x + c * sx + s * sz
+            z = p.z - s * sx + c * sz
+            i = int(wp.floor(x / dx + float(width - 1) * 0.5 + 0.5))
+            j = int(wp.floor(z / dx + float(height - 1) * 0.5 + 0.5))
+            if i >= 0 and i < width and j >= 0 and j < height:
+                idx = j * width + i
+                if solid[idx] == 0 and h[idx] > 0.0:
+                    depth = wp.max(0.0, h[idx])
+                    surface = bed[idx] + depth
+                    immersion = wp.clamp(surface - base_y, 0.0, body_height[n])
+                    flow = wp.vec3(u[idx], 0.0, v[idx])
+                    relative = flow - body_velocities[n]
+                    speed = wp.length(relative)
+                    submerged = immersion / wp.max(body_height[n], 1.0e-4)
+                    total_depth = total_depth + depth
+                    total_immersion = total_immersion + immersion
+                    total_surface = total_surface + surface
+                    total_flow = total_flow + flow
+                    total_force = total_force + relative * (
+                        0.5 * rho * drag[n] * cross_area[n] * submerged * speed)
+                    wet_samples = wet_samples + 1
+        sample_depth[n] = total_depth / 9.0
+        sample_immersion[n] = total_immersion / 9.0
+        sample_support[n] = support
+        sample_force[n] = total_force / 9.0
+        if wet_samples > 0:
+            sample_surface[n] = total_surface / float(wet_samples)
+            sample_velocity[n] = total_flow / float(wet_samples)
+        else:
+            sample_surface[n] = support
+            sample_velocity[n] = wp.vec3(0.0, 0.0, 0.0)
 
 
 class FluidSolver:
     def initialize(self, world) -> None: ...
-    def set_boundaries(self, terrain, obstacles: dict) -> None: ...
-    def set_environment(self, base_temperature: float, shade: dict) -> None: ...
-    def set_bed_obstructions(self, bed: dict) -> None: ...
-    def set_river_flow(self, enabled: bool) -> None: ...
+    def set_boundaries(self, terrain, obstacles: dict, terrain_revision=0,
+                       obstacle_revision=0) -> None: ...
     def advance(self, global_dt: float, max_substeps: int, stability_dt: float) -> int: ...
-    def sample_for_bodies(self, positions: np.ndarray, radii: Optional[np.ndarray] = None) -> dict: ...
+    def sample_for_bodies(self, positions: np.ndarray, body_velocities=None,
+                           drag=None, cross_area=None, body_height=None,
+                           rotations=None, half_extents=None) -> dict: ...
     def reset(self) -> None: ...
     def get_water_height(self, x: float = 0.0, z: float = 0.0) -> float: ...
     def get_velocity_field(self) -> Optional[np.ndarray]: ...
-    def get_depth_grid(self) -> Optional[np.ndarray]:
-        """Full per-cell depth field, indexed exactly like TerrainGrid.heights.
-
-        Used to stream a WATER_HEIGHT bulk frame so the frontend can deform
-        the water mesh per-cell instead of showing a flat plane -- see
-        SimulationManager._stream() and
-        frontend/src/scene/SceneManager.ts:updateWaterField.
-        """
-        return None
+    def get_water_height_field(self) -> np.ndarray: ...
+    def get_flow_particles(self) -> np.ndarray: ...
+    def diagnostics(self) -> dict: ...
 
 
 class PlaceholderFluidSolver(FluidSolver):
     def __init__(self) -> None:
-        self._world = None
-        self._terrain = None
-        self._obstacles = {}
+        self._world = self._terrain = None
         self._level = 0.5
-        self._time = 0.0
         self.last_substeps = 0
 
     def initialize(self, world) -> None:
-        self._world = world
-        self._terrain = world.terrain
+        self._world, self._terrain = world, world.terrain
         self._level = world.water.level
-        self._time = 0.0
 
-    def set_boundaries(self, terrain, obstacles: dict) -> None:
+    def set_boundaries(self, terrain, obstacles: dict, terrain_revision=0,
+                       obstacle_revision=0) -> None:
         self._terrain = terrain
-        self._obstacles = obstacles
 
     def advance(self, global_dt: float, max_substeps: int, stability_dt: float) -> int:
-        substeps = max(1, min(max_substeps, math.ceil(global_dt / stability_dt)))
-        dt = global_dt / substeps
-        for _ in range(substeps):
-            self._time += dt
-            if self._world is not None:
-                self._level = self._world.water.level
-        self.last_substeps = substeps
-        return substeps
+        self.last_substeps = max(1, min(max_substeps, math.ceil(global_dt / stability_dt)))
+        return self.last_substeps
 
-    def sample_for_bodies(self, positions: np.ndarray, radii: Optional[np.ndarray] = None) -> dict:
+    def sample_for_bodies(self, positions: np.ndarray, body_velocities=None,
+                           drag=None, cross_area=None, body_height=None,
+                           rotations=None, half_extents=None) -> dict:
         count = len(positions)
         depths = np.zeros(count, dtype=np.float32)
         if self._terrain is not None:
-            for i, position in enumerate(positions):
-                terrain_h = self._terrain.height_at(float(position[0]), float(position[2]))
-                depths[i] = max(0.0, self._level - terrain_h)
-        velocities = np.tile(np.array([1.5, 0.0, 0.0], dtype=np.float32), (count, 1))
-        forces = velocities * depths[:, None]
-        return {"depths": depths, "velocities": velocities, "forces": forces}
+            for i, p in enumerate(positions):
+                depths[i] = max(0.0, self._level - self._terrain.height_at(p[0], p[2]))
+        velocities = np.zeros((count, 3), dtype=np.float32)
+        heights = np.ones(count, dtype=np.float32) if body_height is None \
+            else np.asarray(body_height, dtype=np.float32)
+        surfaces = depths + np.asarray([
+            self._terrain.height_at(float(p[0]), float(p[2])) for p in positions],
+            dtype=np.float32)
+        immersions = np.clip(surfaces - np.asarray(positions, dtype=np.float32)[:, 1],
+                             0.0, heights)
+        return {"depths": depths, "immersions": immersions,
+                "surface_elevations": surfaces,
+                "support_elevations": surfaces - depths, "velocities": velocities,
+                "forces": np.zeros_like(velocities)}
 
-    def reset(self) -> None:
-        self._time = 0.0
-        if self._world is not None:
-            self._level = self._world.water.level
-
-    def set_level(self, level: float) -> None:
-        self._level = level
-
-    def get_water_height(self, x: float = 0.0, z: float = 0.0) -> float:
-        return self._level
-
-    def get_velocity_field(self) -> Optional[np.ndarray]:
-        return np.array([1.5, 0.0, 0.0], dtype=np.float32)
-
-
-def _footprint_cells(radius: float, cell_size: float) -> float:
-    """Obstacle disk radius in grid cells for a given real-world radius.
-
-    Shared by _rasterize_obstacles (what counts as solid) and
-    sample_for_bodies (how far out a body must sample to clear its own
-    hole) so the two can never drift apart -- a real bug: they used to be
-    computed independently, and a sample ring 0.5 cells past the disk edge
-    still bilinear-blended with a boundary obstacle cell (halving the
-    reading), because interpolation reaches a full cell beyond the sample
-    point.
-    """
-    return max(1.0, float(radius) / cell_size)
+    def reset(self) -> None: pass
+    def set_level(self, level: float) -> None: self._level = float(level)
+    def get_water_height(self, x=0.0, z=0.0) -> float: return self._level
+    def get_velocity_field(self) -> Optional[np.ndarray]: return None
+    def get_water_height_field(self) -> np.ndarray:
+        return (np.full(self._terrain.heights.size, self._level, dtype=np.float32)
+                 if self._terrain is not None else np.zeros(0, dtype=np.float32))
+    def get_flow_particles(self) -> np.ndarray: return np.zeros((0, 3), dtype=np.float32)
+    def diagnostics(self) -> dict:
+        return {"solver": "placeholder", "substeps": self.last_substeps}
 
 
-def _bilinear(grid: np.ndarray, gx: np.ndarray, gz: np.ndarray) -> np.ndarray:
-    """Sample a (ny, nx) grid at fractional (gx, gz) cell coordinates."""
-    ny, nx = grid.shape
-    gx = np.clip(gx, 0, nx - 1)
-    gz = np.clip(gz, 0, ny - 1)
-    i0 = np.floor(gx).astype(np.int64)
-    j0 = np.floor(gz).astype(np.int64)
-    i1 = np.minimum(i0 + 1, nx - 1)
-    j1 = np.minimum(j0 + 1, ny - 1)
-    fx = gx - i0
-    fz = gz - j0
-    return ((1 - fx) * (1 - fz) * grid[j0, i0] + fx * (1 - fz) * grid[j0, i1]
-             + (1 - fx) * fz * grid[j1, i0] + fx * fz * grid[j1, i1])
-
-
-class ShallowWaterFluidSolver(FluidSolver):
-    """Height-field shallow water via outflow-limited cell exchange.
-
-    Each cell exchanges water with its 4 neighbours proportionally to the
-    total-height difference (terrain + depth), clamped so a cell can never
-    drain more water than it holds. This keeps the scheme unconditionally
-    mass-conservative (no water created or destroyed away from an explicit
-    source) and correctly diverts flow around obstacles/terrain changes,
-    which is the causal-realism bar this project actually requires (see
-    docs/04_TZ_v0.3_roadmap.md section 3) rather than a full Navier-Stokes
-    solver. World edges are closed (zero-flux) boundaries.
-
-    Obstacle footprint is currently a fixed radius per registered rigid
-    body (config.FLUID_OBSTACLE_RADIUS_M) rather than the object's real
-    scale — RigidStateBuffer does not carry scale yet. That is a follow-up,
-    not silently assumed correct.
-    """
-
-    def __init__(self) -> None:
-        self._world = None
-        self._terrain = None
-        self._depth: np.ndarray = np.zeros((1, 1), dtype=np.float32)
-        self._flow_x: np.ndarray = np.zeros((1, 1), dtype=np.float32)
-        self._flow_z: np.ndarray = np.zeros((1, 1), dtype=np.float32)
-        self._sediment: np.ndarray = np.zeros((1, 1), dtype=np.float32)
-        self._obstacle_mask: np.ndarray = np.zeros((1, 1), dtype=bool)
-        # per-cell multiplier on flow gain / sediment capacity from local
-        # shade cooling (v0.4, Schauberger hypothesis) -- recomputed each
-        # tick from current tree positions in _update_temperature_factor,
-        # deliberately NOT a persistent/diffusing field. Stays 1.0 (no
-        # effect) wherever nothing casts shade; broadcasts safely against
-        # the real grid shape even before set_environment() is ever called.
-        self._temperature_factor: np.ndarray = np.ones((1, 1), dtype=np.float32)
-        # per-cell rise of the effective riverbed from ROCK domes (v0.4) --
-        # like _temperature_factor, recomputed fresh each tick from current
-        # rock positions and never written back into world terrain, so moving
-        # or deleting a rock leaves no crater behind. Zero = flat bed.
-        self._bed_offset: np.ndarray = np.zeros((1, 1), dtype=np.float32)
-        self._flow_enabled = False
-        self._time = 0.0
+class WarpShallowWaterSolver(FluidSolver):
+    def __init__(self, device: str) -> None:
+        if not WARP_IMPORTED:
+            raise RuntimeError("NVIDIA Warp is unavailable")
+        self.device = device
+        self._world = self._terrain = None
+        self._width = self._height = self._count = 0
+        self._h = self._u = self._v = None
+        self._next_h = self._next_u = self._next_v = None
+        self._bed = self._obstacles = None
+        self._obstacle_host = np.zeros(0, dtype=np.int32)
+        self._bed_host = np.zeros(0, dtype=np.float32)
+        self._level = 0.5
+        self._source_enabled = True
+        self._seen_terrain_revision = -1
+        self._seen_obstacle_revision = -1
+        self.terrain_gpu_uploads = 0
+        self.obstacle_gpu_uploads = 0
         self.last_substeps = 0
-
-    # ------------------------------------------------------------------ setup
-    def initialize(self, world) -> None:
-        self._world = world
-        self._terrain = world.terrain
-        shape = self._terrain.heights.shape
-        self._depth = np.maximum(
-            0.0, world.water.level - self._terrain.heights).astype(np.float32)
-        self._flow_x = np.zeros(shape, dtype=np.float32)
-        self._flow_z = np.zeros(shape, dtype=np.float32)
-        self._sediment = np.zeros(shape, dtype=np.float32)
-        self._obstacle_mask = np.zeros(shape, dtype=bool)
-        self._temperature_factor = np.ones(shape, dtype=np.float32)
-        self._bed_offset = np.zeros(shape, dtype=np.float32)
-        self._flow_enabled = bool(world.water.flow_enabled)
-        if self._flow_enabled:
-            self._seed_river_profile()
         self._time = 0.0
+        self._diag = {"cfl_dt": config.FIXED_DT, "max_depth": 0.0,
+                      "max_velocity": 0.0, "wet_cells": 0, "volume_m3": 0.0,
+                      "cfl_limited": False}
+        self._body_count = 0
+        self._flow_particles = None
 
-    def _seed_river_profile(self) -> None:
-        """Reset the grid to bone dry so the real flux physics can advance a
-        genuine wavefront in from the source edge, instead of the enable
-        action itself deciding what the whole grid looks like.
+    def initialize(self, world) -> None:
+        self._world, self._terrain = world, world.terrain
+        self._level = float(world.water.level)
+        self._source_enabled = True
+        self._width, self._height = world.terrain.width + 1, world.terrain.height + 1
+        self._count = self._width * self._height
+        bed_grid = np.ascontiguousarray(world.terrain.heights, dtype=np.float32)
+        self._bed_host = bed_grid.ravel().copy()
+        depth_grid = np.zeros_like(bed_grid, dtype=np.float32)
+        source_columns = min(config.FLUID_SOURCE_COLUMNS, self._width)
+        depth_grid[:, :source_columns] = np.maximum(
+            self._level - bed_grid[:, :source_columns], 0.0)
+        depth = depth_grid.ravel()
+        zeros = np.zeros(self._count, dtype=np.float32)
+        self._obstacle_host = np.zeros(self._count, dtype=np.int32)
+        self._h = wp.array(depth, dtype=float, device=self.device)
+        self._u = wp.array(zeros, dtype=float, device=self.device)
+        self._v = wp.array(zeros, dtype=float, device=self.device)
+        self._next_h = wp.empty(self._count, dtype=float, device=self.device)
+        self._next_u = wp.empty(self._count, dtype=float, device=self.device)
+        self._next_v = wp.empty(self._count, dtype=float, device=self.device)
+        self._bed = wp.array(self._bed_host, dtype=float, device=self.device)
+        self._obstacles = wp.array(self._obstacle_host, dtype=wp.int32, device=self.device)
+        self._diag_max_depth = wp.zeros(1, dtype=float, device=self.device)
+        self._diag_max_speed = wp.zeros(1, dtype=float, device=self.device)
+        self._diag_max_wave = wp.zeros(1, dtype=float, device=self.device)
+        self._diag_volume = wp.zeros(1, dtype=float, device=self.device)
+        self._diag_wet = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self._seen_terrain_revision = -1
+        self._seen_obstacle_revision = -1
+        self.terrain_gpu_uploads = 1
+        self.obstacle_gpu_uploads = 1
+        self.last_substeps = 0
+        self._time = 0.0
+        self._body_count = 0
+        tracer_count = config.FLOW_TRACER_COUNT
+        rows = max(1, self._height - 2)
+        tracer_ids = np.arange(tracer_count, dtype=np.int32)
+        ti = np.full(tracer_count, min(self._width - 2,
+                                      max(1, source_columns - 1)), dtype=np.int32)
+        tj = 1 + tracer_ids % rows
+        tracer_idx = tj * self._width + ti
+        tracer_x = (ti - world.terrain.width / 2) * world.terrain.cell_size
+        subcell = ((tracer_ids // rows) % 64).astype(np.float32) / 64.0 - 0.5
+        tracer_z = (tj + subcell - world.terrain.height / 2) * world.terrain.cell_size
+        tracer_y = self._bed_host[tracer_idx] + depth[tracer_idx] + 0.08
+        tracers = np.column_stack((tracer_x, tracer_y, tracer_z)).astype(np.float32)
+        tracers[depth[tracer_idx] <= config.FLUID_DRY_DEPTH, 1] = -100.0
+        self._flow_particles = wp.array(tracers, dtype=wp.vec3, device=self.device)
+        self._measure()
 
-        User feedback 2026-09-01 (tested the running app, not just the test
-        suite): water should visibly ENTER from an edge and flow across at
-        the height they set, not appear across the whole map at once. An
-        earlier version of this method pre-filled the entire grid with a
-        source->sink ramp for exactly the opposite reason (an even earlier
-        round of feedback: the gradient was too slow to become visible on its
-        own) -- both problems share one root cause, FLUID_FLOW_GAIN having
-        been too weak (see its docstring in config.py), which is now fixed.
-        With that fixed, starting dry and letting `_step`'s edge clamp do the
-        work produces a real, watchable flood wave on its own: measured, the
-        front reaches 15% of a 100-cell grid by 1s of running, 43% by 10s,
-        77% by 40s -- see config.py's FLUID_RIVER_SINK_FRACTION comment.
-        """
-        self._depth[:, :] = 0.0
-        self._depth[self._obstacle_mask] = 0.0
-
-    def set_river_flow(self, enabled: bool) -> None:
-        """Toggle the continuous west->east river current, see config.py.
-
-        Read live every tick (SimulationManager._step_once), unlike
-        water_level which only takes effect at initialize() for the
-        *lake-fill* amount -- but note world.water.level DOES additionally
-        drive the flow source height live every tick while flow is on (see
-        `_step`), so with flow enabled the slider is no longer inert while
-        RUNNING the way the roadmap's "честные нюансы" note originally flagged.
-        On the off->on edge specifically (not every tick it stays on), resets
-        the grid dry -- see _seed_river_profile() for why that matters.
-        """
-        enabled = bool(enabled)
-        if enabled and not self._flow_enabled:
-            self._seed_river_profile()
-        self._flow_enabled = enabled
-
-    def set_boundaries(self, terrain, obstacles: dict) -> None:
-        self._terrain = terrain
-        if self._depth.shape != terrain.heights.shape:
-            # terrain resized (e.g. loaded world) -> reinitialise the field flat
-            self._depth = np.zeros(terrain.heights.shape, dtype=np.float32)
-            self._sediment = np.zeros(terrain.heights.shape, dtype=np.float32)
-            self._temperature_factor = np.ones(terrain.heights.shape, dtype=np.float32)
-            self._bed_offset = np.zeros(terrain.heights.shape, dtype=np.float32)
-        self._obstacle_mask = self._rasterize_obstacles(terrain, obstacles)
-        self._depth[self._obstacle_mask] = 0.0
-
-    def set_environment(self, base_temperature: float, shade: dict) -> None:
-        """Recompute the per-cell flow/capacity multiplier from tree shade.
-
-        v0.4 RiverLab, Schauberger hypothesis (docs/04_TZ_v0.3_roadmap.md
-        v0.4): shade cools water locally, which we treat as increasing both
-        flow energy and sediment carrying capacity -- see
-        docs/01_vision.md "Viktor Schauberger Lab": implemented as a
-        testable, comparable effect, not asserted as physically correct.
-        Stateless by design (see __init__ note) -- recomputed fresh from
-        `shade` (RigidBodySystem.shade_snapshot()) every call, no memory of
-        previous ticks.
-        """
-        if self._terrain is None:
-            return
-        shape = self._terrain.heights.shape
-        positions = shade.get("positions") if shade else None
-        if positions is None or len(positions) == 0:
-            self._temperature_factor = np.ones(shape, dtype=np.float32)
-            return
-        radii = shade.get("radii", [])
-        coolings = shade.get("cooling", [])
-        cell = self._terrain.cell_size
-        ny, nx = shape
-        yy, xx = np.mgrid[0:ny, 0:nx]
-        local_cooling = np.zeros(shape, dtype=np.float32)
-        for pos, radius, strength in zip(positions, radii, coolings):
-            if radius <= 0.0 or strength <= 0.0:
+    def _build_obstacle_mask(self, terrain, obstacles: dict) -> np.ndarray:
+        mask = np.zeros(self._count, dtype=np.int32)
+        positions = obstacles.get("positions", [])
+        rotations = obstacles.get("rotations", [])
+        scales = obstacles.get("scales", [])
+        types = obstacles.get("types", [])
+        for n, position in enumerate(positions):
+            if n >= len(types) or types[n] != "HOUSE":
                 continue
-            gx = float(pos[0]) / cell + self._terrain.width / 2
-            gz = float(pos[2]) / cell + self._terrain.height / 2
-            r_cells = max(1.0, float(radius) / cell)
-            dist = np.sqrt((xx - gx) ** 2 + (yy - gz) ** 2)
-            # full cooling strength at the trunk, fading to 0 at the canopy edge
-            falloff = np.clip(1.0 - dist / r_cells, 0.0, 1.0)
-            local_cooling = np.maximum(local_cooling, float(strength) * falloff)
-        factor = 1.0 + config.TEMP_EFFECT_PER_DEGREE_C * local_cooling
-        self._temperature_factor = np.clip(
-            factor, config.TEMP_FACTOR_MIN, config.TEMP_FACTOR_MAX).astype(np.float32)
-
-    def set_bed_obstructions(self, bed: dict) -> None:
-        """Rebuild the effective-bed rise from riverbed rocks (v0.4 RiverLab).
-
-        The roadmap item this implements ("камни на дне реки меняют русло")
-        asks for two things the binary obstacle mask cannot give: an effect
-        that scales with the rock's size *and position*, and meandering as an
-        emergent result rather than a scripted one. Both fall out of treating
-        the rock as bed rather than as a wall:
-
-        - a dome of `height` (config.BED_DOME_EXPONENT) is added to the bed,
-          so shallow water is pushed around the rock while deeper water still
-          passes over it -- that is the position dependence, for free: the
-          same rock is a major obstruction mid-channel and nearly irrelevant
-          on a dry bank;
-        - the flow squeezing past the flanks speeds up (erosion) and stalls in
-          the lee (deposition), which the existing sediment mechanic then
-          turns into a channel that actually moves.
-
-        Stateless per tick, exactly like set_environment(): no memory, no
-        accumulation, and world terrain is never mutated here -- only the
-        sediment code may do that.
-        """
-        if self._terrain is None:
-            return
-        shape = self._terrain.heights.shape
-        positions = bed.get("positions") if bed else None
-        if positions is None or len(positions) == 0:
-            self._bed_offset = np.zeros(shape, dtype=np.float32)
-            return
-        radii = bed.get("radii", [])
-        heights = bed.get("heights", [])
-        cell = self._terrain.cell_size
-        ny, nx = shape
-        yy, xx = np.mgrid[0:ny, 0:nx]
-        offset = np.zeros(shape, dtype=np.float32)
-        for pos, radius, height in zip(positions, radii, heights):
-            if radius <= 0.0 or height <= 0.0:
-                continue
-            r_cells = _footprint_cells(float(radius), cell)
-            gx = float(pos[0]) / cell + self._terrain.width / 2
-            gz = float(pos[2]) / cell + self._terrain.height / 2
-            dist2 = (xx - gx) ** 2 + (yy - gz) ** 2
-            # dome: full height at the centre, tapering to 0 at the edge
-            inside = np.clip(1.0 - dist2 / (r_cells ** 2), 0.0, 1.0)
-            offset = np.maximum(offset, float(height) * inside ** config.BED_DOME_EXPONENT)
-        self._bed_offset = offset.astype(np.float32)
-
-    def _rasterize_obstacles(self, terrain, obstacles: dict) -> np.ndarray:
-        mask = np.zeros(terrain.heights.shape, dtype=bool)
-        positions = obstacles.get("positions") if obstacles else None
-        if positions is None or len(positions) == 0:
-            return mask
-        radii = obstacles.get("radii")
-        if radii is None or len(radii) != len(positions):
-            radii = [config.FLUID_OBSTACLE_RADIUS_M] * len(positions)
-        ny, nx = mask.shape
-        yy, xx = np.mgrid[0:ny, 0:nx]
-        for pos, radius in zip(positions, radii):
-            r_cells = _footprint_cells(radius, terrain.cell_size)
-            gx = float(pos[0]) / terrain.cell_size + terrain.width / 2
-            gz = float(pos[2]) / terrain.cell_size + terrain.height / 2
-            mask |= (xx - gx) ** 2 + (yy - gz) ** 2 <= r_cells ** 2
+            scale = scales[n] if n < len(scales) else [1.0, 1.0, 1.0]
+            yaw = float(rotations[n][1]) if n < len(rotations) else 0.0
+            cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+            half_x = 2.0 * float(scale[0])
+            half_z = 2.0 * float(scale[2])
+            bound_x = abs(cos_yaw) * half_x + abs(sin_yaw) * half_z
+            bound_z = abs(sin_yaw) * half_x + abs(cos_yaw) * half_z
+            center_x, center_z = float(position[0]), float(position[2])
+            lo_i = max(1, int(math.floor((center_x - bound_x) / terrain.cell_size
+                                         + terrain.width / 2)))
+            hi_i = min(self._width - 2, int(math.ceil((center_x + bound_x)
+                                                       / terrain.cell_size
+                                                       + terrain.width / 2)))
+            lo_j = max(1, int(math.floor((center_z - bound_z) / terrain.cell_size
+                                         + terrain.height / 2)))
+            hi_j = min(self._height - 2, int(math.ceil((center_z + bound_z)
+                                                        / terrain.cell_size
+                                                        + terrain.height / 2)))
+            epsilon = 1.0e-6 * max(1.0, half_x, half_z, terrain.cell_size)
+            for row in range(lo_j, hi_j + 1):
+                world_z = (row - terrain.height / 2) * terrain.cell_size
+                for column in range(lo_i, hi_i + 1):
+                    world_x = (column - terrain.width / 2) * terrain.cell_size
+                    dx, dz = world_x - center_x, world_z - center_z
+                    local_x = cos_yaw * dx + sin_yaw * dz
+                    local_z = -sin_yaw * dx + cos_yaw * dz
+                    if (abs(local_x) <= half_x + epsilon
+                            and abs(local_z) <= half_z + epsilon):
+                        mask[row * self._width + column] = 1
         return mask
 
-    # ------------------------------------------------------------------ step
+    def _remap_obstacles(self, new_mask: np.ndarray) -> None:
+        h, u, v = self._host_fields()
+        old_mask = self._obstacle_host
+        newly_solid = np.flatnonzero((old_mask == 0) & (new_mask != 0))
+        freed = (old_mask != 0) & (new_mask == 0)
+        h[freed] = 0.0
+        u[freed] = 0.0
+        v[freed] = 0.0
+        fluid_cells = np.flatnonzero((new_mask == 0) & (old_mask == 0))
+        for source in newly_solid:
+            depth = float(h[source])
+            if depth <= 0.0 or not len(fluid_cells):
+                continue
+            sj, si = divmod(int(source), self._width)
+            fj, fi = np.divmod(fluid_cells, self._width)
+            distance = (fi - si) ** 2 + (fj - sj) ** 2
+            target = int(fluid_cells[int(np.argmin(distance))])
+            old_depth = float(h[target])
+            total = old_depth + depth
+            if total > config.FLUID_DRY_DEPTH:
+                u[target] = (u[target] * old_depth + u[source] * depth) / total
+                v[target] = (v[target] * old_depth + v[source] * depth) / total
+            h[target] = total
+        h[new_mask != 0] = 0.0
+        u[new_mask != 0] = 0.0
+        v[new_mask != 0] = 0.0
+        self._h = wp.array(h, dtype=float, device=self.device)
+        self._u = wp.array(u, dtype=float, device=self.device)
+        self._v = wp.array(v, dtype=float, device=self.device)
+
+    def set_boundaries(self, terrain, obstacles: dict, terrain_revision=0,
+                       obstacle_revision=0) -> None:
+        self._terrain = terrain
+        changed = False
+        if terrain_revision != self._seen_terrain_revision:
+            self._bed_host = np.ascontiguousarray(terrain.heights, dtype=np.float32).ravel().copy()
+            self._bed = wp.array(self._bed_host, dtype=float, device=self.device)
+            self._seen_terrain_revision = terrain_revision
+            self.terrain_gpu_uploads += 1
+            changed = True
+        if obstacle_revision != self._seen_obstacle_revision:
+            new_mask = self._build_obstacle_mask(terrain, obstacles)
+            if not np.array_equal(new_mask, self._obstacle_host):
+                self._remap_obstacles(new_mask)
+                self._obstacle_host = new_mask
+                self._obstacles = wp.array(new_mask, dtype=wp.int32, device=self.device)
+            self._seen_obstacle_revision = obstacle_revision
+            self.obstacle_gpu_uploads += 1
+            changed = True
+        if changed:
+            self._measure()
+
+    def _measure(self) -> None:
+        if self._h is None:
+            return
+        wp.launch(_clear_diagnostics, dim=1, inputs=[self._diag_max_depth,
+                  self._diag_max_speed, self._diag_max_wave, self._diag_volume,
+                  self._diag_wet], device=self.device)
+        wp.launch(_reduce_diagnostics, dim=self._count, inputs=[self._h, self._u,
+                  self._v, self._obstacles, float(self._world.environment.gravity),
+                  float(self._terrain.cell_size ** 2), config.FLUID_DRY_DEPTH,
+                  self._diag_max_depth, self._diag_max_speed, self._diag_max_wave,
+                  self._diag_volume, self._diag_wet], device=self.device)
+        max_wave = float(self._diag_max_wave.numpy()[0])
+        cfl_dt = (config.FIXED_DT if max_wave <= 1.0e-8 else
+                  config.FLUID_CFL * self._terrain.cell_size / max_wave)
+        self._diag.update({
+            "cfl_dt": cfl_dt,
+            "max_depth": float(self._diag_max_depth.numpy()[0]),
+            "max_velocity": float(self._diag_max_speed.numpy()[0]),
+            "wet_cells": int(self._diag_wet.numpy()[0]),
+            "volume_m3": float(self._diag_volume.numpy()[0]),
+        })
+
     def advance(self, global_dt: float, max_substeps: int, stability_dt: float) -> int:
-        substeps = max(1, min(max_substeps, math.ceil(global_dt / stability_dt)))
+        if self._h is None:
+            return 0
+        self._measure()
+        required = max(1, math.ceil(global_dt / max(self._diag["cfl_dt"], 1.0e-8)))
+        substeps = min(max_substeps, required)
         dt = global_dt / substeps
+        self._diag["cfl_limited"] = required > max_substeps
+        gravity = float(self._world.environment.gravity)
         for _ in range(substeps):
-            self._step(dt)
+            wp.launch(_velocity_step, dim=self._count, inputs=[self._h, self._u,
+                      self._v, self._bed, self._obstacles, self._next_u,
+                      self._next_v, self._width, self._height,
+                      float(self._terrain.cell_size), dt, gravity,
+                      config.FLUID_DRY_DEPTH, config.FLUID_DAMPING,
+                      config.FLUID_MAX_VELOCITY], device=self.device)
+            self._u, self._next_u = self._next_u, self._u
+            self._v, self._next_v = self._next_v, self._v
+            wp.launch(_depth_step, dim=self._count, inputs=[self._h, self._u,
+                      self._v, self._bed, self._obstacles, self._next_h,
+                      self._width, self._height, float(self._terrain.cell_size), dt],
+                      device=self.device)
+            self._h, self._next_h = self._next_h, self._h
+            if self._source_enabled:
+                wp.launch(_apply_source, dim=self._count, inputs=[self._h,
+                          self._bed, self._obstacles, self._width,
+                          self._height, config.FLUID_SOURCE_COLUMNS,
+                          self._level], device=self.device)
+            wp.launch(_advect_flow_tracers, dim=config.FLOW_TRACER_COUNT,
+                      inputs=[self._flow_particles, self._h, self._u, self._v,
+                              self._bed, self._obstacles, self._width, self._height,
+                              config.FLUID_SOURCE_COLUMNS,
+                              float(self._terrain.cell_size), dt,
+                              config.FLUID_DRY_DEPTH], device=self.device)
             self._time += dt
         self.last_substeps = substeps
         return substeps
 
-    def _step(self, dt: float) -> None:
-        terrain_h = self._terrain.heights
-        depth = self._depth
-        effective = terrain_h.astype(np.float32) + self._bed_offset  # rocks raise the bed
-        effective[self._obstacle_mask] += 1e4  # solid: never a flow target
-        total = effective + depth
+    def _host_fields(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self._h is None:
+            empty = np.zeros(0, dtype=np.float32)
+            return empty, empty, empty
+        return (np.asarray(self._h.numpy(), dtype=np.float32),
+                np.asarray(self._u.numpy(), dtype=np.float32),
+                np.asarray(self._v.numpy(), dtype=np.float32))
 
-        padded = np.pad(total, 1, mode="edge")
-        h_right = padded[1:-1, 2:]
-        h_left = padded[1:-1, :-2]
-        h_down = padded[2:, 1:-1]
-        h_up = padded[:-2, 1:-1]
-
-        # per-cell temperature multiplier (v0.4, Schauberger shade hypothesis
-        # -- see set_environment); stays 1.0 (no effect) with no shade nearby
-        gain = config.FLUID_FLOW_GAIN * self._temperature_factor
-        flow_right = np.maximum(0.0, total - h_right) * gain
-        flow_left = np.maximum(0.0, total - h_left) * gain
-        flow_down = np.maximum(0.0, total - h_down) * gain
-        flow_up = np.maximum(0.0, total - h_up) * gain
-
-        outflow = flow_right + flow_left + flow_down + flow_up
-        available = depth / dt
-        scale = np.ones_like(depth)
-        draining = outflow > available
-        scale[draining] = available[draining] / np.maximum(outflow[draining], 1e-9)
-        flow_right *= scale
-        flow_left *= scale
-        flow_down *= scale
-        flow_up *= scale
-
-        inflow_from_left = np.pad(flow_right, ((0, 0), (1, 0)))[:, :-1]
-        inflow_from_right = np.pad(flow_left, ((0, 0), (0, 1)))[:, 1:]
-        inflow_from_up = np.pad(flow_down, ((1, 0), (0, 0)))[:-1, :]
-        inflow_from_down = np.pad(flow_up, ((0, 1), (0, 0)))[1:, :]
-        inflow = inflow_from_left + inflow_from_right + inflow_from_up + inflow_from_down
-
-        new_depth = depth + dt * (inflow - (flow_right + flow_left + flow_down + flow_up))
-        new_depth = np.maximum(0.0, new_depth)
-        new_depth[self._obstacle_mask] = 0.0
-        if self._flow_enabled:
-            # Upstream reservoir (west edge, i=0) never runs dry, held at the
-            # user's own Water Level setting -- read live here, not snapshotted
-            # at initialize(), so the slider actually controls the river's
-            # height while RUNNING (see set_river_flow's docstring). Downstream
-            # outlet (east edge, i=-1) never backs up, held at a fraction of
-            # that same source so the gradient direction holds regardless of
-            # what height the user picks. See config.py for why this alone is
-            # enough to keep the interior flux scheme moving continuously
-            # instead of settling flat. Obstacles at either edge stay dry
-            # (reapplied after the clamp).
-            source = max(0.0, float(self._world.water.level)) if self._world is not None else 0.0
-            sink = source * config.FLUID_RIVER_SINK_FRACTION
-            new_depth[:, 0] = np.maximum(new_depth[:, 0], source)
-            new_depth[:, -1] = np.minimum(new_depth[:, -1], sink)
-            new_depth[self._obstacle_mask] = 0.0
-        new_depth[new_depth < config.FLUID_MIN_DEPTH] = 0.0
-
-        self._depth = new_depth.astype(np.float32)
-        self._flow_x = (flow_right - flow_left).astype(np.float32)
-        self._flow_z = (flow_down - flow_up).astype(np.float32)
-        self._erode_and_transport_sediment(dt, depth, flow_right, flow_left, flow_down, flow_up)
-
-    def _erode_and_transport_sediment(self, dt: float, old_depth: np.ndarray,
-                                      flow_right: np.ndarray, flow_left: np.ndarray,
-                                      flow_down: np.ndarray, flow_up: np.ndarray) -> None:
-        """RiverLab (v0.4): capacity-based erosion/deposition + advection.
-
-        Standard real-time hydraulic erosion (capacity ~ speed * depth;
-        erode when under capacity, deposit when over) -- see
-        docs/04_TZ_v0.3_roadmap.md v0.4. Terrain is mutated in place
-        (self._terrain IS world.terrain by reference), so erosion feeds
-        back into flow exactly like a manual terrain.brush() would.
-        Deliberately slow (config.SEDIMENT_*_RATE) relative to a single
-        flood event -- see the config module docstring for why.
-        """
-        speed = np.sqrt((flow_right - flow_left) ** 2 + (flow_down - flow_up) ** 2)
-        # colder water (shade) carries more/heavier sediment per Schauberger
-        # -- same self._temperature_factor as the flow gain above
-        capacity = config.SEDIMENT_CAPACITY_SCALE * self._temperature_factor * speed * old_depth
-        sediment = self._sediment
-        diff = capacity - sediment
-
-        erode = np.where(diff > 0, diff * config.SEDIMENT_ERODE_RATE * dt, 0.0)
-        # never erode below the world's bedrock floor
-        erode = np.minimum(erode, np.maximum(0.0, self._terrain.heights - config.HEIGHT_MIN))
-        # never erode terrain that's carrying no water at all (dry banks)
-        erode[old_depth <= config.FLUID_MIN_DEPTH] = 0.0
-        # a boulder is bedrock, not sediment: the river scours around it, not
-        # through it -- without this the rock would dig its own hole and the
-        # flank-erosion/lee-deposition asymmetry that makes a channel meander
-        # would be swamped by a symmetric pit underneath it
-        erode[self._bed_offset > config.BED_EROSION_SHIELD] = 0.0
-
-        deposit = np.where(diff < 0, np.minimum(-diff, sediment) * config.SEDIMENT_DEPOSIT_RATE * dt, 0.0)
-        deposit = np.minimum(deposit, sediment)
-
-        self._terrain.heights = (self._terrain.heights - erode + deposit).astype(np.float32)
-        sediment = sediment + erode - deposit
-
-        concentration = sediment / np.maximum(old_depth, 1e-6)
-        sed_out_right = flow_right * dt * concentration
-        sed_out_left = flow_left * dt * concentration
-        sed_out_down = flow_down * dt * concentration
-        sed_out_up = flow_up * dt * concentration
-
-        sed_in_left = np.pad(sed_out_right, ((0, 0), (1, 0)))[:, :-1]
-        sed_in_right = np.pad(sed_out_left, ((0, 0), (0, 1)))[:, 1:]
-        sed_in_up = np.pad(sed_out_down, ((1, 0), (0, 0)))[:-1, :]
-        sed_in_down = np.pad(sed_out_up, ((0, 1), (0, 0)))[1:, :]
-        sed_inflow = sed_in_left + sed_in_right + sed_in_up + sed_in_down
-        sed_outflow = sed_out_right + sed_out_left + sed_out_down + sed_out_up
-
-        new_sediment = np.maximum(0.0, sediment - sed_outflow + sed_inflow)
-        new_sediment[self._obstacle_mask] = 0.0
-        self._sediment = new_sediment.astype(np.float32)
-
-    # ------------------------------------------------------------------ readback
-    def sample_for_bodies(self, positions: np.ndarray, radii: Optional[np.ndarray] = None) -> dict:
-        """Ambient depth/velocity around each body, excluding ANY solid cell.
-
-        Each registered body carves a dry hole into its own footprint (see
-        set_boundaries), so sampling exactly at its centre would always read
-        depth=0 and an object could never float. A fixed-direction ring just
-        outside a body's own radius does not work either: in a populated
-        scene a *different* nearby object's hole can fall on the ring and
-        get blended in too (a house 3-4 m from a box measurably lowered the
-        box's own reading in testing -- this is not a rare edge case, it is
-        the normal case once a scene has more than one object). Instead,
-        average depth/flow over every non-obstacle cell in a neighbourhood
-        around the body, using the real obstacle mask so any hole -- the
-        body's own or a neighbour's -- is excluded, not guessed around.
-        """
+    def sample_for_bodies(self, positions: np.ndarray, body_velocities=None,
+                           drag=None, cross_area=None, body_height=None,
+                           rotations=None, half_extents=None) -> dict:
         count = len(positions)
-        if count == 0 or self._terrain is None:
-            return {"depths": np.zeros(0, dtype=np.float32),
-                    "velocities": np.zeros((0, 3), dtype=np.float32),
-                    "forces": np.zeros((0, 3), dtype=np.float32)}
-        cell = self._terrain.cell_size
-        ny, nx = self._depth.shape
-        if radii is None or len(radii) != count:
-            radii = np.full(count, config.FLUID_OBSTACLE_RADIUS_M, dtype=np.float32)
-        depths = np.zeros(count, dtype=np.float32)
-        vx = np.zeros(count, dtype=np.float32)
-        vz = np.zeros(count, dtype=np.float32)
-        for i in range(count):
-            gx = float(positions[i, 0]) / cell + self._terrain.width / 2
-            gz = float(positions[i, 2]) / cell + self._terrain.height / 2
-            margin = _footprint_cells(radii[i], cell) + 2.0
-            i0, i1 = max(0, int(gx - margin)), min(nx, int(gx + margin) + 1)
-            j0, j1 = max(0, int(gz - margin)), min(ny, int(gz + margin) + 1)
-            open_cells = ~self._obstacle_mask[j0:j1, i0:i1]
-            if open_cells.any():
-                depths[i] = float(self._depth[j0:j1, i0:i1][open_cells].mean())
-                vx[i] = float(self._flow_x[j0:j1, i0:i1][open_cells].mean())
-                vz[i] = float(self._flow_z[j0:j1, i0:i1][open_cells].mean())
-        velocities = np.column_stack([vx, np.zeros(count, dtype=np.float32), vz])
-        forces = velocities * depths[:, None]
-        return {"depths": depths, "velocities": velocities, "forces": forces}
+        if not count:
+            empty3 = np.zeros((0, 3), dtype=np.float32)
+            return {"depths": np.zeros(0, dtype=np.float32), "velocities": empty3,
+                    "forces": empty3.copy()}
+        body_velocities = np.zeros((count, 3), dtype=np.float32) if body_velocities is None \
+            else np.asarray(body_velocities, dtype=np.float32)
+        drag = np.ones(count, dtype=np.float32) if drag is None else np.asarray(drag, dtype=np.float32)
+        cross_area = np.ones(count, dtype=np.float32) if cross_area is None \
+            else np.asarray(cross_area, dtype=np.float32)
+        body_height = np.ones(count, dtype=np.float32) if body_height is None \
+            else np.asarray(body_height, dtype=np.float32)
+        rotations = np.zeros((count, 3), dtype=np.float32) if rotations is None \
+            else np.asarray(rotations, dtype=np.float32)
+        half_extents = np.zeros((count, 2), dtype=np.float32) if half_extents is None \
+            else np.asarray(half_extents, dtype=np.float32)
+        if count != self._body_count:
+            self._body_positions = wp.empty(count, dtype=wp.vec3, device=self.device)
+            self._body_rotations = wp.empty(count, dtype=wp.vec3, device=self.device)
+            self._body_extents = wp.empty(count, dtype=wp.vec2, device=self.device)
+            self._body_velocities = wp.empty(count, dtype=wp.vec3, device=self.device)
+            self._body_drag = wp.empty(count, dtype=float, device=self.device)
+            self._body_area = wp.empty(count, dtype=float, device=self.device)
+            self._body_height = wp.empty(count, dtype=float, device=self.device)
+            self._sample_depth = wp.empty(count, dtype=float, device=self.device)
+            self._sample_immersion = wp.empty(count, dtype=float, device=self.device)
+            self._sample_surface = wp.empty(count, dtype=float, device=self.device)
+            self._sample_support = wp.empty(count, dtype=float, device=self.device)
+            self._sample_velocity = wp.empty(count, dtype=wp.vec3, device=self.device)
+            self._sample_force = wp.empty(count, dtype=wp.vec3, device=self.device)
+            self._body_count = count
+        self._body_positions.assign(np.asarray(positions, dtype=np.float32))
+        self._body_rotations.assign(rotations)
+        self._body_extents.assign(half_extents)
+        self._body_velocities.assign(body_velocities)
+        self._body_drag.assign(drag)
+        self._body_area.assign(cross_area)
+        self._body_height.assign(body_height)
+        wp.launch(_sample_bodies, dim=count, inputs=[self._h, self._u, self._v,
+                   self._bed, self._obstacles, self._body_positions,
+                   self._body_rotations, self._body_extents, self._body_velocities,
+                   self._body_drag, self._body_area, self._body_height,
+                   self._sample_depth, self._sample_immersion, self._sample_surface,
+                   self._sample_support, self._sample_velocity, self._sample_force,
+                  self._width, self._height,
+                  float(self._terrain.cell_size), config.WATER_DENSITY], device=self.device)
+        return {"device": self.device, "count": count,
+                 "depths_device": self._sample_depth,
+                 "immersions_device": self._sample_immersion,
+                 "surface_elevations_device": self._sample_surface,
+                 "support_elevations_device": self._sample_support,
+                "velocities_device": self._sample_velocity,
+                "forces_device": self._sample_force}
 
     def reset(self) -> None:
         if self._world is not None:
             self.initialize(self._world)
 
-    def get_water_height(self, x: float = 0.0, z: float = 0.0) -> float:
-        if self._terrain is None:
+    def set_level(self, level: float) -> None:
+        level = float(level)
+        if abs(level - self._level) > 1.0e-9 and self._h is not None:
+            self._source_enabled = True
+            wp.launch(_apply_source, dim=self._count, inputs=[self._h, self._bed,
+                      self._obstacles, self._width, self._height,
+                      config.FLUID_SOURCE_COLUMNS, level], device=self.device)
+        self._level = level
+
+    def get_water_height(self, x=0.0, z=0.0) -> float:
+        field = self.get_water_height_field()
+        if not len(field):
             return 0.0
-        gx = np.array([x / self._terrain.cell_size + self._terrain.width / 2])
-        gz = np.array([z / self._terrain.cell_size + self._terrain.height / 2])
-        terrain_h = float(self._terrain.height_at(x, z))
-        depth = float(_bilinear(self._depth, gx, gz)[0])
-        return terrain_h + depth
+        i = int(np.clip(round(x / self._terrain.cell_size + self._terrain.width / 2),
+                        0, self._width - 1))
+        j = int(np.clip(round(z / self._terrain.cell_size + self._terrain.height / 2),
+                        0, self._height - 1))
+        return float(field[j * self._width + i])
+
+    def get_water_height_field(self) -> np.ndarray:
+        if self._h is None:
+            return np.zeros(0, dtype=np.float32)
+        depth = np.asarray(self._h.numpy(), dtype=np.float32)
+        return np.where(depth > config.FLUID_DRY_DEPTH, self._bed_host + depth,
+                        self._bed_host - 0.05).astype(np.float32)
 
     def get_velocity_field(self) -> Optional[np.ndarray]:
-        return np.dstack([self._flow_x, np.zeros_like(self._flow_x), self._flow_z])
+        _, u, v = self._host_fields()
+        return (np.column_stack((u, np.zeros_like(u), v)).astype(np.float32)
+                 if len(u) else None)
 
-    def get_depth_grid(self) -> Optional[np.ndarray]:
-        return self._depth
+    def get_flow_particles(self) -> np.ndarray:
+        if self._flow_particles is None:
+            return np.zeros((0, 3), dtype=np.float32)
+        return np.asarray(self._flow_particles.numpy(), dtype=np.float32)
 
-    def get_sediment_grid(self) -> np.ndarray:
-        return self._sediment
+    def diagnostics(self) -> dict:
+        return {"solver": "warp_shallow_water", "device": self.device,
+                "grid": [self._width, self._height], "substeps": self.last_substeps,
+                "terrain_gpu_uploads": self.terrain_gpu_uploads,
+                "obstacle_gpu_uploads": self.obstacle_gpu_uploads,
+                **self._diag}
 
-    def total_volume(self) -> float:
-        """Sum of water depth over all cells; used by conservation tests."""
-        return float(self._depth.sum())
 
-    def total_solid_material(self) -> float:
-        """terrain height + suspended sediment, summed over all cells.
-
-        Erosion/deposition only transfers material between the two -- this
-        sum should stay constant (up to sediment carried across a closed
-        world edge and clamped there, same caveat as total_volume).
-        """
-        return float(self._terrain.heights.sum() + self._sediment.sum())
+def create_fluid_solver(device: str) -> FluidSolver:
+    if WARP_IMPORTED:
+        try:
+            return WarpShallowWaterSolver(device)
+        except Exception as exc:  # pragma: no cover
+            print(f"[naturelab] FloodSolver unavailable: {exc}; using placeholder")
+    return PlaceholderFluidSolver()

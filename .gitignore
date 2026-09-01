@@ -22,3 +22,6 @@ Thumbs.db
 
 # agent driver screenshots (run artifacts, see .claude/skills/run-naturelab/)
 .claude/skills/run-naturelab/shots/
+
+# release archives (rebuildable via tools/make_release.py; kept out of git for size)
+releases/*.zip

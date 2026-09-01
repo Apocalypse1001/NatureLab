@@ -1,8 +1,4 @@
-"""Data-oriented rigid-body foundation.
-
-The placeholder keeps contiguous arrays and an ID-to-index map. A future Warp
-solver can upload these buffers directly without changing SimulationManager.
-"""
+"""Data-oriented first-order rigid-body and fluid-force coupling."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -11,8 +7,65 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from . import config
+from .compute_engine import WARP_IMPORTED, wp
 from .events import EventLog, EventType
-from .world_state import ObjectState, WorldObject, default_properties
+from .world_state import ObjectState, WorldObject
+
+
+STATE_NAMES = [ObjectState.INTACT.value, ObjectState.MOVING.value,
+               ObjectState.FLOATING.value, ObjectState.SETTLED.value]
+STATE_CODES = {name: i for i, name in enumerate(STATE_NAMES)}
+
+
+if WARP_IMPORTED:
+    @wp.kernel
+    def _integrate_bodies(positions: wp.array(dtype=wp.vec3),
+                          velocities: wp.array(dtype=wp.vec3),
+                          masses: wp.array(dtype=float),
+                           frictions: wp.array(dtype=float),
+                           buoyancies: wp.array(dtype=float),
+                           volumes: wp.array(dtype=float),
+                          ground_areas: wp.array(dtype=float),
+                          static: wp.array(dtype=wp.int32),
+                          states: wp.array(dtype=wp.int32),
+                           immersions: wp.array(dtype=float),
+                          forces: wp.array(dtype=wp.vec3),
+                          dynamic: wp.array(dtype=wp.int32),
+                          dt: float, gravity: float, rho: float):
+        i = wp.tid()
+        depth = wp.max(0.0, immersions[i])
+        height = volumes[i] / wp.max(ground_areas[i], 1.0e-6)
+        submerged = wp.clamp(depth / wp.max(height, 1.0e-6), 0.0, 1.0)
+        buoyancy = buoyancies[i] * rho * gravity * volumes[i] * submerged
+        weight = masses[i] * gravity
+        floating = static[i] == 0 and buoyancy >= weight * 0.999
+        force = forces[i]
+        drive = wp.sqrt(force.x * force.x + force.z * force.z)
+        hold = frictions[i] * wp.max(weight - buoyancy, 0.0)
+        sliding = static[i] == 0 and not floating and drive > hold
+        moving = floating or sliding
+        velocity = velocities[i]
+        position = positions[i]
+        if moving:
+            scale = float(1.0)
+            if sliding and drive > 1.0e-8:
+                scale = wp.max(0.0, 1.0 - hold / drive)
+            acceleration = wp.vec3(force.x * scale / masses[i], 0.0,
+                                   force.z * scale / masses[i])
+            velocity = velocity + acceleration * dt
+            position = position + velocity * dt
+            if floating:
+                states[i] = 2
+            else:
+                states[i] = 1
+            dynamic[i] = 1
+        else:
+            velocity = wp.vec3(0.0, 0.0, 0.0)
+            if states[i] == 1 or states[i] == 2:
+                states[i] = 3
+            dynamic[i] = 0
+        positions[i] = position
+        velocities[i] = velocity
 
 
 @dataclass
@@ -22,44 +75,17 @@ class RigidStateBuffer:
     positions: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
     velocities: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
     rotations: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    scales: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=np.float32))
+    half_extents: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=np.float32))
     masses: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
-    buoyancies: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
-    states: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int16))
     frictions: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
-    drags: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
-    foundation_heights: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
-    footprint_radii: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
-    root_strengths: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
-    rooted: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
-    shade_radii: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
-    shade_coolings: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
-    bed_heights: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
-
-    @staticmethod
-    def _footprint_radius(obj: WorldObject) -> float:
-        base = float(obj.metadata.get("footprint_radius", 1.0))
-        return base * max(float(obj.scale[0]), float(obj.scale[2]))
-
-    @staticmethod
-    def _shade_radius(obj: WorldObject) -> float:
-        base = float(obj.metadata.get("shade_radius", 0.0))
-        return base * max(float(obj.scale[0]), float(obj.scale[2]))
-
-    @staticmethod
-    def _bed_height(obj: WorldObject) -> float:
-        """How far a riverbed obstruction stands proud of the bed (m).
-
-        Scales with the object's *vertical* scale, while the footprint radius
-        scales with the horizontal one -- so a rock stretched only sideways
-        gets wider without getting taller. Zero for every type except ROCK.
-        """
-        # falls back to the type default, not 0.0: worlds saved before
-        # bed_height existed carry no such key, and a ROCK loaded from one of
-        # them must still behave like a rock rather than silently reverting to
-        # the pre-v0.4 infinitely-tall-wall behaviour.
-        default = default_properties(obj.type).get("bed_height", 0.0)
-        base = float(obj.metadata.get("bed_height", default))
-        return base * max(0.0, float(obj.scale[1]))
+    buoyancies: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    volumes: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    drag_coefficients: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    ground_areas: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    cross_areas: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    static: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.bool_))
+    states: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int16))
 
     def register(self, obj: WorldObject) -> int:
         if obj.id in self.index:
@@ -71,24 +97,21 @@ class RigidStateBuffer:
         self.positions = np.vstack((self.positions, np.asarray(obj.position, dtype=np.float32)))
         self.velocities = np.vstack((self.velocities, np.zeros(3, dtype=np.float32)))
         self.rotations = np.vstack((self.rotations, np.asarray(obj.rotation, dtype=np.float32)))
+        self.scales = np.vstack((self.scales, np.asarray(obj.scale, dtype=np.float32)))
+        self.half_extents = np.vstack((self.half_extents, footprint_half_extents(obj)))
         self.masses = np.append(self.masses, np.float32(obj.mass))
-        self.buoyancies = np.append(self.buoyancies, np.float32(obj.buoyancy))
-        self.states = np.append(self.states, np.int16(0))
         self.frictions = np.append(self.frictions, np.float32(obj.friction))
-        self.drags = np.append(self.drags, np.float32(obj.metadata.get("drag", 0.5)))
-        self.foundation_heights = np.append(
-            self.foundation_heights, np.float32(obj.metadata.get("foundation_height", 0.0)))
-        self.footprint_radii = np.append(self.footprint_radii, np.float32(self._footprint_radius(obj)))
-        root_strength = float(obj.metadata.get("root_strength", 0.0))
-        self.root_strengths = np.append(self.root_strengths, np.float32(root_strength))
-        # rooted only ever goes True -> False (broken), set once on first
-        # registration -- update() below must NOT reset an already-broken
-        # anchor back to rooted just because the object was edited.
-        self.rooted = np.append(self.rooted, root_strength > 0.0)
-        self.shade_radii = np.append(self.shade_radii, np.float32(self._shade_radius(obj)))
-        self.shade_coolings = np.append(
-            self.shade_coolings, np.float32(obj.metadata.get("shade_cooling", 0.0)))
-        self.bed_heights = np.append(self.bed_heights, np.float32(self._bed_height(obj)))
+        self.buoyancies = np.append(self.buoyancies, np.float32(obj.buoyancy))
+        self.volumes = np.append(self.volumes, np.float32(obj.volume_m3))
+        self.drag_coefficients = np.append(self.drag_coefficients,
+                                           np.float32(obj.drag_coefficient))
+        self.ground_areas = np.append(self.ground_areas,
+                                      np.float32(obj.ground_contact_area))
+        self.cross_areas = np.append(self.cross_areas,
+                                     np.float32(obj.cross_sectional_area))
+        self.static = np.append(self.static, np.bool_(obj.is_static))
+        self.states = np.append(self.states,
+                                np.int16(STATE_CODES.get(obj.state, 0)))
         return idx
 
     def update(self, obj: WorldObject) -> None:
@@ -98,48 +121,50 @@ class RigidStateBuffer:
             return
         self.positions[idx] = obj.position
         self.rotations[idx] = obj.rotation
+        self.scales[idx] = obj.scale
+        self.half_extents[idx] = footprint_half_extents(obj)
         self.masses[idx] = obj.mass
-        self.buoyancies[idx] = obj.buoyancy
         self.frictions[idx] = obj.friction
-        self.drags[idx] = obj.metadata.get("drag", self.drags[idx])
-        self.foundation_heights[idx] = obj.metadata.get("foundation_height", self.foundation_heights[idx])
-        self.footprint_radii[idx] = self._footprint_radius(obj)
-        self.root_strengths[idx] = obj.metadata.get("root_strength", self.root_strengths[idx])
-        self.shade_radii[idx] = self._shade_radius(obj)
-        self.shade_coolings[idx] = obj.metadata.get("shade_cooling", self.shade_coolings[idx])
-        self.bed_heights[idx] = self._bed_height(obj)
+        self.buoyancies[idx] = obj.buoyancy
+        self.volumes[idx] = obj.volume_m3
+        self.drag_coefficients[idx] = obj.drag_coefficient
+        self.ground_areas[idx] = obj.ground_contact_area
+        self.cross_areas[idx] = obj.cross_sectional_area
+        self.static[idx] = obj.is_static
+        self.states[idx] = STATE_CODES.get(obj.state, int(self.states[idx]))
 
     def unregister(self, object_id: str) -> None:
         idx = self.index.pop(object_id, None)
         if idx is None:
             return
         last = len(self.ids) - 1
+        arrays = (self.positions, self.velocities, self.rotations, self.scales,
+                  self.half_extents, self.masses, self.frictions, self.buoyancies,
+                  self.volumes, self.drag_coefficients,
+                  self.ground_areas, self.cross_areas, self.static, self.states)
         if idx != last:
             moved_id = self.ids[last]
             self.ids[idx] = moved_id
             self.index[moved_id] = idx
-            for array in (self.positions, self.velocities, self.rotations,
-                          self.masses, self.buoyancies, self.states,
-                          self.frictions, self.drags, self.foundation_heights,
-                          self.footprint_radii, self.root_strengths, self.rooted,
-                          self.shade_radii, self.shade_coolings, self.bed_heights):
+            for array in arrays:
                 array[idx] = array[last]
         self.ids.pop()
-        self.positions = self.positions[:-1]
-        self.velocities = self.velocities[:-1]
-        self.rotations = self.rotations[:-1]
-        self.masses = self.masses[:-1]
-        self.buoyancies = self.buoyancies[:-1]
-        self.states = self.states[:-1]
-        self.frictions = self.frictions[:-1]
-        self.drags = self.drags[:-1]
-        self.foundation_heights = self.foundation_heights[:-1]
-        self.footprint_radii = self.footprint_radii[:-1]
-        self.root_strengths = self.root_strengths[:-1]
-        self.rooted = self.rooted[:-1]
-        self.shade_radii = self.shade_radii[:-1]
-        self.shade_coolings = self.shade_coolings[:-1]
-        self.bed_heights = self.bed_heights[:-1]
+        for name in ("positions", "velocities", "rotations", "scales", "half_extents",
+                     "masses", "frictions", "buoyancies", "volumes",
+                     "drag_coefficients", "ground_areas", "cross_areas",
+                     "static", "states"):
+            setattr(self, name, getattr(self, name)[:-1])
+
+    @property
+    def body_heights(self) -> np.ndarray:
+        return self.volumes / np.maximum(self.ground_areas, 1.0e-6)
+
+
+def footprint_half_extents(obj: WorldObject) -> np.ndarray:
+    base = {"HOUSE": (2.0, 2.0), "CAR": (2.2, 1.0), "TREE": (0.25, 0.25),
+            "BOX": (0.6, 0.6), "DEBRIS": (0.6, 0.6), "GAUGE": (0.0, 0.0)}
+    hx, hz = base.get(obj.type, (0.5, 0.5))
+    return np.asarray((hx * obj.scale[0], hz * obj.scale[2]), dtype=np.float32)
 
 
 class RigidBodySystem:
@@ -148,406 +173,258 @@ class RigidBodySystem:
     def update_body(self, obj: WorldObject) -> None: ...
     def unregister_body(self, object_id: str) -> None: ...
     def obstacle_snapshot(self) -> dict: ...
-    def shade_snapshot(self) -> dict: ...
-    def bed_snapshot(self) -> dict: ...
     def step(self, dt: float, sim_time: float, fluid_samples=None) -> List[str]: ...
-    def reset(self) -> None: ...
-    def get_transforms(self) -> List[Tuple[str, List[float]]]: ...
 
 
-class _ArrayRigidBodySystem(RigidBodySystem):
-    """Shared array-backed bookkeeping; subclasses only differ in step()."""
+class PlaceholderRigidBodySystem(RigidBodySystem):
+    """Vectorized force model; angular dynamics remain outside 0.4."""
 
     def __init__(self) -> None:
-        self._world = None
-        self._fluid = None
+        self._world = self._fluid = None
         self._events: EventLog | None = None
         self.buffer = RigidStateBuffer()
+        self.latest_fluid_samples: Dict[str, dict] = {}
 
     def initialize(self, world, fluid, events: EventLog) -> None:
         self._world, self._fluid, self._events = world, fluid, events
         self.buffer = RigidStateBuffer()
+        self.latest_fluid_samples = {}
+        self._device_count = 0
         for obj in world.objects.values():
             self.buffer.register(obj)
 
-    def register_body(self, obj: WorldObject) -> None:
-        self.buffer.register(obj)
-
-    def update_body(self, obj: WorldObject) -> None:
-        self.buffer.update(obj)
-
-    def unregister_body(self, object_id: str) -> None:
-        self.buffer.unregister(object_id)
+    def register_body(self, obj: WorldObject) -> None: self.buffer.register(obj)
+    def update_body(self, obj: WorldObject) -> None: self.buffer.update(obj)
+    def unregister_body(self, object_id: str) -> None: self.buffer.unregister(object_id)
 
     def obstacle_snapshot(self) -> dict:
-        """Bodies the fluid must treat as solid walls.
+        objects = [self._world.objects[oid] for oid in self.buffer.ids]
+        return {"ids": list(self.buffer.ids),
+                "positions": self.buffer.positions.copy(),
+                "rotations": self.buffer.rotations.copy(),
+                "types": [obj.type for obj in objects],
+                 "scales": self.buffer.scales.copy()}
 
-        Riverbed obstructions (bed_height > 0, i.e. ROCK) are deliberately
-        excluded: the obstacle mask is an infinitely tall wall, which is right
-        for a house and wrong for a boulder a deep river simply flows over.
-        They go through bed_snapshot() instead -- see
-        ShallowWaterFluidSolver.set_bed_obstructions and the roadmap's own note
-        that a rock is part of the riverbed, not a rigid body with buoyancy.
-        """
-        wall = self.buffer.bed_heights <= 0.0
-        return {
-            "ids": [oid for oid, is_wall in zip(self.buffer.ids, wall) if is_wall],
-            "positions": self.buffer.positions[wall].copy(),
-            "rotations": self.buffer.rotations[wall].copy(),
-            "masses": self.buffer.masses[wall].copy(),
-            "radii": self.buffer.footprint_radii[wall].copy(),
+    def _resolve_collisions(self, dynamic: np.ndarray) -> None:
+        count = len(self.buffer.ids)
+        if count < 2 or not np.any(dynamic):
+            return
+        base = {"HOUSE": 2.8, "CAR": 2.3, "TREE": 0.55,
+                "BOX": 0.85, "DEBRIS": 0.65}
+        radii = np.asarray([base.get(self._world.objects[oid].type, 0.85)
+                            * max(self._world.objects[oid].scale[0],
+                                  self._world.objects[oid].scale[2])
+                            for oid in self.buffer.ids], dtype=np.float32)
+        xz = self.buffer.positions[:, (0, 2)]
+        delta = xz[:, None, :] - xz[None, :, :]
+        distance = np.linalg.norm(delta, axis=2)
+        minimum = radii[:, None] + radii[None, :]
+        pair_i, pair_j = np.where(np.triu(distance < minimum, 1))
+        collidable = np.asarray([self._world.objects[oid].type != "GAUGE"
+                                 for oid in self.buffer.ids], dtype=np.bool_)
+        active = ((dynamic[pair_i] | dynamic[pair_j])
+                  & collidable[pair_i] & collidable[pair_j])
+        pair_i, pair_j = pair_i[active], pair_j[active]
+        if not len(pair_i):
+            return
+        pair_delta = delta[pair_i, pair_j].copy()
+        pair_distance = distance[pair_i, pair_j].copy()
+        zero = pair_distance < 1.0e-6
+        pair_delta[zero] = [1.0, 0.0]
+        pair_distance[zero] = 1.0
+        normal = pair_delta / pair_distance[:, None]
+        overlap = minimum[pair_i, pair_j] - distance[pair_i, pair_j]
+        inv_i = np.where(dynamic[pair_i], 1.0 / self.buffer.masses[pair_i], 0.0)
+        inv_j = np.where(dynamic[pair_j], 1.0 / self.buffer.masses[pair_j], 0.0)
+        total = np.maximum(inv_i + inv_j, 1.0e-12)
+        correction = np.zeros((count, 2), dtype=np.float32)
+        np.add.at(correction, pair_i, normal * (overlap * inv_i / total)[:, None])
+        np.add.at(correction, pair_j, -normal * (overlap * inv_j / total)[:, None])
+        self.buffer.positions[:, 0] += correction[:, 0]
+        self.buffer.positions[:, 2] += correction[:, 1]
+
+    def _step_device(self, dt: float, sim_time: float, samples: dict) -> List[str]:
+        count = len(self.buffer.ids)
+        if getattr(self, "_device_count", 0) != count:
+            device = samples["device"]
+            self._d_positions = wp.empty(count, dtype=wp.vec3, device=device)
+            self._d_velocities = wp.empty(count, dtype=wp.vec3, device=device)
+            self._d_masses = wp.empty(count, dtype=float, device=device)
+            self._d_frictions = wp.empty(count, dtype=float, device=device)
+            self._d_buoyancies = wp.empty(count, dtype=float, device=device)
+            self._d_volumes = wp.empty(count, dtype=float, device=device)
+            self._d_ground_areas = wp.empty(count, dtype=float, device=device)
+            self._d_static = wp.empty(count, dtype=wp.int32, device=device)
+            self._d_states = wp.empty(count, dtype=wp.int32, device=device)
+            self._d_dynamic = wp.empty(count, dtype=wp.int32, device=device)
+            self._device_count = count
+        self._d_positions.assign(self.buffer.positions)
+        self._d_velocities.assign(self.buffer.velocities)
+        self._d_masses.assign(self.buffer.masses)
+        self._d_frictions.assign(self.buffer.frictions)
+        self._d_buoyancies.assign(self.buffer.buoyancies)
+        self._d_volumes.assign(self.buffer.volumes)
+        self._d_ground_areas.assign(self.buffer.ground_areas)
+        self._d_static.assign(self.buffer.static.astype(np.int32))
+        self._d_states.assign(self.buffer.states.astype(np.int32))
+        old_states = self.buffer.states.copy()
+        wp.launch(_integrate_bodies, dim=count, inputs=[self._d_positions,
+            self._d_velocities, self._d_masses, self._d_frictions,
+                   self._d_buoyancies, self._d_volumes, self._d_ground_areas,
+                   self._d_static, self._d_states, samples["immersions_device"],
+                   samples["forces_device"],
+                  self._d_dynamic, dt, float(self._world.environment.gravity),
+                  config.WATER_DENSITY], device=samples["device"])
+        self.buffer.positions[:] = np.asarray(self._d_positions.numpy(), dtype=np.float32)
+        self.buffer.velocities[:] = np.asarray(self._d_velocities.numpy(), dtype=np.float32)
+        self.buffer.states[:] = np.asarray(self._d_states.numpy(), dtype=np.int16)
+        dynamic = np.asarray(self._d_dynamic.numpy(), dtype=np.int32).astype(bool)
+        depths = np.asarray(samples["depths_device"].numpy(), dtype=np.float32)
+        immersions = np.asarray(samples["immersions_device"].numpy(), dtype=np.float32)
+        surfaces = np.asarray(samples["surface_elevations_device"].numpy(), dtype=np.float32)
+        supports = np.asarray(samples["support_elevations_device"].numpy(), dtype=np.float32)
+        flow_velocities = np.asarray(samples["velocities_device"].numpy(), dtype=np.float32)
+        self._cache_fluid_samples(depths, surfaces, supports, flow_velocities)
+        self._resolve_collisions(dynamic)
+
+        for idx, oid in enumerate(self.buffer.ids):
+            obj = self._world.objects[oid]
+            terrain_y = float(supports[idx])
+            if self.buffer.states[idx] == STATE_CODES[ObjectState.FLOATING.value]:
+                draft = self.buffer.masses[idx] / (config.WATER_DENSITY
+                                                    * self.buffer.buoyancies[idx]
+                                                    * self.buffer.ground_areas[idx])
+                self.buffer.positions[idx, 1] = max(terrain_y, surfaces[idx] - draft)
+            else:
+                self.buffer.positions[idx, 1] = terrain_y
+            obj.position = self.buffer.positions[idx].astype(float).tolist()
+            obj.state = STATE_NAMES[int(self.buffer.states[idx])]
+
+        changed = np.flatnonzero((old_states != self.buffer.states) | dynamic)
+        for idx in np.flatnonzero(old_states != self.buffer.states):
+            oid = self.buffer.ids[int(idx)]
+            state = STATE_NAMES[int(self.buffer.states[idx])]
+            if not self._events:
+                continue
+            if state == ObjectState.FLOATING.value:
+                self._events.record(sim_time, EventType.OBJECT_FLOATING, oid,
+                                     cause="gpu_buoyancy_supports_weight",
+                                     water_depth=float(depths[idx]),
+                                     immersion=float(immersions[idx]))
+            elif state == ObjectState.MOVING.value:
+                self._events.record(sim_time, EventType.OBJECT_STARTED_MOVING, oid,
+                                    cause="gpu_drag_exceeds_friction")
+            elif state == ObjectState.SETTLED.value:
+                self._events.record(sim_time, EventType.OBJECT_SETTLED, oid,
+                                    cause="gpu_force_below_friction")
+        return [self.buffer.ids[int(i)] for i in changed]
+
+    def step(self, dt: float, sim_time: float, fluid_samples=None) -> List[str]:
+        count = len(self.buffer.ids)
+        if self._world is None or not count:
+            return []
+        if fluid_samples is not None and "depths_device" in fluid_samples:
+            return self._step_device(dt, sim_time, fluid_samples)
+        depths = np.zeros(count, dtype=np.float32)
+        immersions = np.zeros(count, dtype=np.float32)
+        forces = np.zeros((count, 3), dtype=np.float32)
+        if fluid_samples is not None:
+            depths[:] = fluid_samples["depths"]
+            immersions[:] = fluid_samples.get("immersions", fluid_samples["depths"])
+            forces[:] = fluid_samples["forces"]
+            surfaces = np.asarray(fluid_samples.get("surface_elevations", depths),
+                                  dtype=np.float32)
+            supports = np.asarray(fluid_samples.get("support_elevations",
+                                  np.zeros(count)), dtype=np.float32)
+            flow_velocities = np.asarray(fluid_samples.get("velocities",
+                                         np.zeros((count, 3))), dtype=np.float32)
+            self._cache_fluid_samples(depths, surfaces, supports, flow_velocities)
+
+        gravity = float(self._world.environment.gravity)
+        submerged = np.clip(immersions / np.maximum(self.buffer.body_heights, 1.0e-6), 0.0, 1.0)
+        buoyancy_force = (self.buffer.buoyancies * config.WATER_DENSITY * gravity
+                          * self.buffer.volumes * submerged)
+        weight = self.buffer.masses * gravity
+        floating = (~self.buffer.static) & (buoyancy_force >= weight * 0.999)
+        normal_force = np.maximum(weight - buoyancy_force, 0.0)
+        horizontal_force = forces[:, (0, 2)].copy()
+        drive = np.linalg.norm(horizontal_force, axis=1)
+        speed = np.linalg.norm(self.buffer.velocities[:, (0, 2)], axis=1)
+        friction_limit = self.buffer.frictions * normal_force
+        sliding = (~self.buffer.static) & (~floating) & (drive > friction_limit)
+        moving = floating | sliding
+
+        direction = np.zeros_like(horizontal_force)
+        force_nonzero = drive > 1.0e-8
+        direction[force_nonzero] = horizontal_force[force_nonzero] / drive[force_nonzero, None]
+        net = horizontal_force.copy()
+        grounded = sliding & (friction_limit > 0.0)
+        net[grounded] -= direction[grounded] * friction_limit[grounded, None]
+        net[~moving] = 0.0
+        acceleration = net / np.maximum(self.buffer.masses[:, None], 1.0e-6)
+        self.buffer.velocities[:, 0] += acceleration[:, 0] * dt
+        self.buffer.velocities[:, 2] += acceleration[:, 1] * dt
+        self.buffer.velocities[~moving, 0] = 0.0
+        self.buffer.velocities[~moving, 2] = 0.0
+        self.buffer.positions[moving] += self.buffer.velocities[moving] * dt
+        self._resolve_collisions(moving)
+
+        old_states = self.buffer.states.copy()
+        for idx in range(count):
+            obj = self._world.objects[self.buffer.ids[idx]]
+            terrain_y = self._world.terrain.height_at(float(self.buffer.positions[idx, 0]),
+                                                       float(self.buffer.positions[idx, 2]))
+            if floating[idx]:
+                draft = self.buffer.masses[idx] / (config.WATER_DENSITY
+                                                    * self.buffer.buoyancies[idx]
+                                                    * self.buffer.ground_areas[idx])
+                surface = (fluid_samples.get("surface_elevations", depths)[idx]
+                           if fluid_samples is not None else terrain_y + depths[idx])
+                self.buffer.positions[idx, 1] = max(terrain_y, surface - draft)
+                new_state = STATE_CODES[ObjectState.FLOATING.value]
+            elif sliding[idx] or speed[idx] > config.RIGID_STOP_SPEED:
+                self.buffer.positions[idx, 1] = terrain_y
+                new_state = STATE_CODES[ObjectState.MOVING.value]
+            elif old_states[idx] in (STATE_CODES[ObjectState.MOVING.value],
+                                     STATE_CODES[ObjectState.FLOATING.value]):
+                self.buffer.positions[idx, 1] = terrain_y
+                new_state = STATE_CODES[ObjectState.SETTLED.value]
+            else:
+                self.buffer.positions[idx, 1] = terrain_y
+                new_state = int(old_states[idx])
+            self.buffer.states[idx] = new_state
+            obj.position = self.buffer.positions[idx].astype(float).tolist()
+            obj.state = STATE_NAMES[new_state]
+
+        changed = np.flatnonzero((old_states != self.buffer.states) | moving)
+        for idx in np.flatnonzero(old_states != self.buffer.states):
+            oid = self.buffer.ids[int(idx)]
+            state = STATE_NAMES[int(self.buffer.states[idx])]
+            if not self._events:
+                continue
+            if state == ObjectState.FLOATING.value:
+                self._events.record(sim_time, EventType.OBJECT_FLOATING, oid,
+                                     cause="buoyancy_supports_weight",
+                                     water_depth=float(depths[idx]),
+                                     immersion=float(immersions[idx]))
+            elif state == ObjectState.MOVING.value:
+                self._events.record(sim_time, EventType.OBJECT_STARTED_MOVING, oid,
+                                    cause="drag_exceeds_friction",
+                                    force=float(drive[idx]))
+            elif state == ObjectState.SETTLED.value:
+                self._events.record(sim_time, EventType.OBJECT_SETTLED, oid,
+                                    cause="force_below_friction")
+        return [self.buffer.ids[int(i)] for i in changed]
+
+    def _cache_fluid_samples(self, depths: np.ndarray, surfaces: np.ndarray,
+                             supports: np.ndarray, velocities: np.ndarray) -> None:
+        self.latest_fluid_samples = {
+            oid: {"depth": float(depths[i]), "surface": float(surfaces[i]),
+                  "support": float(supports[i]),
+                  "velocity": np.asarray(velocities[i], dtype=np.float32).copy()}
+            for i, oid in enumerate(self.buffer.ids)
         }
-
-    def bed_snapshot(self) -> dict:
-        """Positions/radii/heights of bodies that raise the riverbed (ROCK).
-
-        Counterpart of shade_snapshot(): same shape of data, consumed by
-        ShallowWaterFluidSolver.set_bed_obstructions() fresh every tick, so a
-        rock that is moved in the editor takes its bump with it.
-        """
-        obstructing = self.buffer.bed_heights > 0.0
-        return {
-            "positions": self.buffer.positions[obstructing].copy(),
-            "radii": self.buffer.footprint_radii[obstructing].copy(),
-            "heights": self.buffer.bed_heights[obstructing].copy(),
-        }
-
-    def shade_snapshot(self) -> dict:
-        """Positions/radii/strength of shade-casting bodies (TREE canopy),
-        for ShallowWaterFluidSolver._update_temperature_factor. Only bodies
-        with shade_cooling > 0 are included -- most types cast none."""
-        casting = self.buffer.shade_coolings > 0.0
-        return {
-            "positions": self.buffer.positions[casting].copy(),
-            "radii": self.buffer.shade_radii[casting].copy(),
-            "cooling": self.buffer.shade_coolings[casting].copy(),
-        }
-
-    def reset(self) -> None:
-        if self._world is not None and self._fluid is not None and self._events is not None:
-            self.initialize(self._world, self._fluid, self._events)
 
     def get_transforms(self) -> List[Tuple[str, List[float]]]:
         return [(oid, self.buffer.positions[i].astype(float).tolist())
                 for i, oid in enumerate(self.buffer.ids)]
-
-
-class PlaceholderRigidBodySystem(_ArrayRigidBodySystem):
-    """Binary buoyancy-threshold placeholder, kept for reference/tests.
-
-    Superseded by ForceRigidBodySystem (gravity/buoyancy/drag/friction) as of
-    v0.3 -- see docs/04_TZ_v0.3_roadmap.md.
-    """
-
-    def step(self, dt: float, sim_time: float, fluid_samples=None) -> List[str]:
-        if self._world is None or not self.buffer.ids:
-            return []
-        positions = self.buffer.positions
-        depths = np.zeros(len(self.buffer.ids), dtype=np.float32)
-        flow = np.zeros((len(self.buffer.ids), 3), dtype=np.float32)
-        if fluid_samples is not None:
-            depths[:] = fluid_samples["depths"]
-            flow[:] = fluid_samples["velocities"]
-        floating = self.buffer.buoyancies * depths > 0.3
-        alpha = min(1.0, dt)
-        self.buffer.velocities[floating] += (flow[floating] - self.buffer.velocities[floating]) * alpha
-        positions[floating] += self.buffer.velocities[floating] * dt
-
-        changed: List[str] = []
-        for idx in np.flatnonzero(floating):
-            oid = self.buffer.ids[int(idx)]
-            obj = self._world.objects.get(oid)
-            if obj is None:
-                continue
-            if obj.state != ObjectState.FLOATING.value and self._events:
-                self._events.record(sim_time, EventType.OBJECT_STARTED_MOVING, oid,
-                                    cause="water_buoyancy", water_depth=float(depths[idx]))
-                self._events.record(sim_time, EventType.OBJECT_FLOATING, oid,
-                                    cause="buoyancy_gt_threshold", buoyancy=obj.buoyancy)
-            obj.state = ObjectState.FLOATING.value
-            obj.position = positions[idx].astype(float).tolist()
-            changed.append(oid)
-        for idx in np.flatnonzero(~floating):
-            oid = self.buffer.ids[int(idx)]
-            obj = self._world.objects.get(oid)
-            if obj is not None and obj.state == ObjectState.FLOATING.value:
-                obj.state = ObjectState.SETTLED.value
-                self.buffer.velocities[idx] = 0.0
-                if self._events:
-                    self._events.record(sim_time, EventType.OBJECT_SETTLED, oid,
-                                        cause="water_receded")
-                changed.append(oid)
-        return changed
-
-
-class ForceRigidBodySystem(_ArrayRigidBodySystem):
-    """gravity + buoyancy + hydrodynamic drag + ground friction, vectorized.
-
-    Per-object force model (see docs/04_TZ_v0.3_roadmap.md and
-    docs/01_vision.md "Поведение автомобиля"):
-
-    - buoyancy reduces how much of the object's weight still rests on the
-      ground (normal force), scaled by how deep it sits past its own
-      foundation_height -- this is what makes Experiment A/B from
-      docs/01_vision.md (house foundation 0.2 m vs 1.0 m) actually change
-      the outcome instead of being an unused metadata field.
-    - ground friction is Coulomb friction against that reduced normal force:
-      a static object stays put while drag stays under the friction limit,
-      and starts moving once drag exceeds it.
-    - hydrodynamic drag pulls the object toward the local water velocity,
-      scaled by how submerged it is.
-
-    `drag` is a per-object scalar proxy (Cd * area), not a full aerodynamic
-    breakdown -- see the causal- vs engineering-realism note in
-    docs/04_TZ_v0.3_roadmap.md section 3. Body<->body contact is resolved by
-    _resolve_collisions() as disk-in-XZ-plane impulses (mass-weighted, no
-    rotation/torque) -- an interim response so bodies stop passing through
-    each other, not the full rigid-body engine a later Warp port would add.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._active_contacts: set = set()
-
-    def initialize(self, world, fluid, events: EventLog) -> None:
-        super().initialize(world, fluid, events)
-        self._active_contacts = set()
-
-    def _resolve_collisions(
-        self, n: int, dt: float
-    ) -> Tuple[List[Tuple[int, int, float]], List[Tuple[int, float]]]:
-        """Mass-weighted impulse + positional correction for overlapping
-        footprints (disks of radius footprint_radii in the XZ plane -- the
-        same radius the fluid solver already carves obstacles with).
-
-        Returns:
-        - (i, j, impact_speed) for pairs whose contact just started this
-          tick, so the caller can emit one OBJECT_COLLISION event per
-          contact instead of every tick two bodies stay touching.
-        - (i, impact_force) for still-rooted bodies whose impulse/dt this
-          tick exceeded their root_strength -- a body impact (e.g. a car
-          slamming into a tree) can uproot it, not just water drag.
-        """
-        buf = self.buffer
-        if n < 2:
-            self._active_contacts = set()
-            return [], []
-        pos_xz = buf.positions[:, [0, 2]]
-        diff = pos_xz[:, None, :] - pos_xz[None, :, :]
-        dist = np.linalg.norm(diff, axis=-1)
-        np.fill_diagonal(dist, np.inf)
-        radius_sum = buf.footprint_radii[:, None] + buf.footprint_radii[None, :]
-        # dist is +inf on the diagonal, so raw overlap there is -inf; clamp
-        # to 0 up front rather than relying on np.where's unselected branch
-        # to mask it out later (0 * -inf is NaN even though it gets discarded).
-        overlap = np.where(np.isfinite(dist), radius_sum - dist, 0.0)
-        colliding = overlap > 0
-        current_contacts: set = set()
-        new_events: List[Tuple[int, int, float]] = []
-        uprooted: List[Tuple[int, float]] = []
-        if not colliding.any():
-            self._active_contacts = current_contacts
-            return new_events, uprooted
-
-        normal = diff / np.maximum(dist[..., None], 1e-6)
-        # A still-rooted body (TREE, ROCK) must behave as infinitely heavy in
-        # collision response -- not just resist water drag. Using its real
-        # mass here was a real bug: a 2000kg ROCK still got physically
-        # shoved by a fast CAR's positional correction even though
-        # root_strength said it should be immovable; only the *velocity*
-        # path respected rootedness, not this position path.
-        inv_mass = np.where(buf.rooted, 0.0, 1.0 / np.maximum(buf.masses, 1e-6))
-        total_inv_mass = inv_mass[:, None] + inv_mass[None, :]
-
-        # positional correction: split overlap by inverse-mass ratio so the
-        # heavier body moves less (a HOUSE barely budges against a BOX)
-        frac_i = np.where(colliding, inv_mass[:, None] / np.maximum(total_inv_mass, 1e-9), 0.0)
-        push = normal * (overlap * frac_i)[..., None]
-        pos_xz = pos_xz + push.sum(axis=1)
-        buf.positions[:, 0] = pos_xz[:, 0]
-        buf.positions[:, 2] = pos_xz[:, 1]
-
-        # velocity impulse along the contact normal (Newton's third law falls
-        # out automatically: impulse[i,j] == -impulse[j,i] by construction)
-        vel_xz = buf.velocities[:, [0, 2]]
-        rel_vel = vel_xz[:, None, :] - vel_xz[None, :, :]
-        vel_along_normal = np.sum(rel_vel * normal, axis=-1)
-        approaching = colliding & (vel_along_normal < 0)
-        restitution = config.RIGID_COLLISION_RESTITUTION
-        j_impulse = np.where(approaching,
-                             -(1 + restitution) * vel_along_normal / np.maximum(total_inv_mass, 1e-9),
-                             0.0)
-        impulse = normal * j_impulse[..., None]
-        vel_xz = vel_xz + (impulse * inv_mass[:, None, None]).sum(axis=1)
-        buf.velocities[:, 0] = vel_xz[:, 0]
-        buf.velocities[:, 2] = vel_xz[:, 1]
-
-        impact_force = np.abs(j_impulse) / max(dt, 1e-9)
-        for i in range(n):
-            for j in range(i + 1, n):
-                if not colliding[i, j]:
-                    continue
-                key = frozenset((buf.ids[i], buf.ids[j]))
-                current_contacts.add(key)
-                if key not in self._active_contacts:
-                    new_events.append((i, j, float(abs(vel_along_normal[i, j]))))
-        # a body impact (not just water drag) can uproot a still-rooted body
-        for i in range(n):
-            if not buf.rooted[i]:
-                continue
-            worst = float(np.max(np.where(colliding[i], impact_force[i], 0.0)))
-            if worst > buf.root_strengths[i]:
-                buf.rooted[i] = False
-                uprooted.append((i, worst))
-        self._active_contacts = current_contacts
-        return new_events, uprooted
-
-    def step(self, dt: float, sim_time: float, fluid_samples=None) -> List[str]:
-        if self._world is None or not self.buffer.ids:
-            return []
-        n = len(self.buffer.ids)
-        depths = np.zeros(n, dtype=np.float32)
-        flow = np.zeros((n, 3), dtype=np.float32)
-        if fluid_samples is not None:
-            depths[:] = fluid_samples["depths"]
-            flow[:] = fluid_samples["velocities"]
-
-        gravity = float(self._world.environment.gravity)
-        buf = self.buffer
-        weight = buf.masses * gravity  # N
-
-        effective_depth = np.maximum(0.0, depths - buf.foundation_heights)
-        depth_ratio = effective_depth / config.RIGID_REFERENCE_DEPTH_M
-        # Buoyant support is NOT capped at buoyancy_coeff * weight: real water
-        # keeps adding lift as depth increases, so any object with buoyancy >
-        # 0 eventually floats given enough depth -- only how much depth it
-        # takes differs per object. buoyancy_coeff instead sets how quickly
-        # support grows with depth. (Capping it at depth_ratio==1 was a real
-        # bug: a box with buoyancy=0.8 could never drop contact_fraction
-        # below 0.2, so it could never reach RIGID_FLOAT_CONTACT_THRESHOLD
-        # and would never float no matter how deep the water got.)
-        buoyant = np.minimum(weight, buf.buoyancies * depth_ratio * weight)
-        normal = np.maximum(0.0, weight - buoyant)
-        submerge = np.clip(depth_ratio, 0.0, 1.0)  # drag exposure caps once fully wet
-        contact_fraction = np.where(weight > 1e-9, normal / np.maximum(weight, 1e-9), 0.0)
-        friction_max = buf.frictions * normal
-        # while still rooted, a body resists with friction PLUS root_strength
-        # (Newtons) on top -- once drag exceeds this combined resistance the
-        # anchor is gone for good (see docs/01_vision.md TREE "root strength"
-        # / "break strength", folded into one threshold here).
-        resistance = friction_max + np.where(buf.rooted, buf.root_strengths, 0.0)
-
-        rel = flow.copy()
-        rel[:, 1] = 0.0
-        rel[:, 0] -= buf.velocities[:, 0]
-        rel[:, 2] -= buf.velocities[:, 2]
-        drag = config.RIGID_WATER_DRAG_SCALE * buf.drags[:, None] * submerge[:, None] * rel
-        drag_mag = np.linalg.norm(drag[:, [0, 2]], axis=1)
-
-        prev_speed = np.linalg.norm(buf.velocities[:, [0, 2]], axis=1)
-        was_moving = prev_speed > config.RIGID_MOVE_EPS_MPS
-
-        net = np.zeros_like(drag)
-        # at rest: static friction (+ root_strength while rooted) holds
-        # unless drag overcomes it
-        drag_dir = np.zeros_like(drag)
-        nonzero_drag = drag_mag > 1e-9
-        drag_dir[nonzero_drag] = drag[nonzero_drag] / drag_mag[nonzero_drag, None]
-        at_rest = ~was_moving
-        overcomes_static = at_rest & (drag_mag > resistance)
-        net[overcomes_static] = (drag[overcomes_static]
-                                  - drag_dir[overcomes_static] * resistance[overcomes_static, None])
-        # already moving: kinetic friction (+ root_strength while rooted)
-        # opposes current velocity direction
-        vel_dir = np.zeros_like(buf.velocities)
-        nonzero_speed = prev_speed > 1e-9
-        vel_xz = buf.velocities.copy()
-        vel_xz[:, 1] = 0.0
-        vel_dir[nonzero_speed] = vel_xz[nonzero_speed] / prev_speed[nonzero_speed, None]
-        net[was_moving] = drag[was_moving] - vel_dir[was_moving] * resistance[was_moving, None]
-
-        # drag alone broke the anchor this tick -- record before mutating
-        # buf.rooted so the event/state logic below still sees "just broke"
-        uprooted_by_drag = buf.rooted & (drag_mag > resistance)
-
-        accel = net / np.maximum(buf.masses[:, None], 1e-6)
-        new_velocities = buf.velocities + accel * dt
-        new_velocities[:, 1] = 0.0
-        holding = at_rest & ~overcomes_static
-        new_velocities[holding] = 0.0
-        new_speed = np.linalg.norm(new_velocities[:, [0, 2]], axis=1)
-        # a moving body whose drag can no longer beat resistance comes to
-        # rest rather than oscillating around zero at fixed dt
-        stopping = was_moving & (drag_mag <= resistance) & (new_speed < config.RIGID_MOVE_EPS_MPS)
-        new_velocities[stopping] = 0.0
-
-        buf.velocities = new_velocities.astype(np.float32)
-        buf.positions = (buf.positions + buf.velocities * dt).astype(np.float32)
-        buf.rooted[uprooted_by_drag] = False
-        collision_events, collision_uprooted = self._resolve_collisions(n, dt)
-        for i, j, speed in collision_events:
-            oid_i, oid_j = buf.ids[i], buf.ids[j]
-            if self._events:
-                self._events.record(sim_time, EventType.OBJECT_COLLISION, oid_i,
-                                    cause="body_contact", other=oid_j, impact_speed=speed)
-        for idx in np.flatnonzero(uprooted_by_drag):
-            oid = buf.ids[int(idx)]
-            obj = self._world.objects.get(oid)
-            if obj is not None:
-                obj.state = ObjectState.BROKEN.value
-            if self._events:
-                self._events.record(sim_time, EventType.OBJECT_BROKEN, oid,
-                                    cause="drag_exceeded_root_strength",
-                                    drag_force=float(drag_mag[idx]),
-                                    root_strength=float(buf.root_strengths[idx]))
-        for idx, impact_force in collision_uprooted:
-            oid = buf.ids[idx]
-            obj = self._world.objects.get(oid)
-            if obj is not None:
-                obj.state = ObjectState.BROKEN.value
-            if self._events:
-                self._events.record(sim_time, EventType.OBJECT_BROKEN, oid,
-                                    cause="body_impact_exceeded_root_strength",
-                                    impact_force=impact_force,
-                                    root_strength=float(buf.root_strengths[idx]))
-        new_speed = np.linalg.norm(buf.velocities[:, [0, 2]], axis=1)
-
-        floating_mask = contact_fraction < config.RIGID_FLOAT_CONTACT_THRESHOLD
-        moving_mask = (~floating_mask) & (new_speed > config.RIGID_MOVE_EPS_MPS)
-
-        changed: List[str] = []
-        for idx in range(n):
-            oid = buf.ids[idx]
-            obj = self._world.objects.get(oid)
-            if obj is None:
-                continue
-            prev_state = obj.state
-            if floating_mask[idx]:
-                new_state = ObjectState.FLOATING.value
-            elif moving_mask[idx]:
-                new_state = ObjectState.MOVING.value
-            elif prev_state in (ObjectState.FLOATING.value, ObjectState.MOVING.value,
-                                 ObjectState.SETTLED.value):
-                new_state = ObjectState.SETTLED.value
-            else:
-                new_state = prev_state
-            if new_state != prev_state and self._events:
-                cause_params = dict(water_depth=float(depths[idx]),
-                                     flow_speed=float(np.linalg.norm(flow[idx, [0, 2]])),
-                                     drag_force=float(drag_mag[idx]),
-                                     ground_friction=float(friction_max[idx]),
-                                     contact_fraction=float(contact_fraction[idx]))
-                if new_state == ObjectState.MOVING.value:
-                    self._events.record(sim_time, EventType.OBJECT_STARTED_MOVING, oid,
-                                        cause="drag_exceeded_friction", **cause_params)
-                elif new_state == ObjectState.FLOATING.value:
-                    self._events.record(sim_time, EventType.OBJECT_FLOATING, oid,
-                                        cause="buoyancy_exceeded_weight", **cause_params)
-                elif new_state == ObjectState.SETTLED.value:
-                    self._events.record(sim_time, EventType.OBJECT_SETTLED, oid,
-                                        cause="water_receded", **cause_params)
-            obj.state = new_state
-            obj.position = buf.positions[idx].astype(float).tolist()
-            if new_state != prev_state or moving_mask[idx] or floating_mask[idx]:
-                changed.append(oid)
-        return changed

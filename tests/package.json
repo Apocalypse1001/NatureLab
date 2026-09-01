@@ -1,7 +1,7 @@
 {
   "name": "naturelab-foundation-tests",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "test": "node e2e.mjs"

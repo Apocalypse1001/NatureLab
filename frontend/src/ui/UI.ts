@@ -1,6 +1,7 @@
 /** HUD: top bar, object palette, properties panel, terrain/water controls,
  *  debug strip. Pure DOM — no framework, easy to extend. */
-import { OBJECT_TYPES, type ObjectData, type ObjectType, type SimEvent } from '../world/types';
+import { OBJECT_TYPES, type GaugeSample, type GaugeState, type ObjectData,
+  type ObjectType, type SimEvent } from '../world/types';
 
 export interface UICallbacks {
   play(): void;
@@ -14,8 +15,8 @@ export interface UICallbacks {
   removeSelected(): void;
   updateObject(id: string, patch: Partial<ObjectData>): void;
   setWaterLevel(v: number): void;
-  setWaterFlow(enabled: boolean): void;
-  setTemperature(v: number): void;
+  setTracerVisible(visible: boolean): void;
+  setTracerCount(count: number): void;
   setTool(tool: 'select' | 'raise' | 'lower'): void;
   setBrush(radius: number, strength: number): void;
   getObjects(): ObjectData[];
@@ -23,12 +24,14 @@ export interface UICallbacks {
 
 export class UI {
   readonly root: HTMLElement;
+  private brandEl!: HTMLElement;
   private clockEl: HTMLSpanElement;
   private statusEl: HTMLSpanElement;
   private fpsEl: HTMLSpanElement;
   private simFpsEl: HTMLSpanElement;
   private objectsEl: HTMLSpanElement;
   private particlesEl: HTMLSpanElement;
+  private fluidEl: HTMLSpanElement;
   private wsEl: HTMLSpanElement;
   private gpuEl: HTMLSpanElement;
   private warpEl: HTMLSpanElement;
@@ -49,6 +52,7 @@ export class UI {
     this.simFpsEl = this.root.querySelector('#dbg-simfps')!;
     this.objectsEl = this.root.querySelector('#dbg-objects')!;
     this.particlesEl = this.root.querySelector('#dbg-particles')!;
+    this.fluidEl = this.root.querySelector('#dbg-fluid')!;
     this.wsEl = this.root.querySelector('#dbg-ws')!;
     this.gpuEl = this.root.querySelector('#dbg-gpu')!;
     this.warpEl = this.root.querySelector('#dbg-warp')!;
@@ -62,7 +66,8 @@ export class UI {
   // ------------------------------------------------------------------ layout
   private buildTopBar(): HTMLElement {
     const bar = el('div', 'topbar');
-    bar.append(el('div', 'brand', 'NatureLab'));
+    this.brandEl = el('div', 'brand', 'NatureLab');
+    bar.append(this.brandEl);
     const controls = el('div', 'controls');
     controls.append(
       btn('PLAY', () => this.cb.play()),
@@ -115,11 +120,11 @@ export class UI {
 
     panel.append(el('h3', '', 'Water'));
     const water = el('div', 'slider-row');
-    water.innerHTML = '<label>Water level <output id="water-out">0.5</output> m</label>';
+    water.innerHTML = '<label>Edge inflow level <output id="water-out">0.5</output> m</label>';
     const slider = el('input', '') as HTMLInputElement;
+    slider.id = 'water-level';
     slider.type = 'range'; slider.min = '-2'; slider.max = '8'; slider.step = '0.1';
     slider.value = '0.5';
-    slider.id = 'water-level';
     slider.oninput = () => {
       this.root.querySelector<HTMLSpanElement>('#water-out')!.textContent = slider.value;
       this.cb.setWaterLevel(parseFloat(slider.value));
@@ -127,38 +132,24 @@ export class UI {
     water.append(slider);
     panel.append(water);
 
-    // Continuous river current: west edge held at the Water Level slider's
-    // value (live, not a snapshot), east edge held at a small fraction of it
-    // -- see backend config.FLUID_RIVER_SINK_FRACTION. Enabling it resets
-    // the grid dry and lets a real wavefront advance in from the west edge
-    // (ShallowWaterFluidSolver._seed_river_profile) rather than filling the
-    // whole map at once. Off by default: a flat lake with a flat initial
-    // fill has zero surface gradient and never moves on its own, see
-    // docs/04_TZ_v0.3_roadmap.md v0.4 "Важная находка".
-    const flowRow = el('div', 'slider-row');
-    const flowLabel = el('label', '') as HTMLLabelElement;
-    const flowCheckbox = el('input', '') as HTMLInputElement;
-    flowCheckbox.type = 'checkbox';
-    flowCheckbox.id = 'water-flow';
-    flowCheckbox.onchange = () => this.cb.setWaterFlow(flowCheckbox.checked);
-    flowLabel.append(flowCheckbox, document.createTextNode(' River flow'));
-    flowRow.append(flowLabel);
-    panel.append(flowRow);
-
-    // v0.4 RiverLab (Schauberger hypothesis): baseline water temperature.
-    // Tree shade cools it locally/automatically -- this is only the manual
-    // global baseline, see docs/04_TZ_v0.3_roadmap.md v0.4.
-    const temp = el('div', 'slider-row');
-    temp.innerHTML = '<label>Water temperature <output id="temp-out">15</output> °C</label>';
-    const tempSlider = el('input', '') as HTMLInputElement;
-    tempSlider.type = 'range'; tempSlider.min = '0'; tempSlider.max = '30'; tempSlider.step = '0.5';
-    tempSlider.value = '15';
-    tempSlider.oninput = () => {
-      this.root.querySelector<HTMLSpanElement>('#temp-out')!.textContent = tempSlider.value;
-      this.cb.setTemperature(parseFloat(tempSlider.value));
+    panel.append(el('h3', '', 'Flow visualization'));
+    const tracerToggle = el('label', 'slider-row', 'Show physical tracers');
+    const visible = el('input', '') as HTMLInputElement;
+    visible.id = 'tracers-visible'; visible.type = 'checkbox'; visible.checked = true;
+    visible.onchange = () => this.cb.setTracerVisible(visible.checked);
+    tracerToggle.append(visible);
+    panel.append(tracerToggle);
+    const tracerCount = el('div', 'slider-row');
+    tracerCount.innerHTML = '<label>Visible tracers <output id="tracer-count-out">8000</output></label>';
+    const count = el('input', '') as HTMLInputElement;
+    count.id = 'tracer-count'; count.type = 'range'; count.min = '0'; count.max = '8000';
+    count.step = '500'; count.value = '8000';
+    count.oninput = () => {
+      this.root.querySelector('#tracer-count-out')!.textContent = count.value;
+      this.cb.setTracerCount(parseInt(count.value, 10));
     };
-    temp.append(tempSlider);
-    panel.append(temp);
+    tracerCount.append(count);
+    panel.append(tracerCount);
 
     panel.append(el('h3', '', 'Terrain'));
     const tools = el('div', 'palette');
@@ -198,7 +189,8 @@ export class UI {
       'FPS <span id="dbg-fps">–</span> | ' +
       'Sim FPS <span id="dbg-simfps">–</span> | ' +
       'Objects <span id="dbg-objects">0</span> | ' +
-      'Particles <span id="dbg-particles">0</span> | ' +
+      'Tracers source <span id="dbg-particles">0</span> | ' +
+      'Wet cells <span id="dbg-fluid">0</span> | ' +
       'WS <span id="dbg-ws">offline</span> | ' +
       'Warp <span id="dbg-warp">–</span> | ' +
       'CUDA <span id="dbg-cuda">–</span> | ' +
@@ -216,22 +208,12 @@ export class UI {
     this.wsEl.className = status === 'connected' ? 'ok' : 'bad';
   }
 
-  setEngine(engine: { warp_available: boolean; cuda: boolean; device: string; gpu_name: string }): void {
+  setEngine(engine: { warp_available: boolean; cuda: boolean; device: string;
+                      gpu_name: string; version?: string }): void {
+    if (engine.version) this.brandEl.textContent = `NatureLab ${engine.version}`;
     this.warpEl.textContent = engine.warp_available ? 'ready' : 'missing';
     this.cudaEl.textContent = engine.cuda ? 'yes' : 'no (CPU mode)';
     this.gpuEl.textContent = engine.gpu_name;
-  }
-
-  /** Push loaded world state into the water controls (load / reset / initial
-   *  hello), so the panel never claims a level or a flow state the backend
-   *  does not actually have. */
-  syncWaterControls(level: number, flowEnabled: boolean): void {
-    const slider = this.root.querySelector<HTMLInputElement>('#water-level');
-    if (slider) slider.value = String(level);
-    const out = this.root.querySelector<HTMLSpanElement>('#water-out');
-    if (out) out.textContent = String(level);
-    const flow = this.root.querySelector<HTMLInputElement>('#water-flow');
-    if (flow) flow.checked = flowEnabled;
   }
 
   setClock(time: number, status: string): void {
@@ -240,14 +222,25 @@ export class UI {
     this.statusEl.className = status === 'RUNNING' ? 'ok' : '';
   }
 
+  setReservoirLevel(level: number): void {
+    const slider = this.root.querySelector<HTMLInputElement>('#water-level');
+    const output = this.root.querySelector<HTMLOutputElement>('#water-out');
+    if (slider) slider.value = String(level);
+    if (output) output.textContent = String(level);
+  }
+
   setFps(fps: number): void {
     this.fpsEl.textContent = fps.toFixed(0);
   }
 
-  setSimStats(state: { sim_fps: number; objects: number; particles: number }): void {
+  setSimStats(state: { sim_fps: number; objects: number; particles: number;
+                       fluid?: { wet_cells?: number; volume_m3?: number } }): void {
     this.simFpsEl.textContent = state.sim_fps.toFixed(1);
     this.objectsEl.textContent = String(state.objects);
     this.particlesEl.textContent = state.particles.toLocaleString();
+    const wet = state.fluid?.wet_cells ?? 0;
+    const volume = state.fluid?.volume_m3 ?? 0;
+    this.fluidEl.textContent = `${wet.toLocaleString()} / ${volume.toFixed(1)} m³`;
   }
 
   logEvent(e: SimEvent): void {
@@ -279,6 +272,7 @@ export class UI {
   }
 
   showProperties(obj: ObjectData | null): void {
+    this.selectedId = obj?.id ?? null;
     const host = this.propsHost;
     host.innerHTML = '';
     if (!obj) {
@@ -295,14 +289,24 @@ export class UI {
       ['Scale X', 'scl_x', obj.scale[0], (v) => this.patchScale(obj.id, 0, v)],
       ['Scale Y', 'scl_y', obj.scale[1], (v) => this.patchScale(obj.id, 1, v)],
       ['Scale Z', 'scl_z', obj.scale[2], (v) => this.patchScale(obj.id, 2, v)],
+    ];
+    if (obj.type !== 'GAUGE') fields.push(
       ['Mass (kg)', 'mass', obj.mass, (v) => this.cb.updateObject(obj.id, { mass: v })],
       ['Friction', 'friction', obj.friction, (v) => this.cb.updateObject(obj.id, { friction: v })],
-      ['Buoyancy', 'buoyancy', obj.buoyancy, (v) => this.cb.updateObject(obj.id, { buoyancy: v })],
+      ['Sealed buoyancy (0–1)', 'buoyancy', obj.buoyancy,
+       (v) => this.cb.updateObject(obj.id, { buoyancy: v })],
+      ['Volume (m³)', 'volume', obj.volume_m3, (v) => this.cb.updateObject(obj.id, { volume_m3: v })],
+      ['Drag coefficient', 'drag', obj.drag_coefficient,
+       (v) => this.cb.updateObject(obj.id, { drag_coefficient: v })],
+      ['Ground area (m²)', 'ground_area', obj.ground_contact_area,
+       (v) => this.cb.updateObject(obj.id, { ground_contact_area: v })],
+      ['Cross area (m²)', 'cross_area', obj.cross_sectional_area,
+       (v) => this.cb.updateObject(obj.id, { cross_sectional_area: v })],
       ['Foundation height', 'foundation', obj.metadata.foundation_height ?? 0,
        (v) => this.cb.updateObject(obj.id, { metadata: { ...obj.metadata, foundation_height: v } })],
       ['Damage resistance', 'resistance', obj.metadata.damage_resistance ?? 0,
        (v) => this.cb.updateObject(obj.id, { metadata: { ...obj.metadata, damage_resistance: v } })],
-    ];
+    );
     for (const [label, key, value, apply] of fields) {
       const row = el('div', 'prop-row');
       row.innerHTML = `<label>${label}</label>`;
@@ -316,6 +320,41 @@ export class UI {
       row.append(input);
       host.append(row);
     }
+    if (obj.type === 'GAUGE') {
+      const readout = el('div', 'gauge-readout');
+      readout.id = 'gauge-readout';
+      readout.innerHTML =
+        '<h3>Live measurements</h3>' +
+        '<div>Depth <strong id="gauge-depth">dry</strong></div>' +
+        '<div>Surface <strong id="gauge-surface">dry</strong></div>' +
+        '<div>Speed <strong id="gauge-speed">0.000 m/s</strong></div>' +
+        '<div>Wave arrival <strong id="gauge-arrival">not arrived</strong></div>' +
+        '<svg id="gauge-chart" viewBox="0 0 240 70" role="img" aria-label="Gauge depth history">' +
+        '<polyline points="" /></svg>';
+      host.append(readout);
+    }
+  }
+
+  updateGaugeReadout(state: GaugeState | undefined, history: GaugeSample[]): void {
+    if (!state || state.id !== this.selectedId || !this.root.querySelector('#gauge-readout')) return;
+    const latest = state.latest;
+    this.root.querySelector('#gauge-depth')!.textContent = latest
+      ? `${latest.water_depth_m.toFixed(3)} m` : 'dry';
+    this.root.querySelector('#gauge-surface')!.textContent = latest?.surface_elevation_m != null
+      ? `${latest.surface_elevation_m.toFixed(3)} m` : 'dry';
+    this.root.querySelector('#gauge-speed')!.textContent = latest
+      ? `${latest.speed_m_s.toFixed(3)} m/s` : '0.000 m/s';
+    this.root.querySelector('#gauge-arrival')!.textContent = state.arrival_time_s != null
+      ? `${state.arrival_time_s.toFixed(2)} s` : 'not arrived';
+    const points = this.root.querySelector<SVGPolylineElement>('#gauge-chart polyline');
+    if (!points || history.length < 2) return;
+    const visible = history.slice(-240);
+    const maxDepth = Math.max(0.001, ...visible.map((sample) => sample.water_depth_m));
+    points.setAttribute('points', visible.map((sample, i) => {
+      const x = i * 240 / Math.max(1, visible.length - 1);
+      const y = 68 - sample.water_depth_m / maxDepth * 64;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' '));
   }
 
   updatePropertyInputs(obj: ObjectData): void {
@@ -325,6 +364,8 @@ export class UI {
       rot_x: deg(obj.rotation[0]), rot_y: deg(obj.rotation[1]), rot_z: deg(obj.rotation[2]),
       scl_x: obj.scale[0], scl_y: obj.scale[1], scl_z: obj.scale[2],
       mass: obj.mass, friction: obj.friction, buoyancy: obj.buoyancy,
+      volume: obj.volume_m3, drag: obj.drag_coefficient,
+      ground_area: obj.ground_contact_area, cross_area: obj.cross_sectional_area,
     };
     for (const input of this.propsHost.querySelectorAll<HTMLInputElement>('input')) {
       const key = input.dataset.key;

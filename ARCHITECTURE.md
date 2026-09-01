@@ -1,182 +1,88 @@
-# NatureLab Foundation 0.2 — Architecture
+# NatureLab 0.5.1 - Architecture
+
+Проектная документация, которая объясняет *почему* архитектура такая, живёт в `docs/`:
+[`01_vision.md`](docs/01_vision.md) (цели и критерий качества),
+[`04_TZ_v0.3_roadmap.md`](docs/04_TZ_v0.3_roadmap.md) (процесс и Definition of Done),
+[`05_audit_v0.4_water.md`](docs/05_audit_v0.4_water.md) (почему прежний солвер заменён),
+[`06_next_steps.md`](docs/06_next_steps.md) (порядок версий дальше).
+
+## Data Flow
 
 ```text
-Three.js editor/visualization
-          ↕ JSON + versioned bulk WebSocket frames
-FastAPI / SimulationManager (authoritative WorldState, fixed dt=1/60)
-          ↕ boundaries / batched samples
-FluidSolver  ↔  RigidBodySystem (dense arrays)
-          ↘       ↙
-        ComputeEngine → NVIDIA Warp → CUDA/CPU
+Three.js editor / WATER_HEIGHT visualization
+                    <-> WebSocket protocol v2
+FastAPI / SimulationManager (authoritative state, fixed global dt=1/60)
+                    -> revision sync
+WarpShallowWaterSolver h/u/v + bed/solid arrays
+                    -> GPU sample depth/velocity/drag
+RigidStateBuffer -> Warp force integration -> compact transforms/states
 ```
 
-## State ownership
+## Fluid
 
-Backend является источником истины. Frontend делает optimistic editor update только
-для реально отправленной команды и принимает authoritative ответ. RESET восстанавливает
-единственный InitialWorldState, снятый при IDLE→RUNNING. PLAY при RUNNING ничего не меняет;
-PLAY при PAUSED только возобновляет часы.
+Grid 101x101 follows terrain vertices. Velocity and continuity use ping-pong Warp arrays.
+Outer faces and solid faces have zero normal flux; tangential edge velocity remains valid.
+Face discharge uses water above the maximum neighboring bed elevation.
 
-## Dynamic body lifecycle
+CFL diagnostics reduce max depth, speed, wave speed, volume and wet count to scalar GPU
+buffers. `FLUID_CFL=0.45` selects internal substeps; `FLUID_MAX_SUBSTEPS` is a guardrail.
 
-`RigidStateBuffer` содержит contiguous NumPy arrays:
+## Obstacles And Revisions
 
-```text
-ids[], index{id→slot}, positions[N,3], velocities[N,3], rotations[N,3],
-masses[N], buoyancies[N], states[N]
-```
+SimulationManager increments `terrain_revision` and `obstacle_revision` only after edits.
+The solver tracks seen revisions and reports `terrain_gpu_uploads` and
+`obstacle_gpu_uploads`. Unchanged ticks do not recreate GPU arrays.
 
-```text
-+ frictions[N], drags[N], foundation_heights[N], footprint_radii[N]
-```
+HOUSE footprints are yaw-oriented solid cells. On a mask revision, water and momentum from newly solid
+cells move deterministically to the nearest unchanged fluid cells. Newly freed cells start
+dry, so moving/removing a HOUSE neither stores phantom water nor creates volume.
 
-ADD регистрирует slot, UPDATE синхронизирует массивы, REMOVE делает swap-delete.
-v0.3: `ForceRigidBodySystem` считает gravity/buoyancy/drag/friction векторно по всем телам
-разом (см. `docs/04_TZ_v0.3_roadmap.md`); будущий Warp solver сможет загрузить эти же массивы
-без изменения контракта.
+## GPU Coupling
 
-## Fluid ↔ Rigid contract
+`_sample_bodies` reads h/u/v directly on device at a rotated 3x3 body footprint,
+accounts for body-base elevation, and calculates hydrodynamic drag.
+`_integrate_bodies` applies force/mass, buoyancy and friction on device. Only compact body
+transforms, states and sample depths return to CPU for WorldState synchronization,
+educational events and the current 2D collision correction. Full h/u/v readback occurs only
+when producing a frontend/debug field.
 
-На каждом global fixed tick:
+## Rigid Model
 
-1. Rigid предоставляет object obstacle snapshot (positions, rotations, masses, **radii**).
-2. Fluid получает terrain + obstacle boundaries; каждый obstacle вырезает дыру радиусом
-   `radii[i]` (не единый фиксированный радиус — дом и коробка вытесняют разный объём).
-3. `FluidSolver.advance(global_dt, max_substeps, stability_dt)` выбирает внутренние substeps.
-4. Fluid batch-sample возвращает depths, velocities и forces для body positions — усреднением
-   по всем открытым (не-obstacle) клеткам в окрестности каждого тела, а не по фиксированному
-   направленному кольцу (направленное кольцо ловило дыру *соседнего* объекта в multi-object
-   сценах — см. `ShallowWaterFluidSolver.sample_for_bodies` docstring).
-5. Rigid применяет samples к плотным массивам через явную модель сил (gravity/buoyancy/drag/
-   friction), не через порог.
+Dense buffers include mass, sealed buoyancy coefficient, volume, drag coefficient,
+contact/cross areas, friction and static flag. Buoyancy is displaced water weight; grounded motion begins when drag exceeds
+Coulomb friction. Semi-implicit integration drives INTACT/MOVING/FLOATING/SETTLED states.
 
-v0.3: `ShallowWaterFluidSolver` реализует этот контракт (height field на сетке terrain,
-outflow-limited обмен, obstacle mask из `obstacle_snapshot()`). Полноценный
-CFD/Navier-Stokes-уровень намеренно не реализован — см. `docs/04_TZ_v0.3_roadmap.md`, раздел 3
-(причинный реализм — цель, инженерный CFD-реализм — не цель проекта).
+## Edge Inflow And Editing
 
-## Water rendering (frontend)
+The map starts dry except for two prescribed source columns at the left boundary (`x=-50 m`).
+The selected Edge inflow level is enforced only there; every downstream cell becomes wet
+through physical flux. Terrain commands are rejected while RUNNING and accepted while
+IDLE/PAUSED.
 
-`SimulationManager._stream()` шлёт `WATER_HEIGHT` bulk-фрейм (полное поле depth) каждый tick
-пока RUNNING/PAUSED. `SceneManager.waterMesh` имеет ту же сетку вершин, что и terrain;
-`updateWaterField()` деформирует её по клеткам (`y = terrain_height + depth`), так что вода
-физически дренирует до уровня terrain там, где depth≈0 — включая внутри/вокруг препятствий.
-До первого `START` — плоский editor-preview на уровне слайдера (`setWater()`).
+## Protocol
 
-## Terrain consistency
+Protocol v2 header is `NL | version:u8 | kind:u8 | count:u32 | time_ms:u64` followed by
+little-endian float32 data. `WATER_HEIGHT` contains absolute Y elevations in row-major
+`[z,x]`. PARTICLES carries GPU-advected flow tracers derived from the real velocity field.
 
-Brush sample имеет одну последовательность: frontend применяет только отправленные samples;
-backend применяет sample к float32 TerrainGrid и отвечает `terrain_patch` с полным массивом
-и SHA-256 над little-endian float32 bytes. Frontend заменяет локальные heights. Автотест
-сравнивает checksum числовых массивов.
+## Educational Gauges
 
-v0.4: `terrain.heights` может также меняться физически (erosion/deposition, см. Sediment ниже),
-не только через ручной brush. `SimulationManager._stream()` шлёт тот же JSON `terrain_patch`
-проактивно во время RUNNING (раз в `config.TERRAIN_RESYNC_INTERVAL_S`), не только как ответ на
-`terrain_brush` op — frontend-обработчик идентичен для обоих случаев (диспетчеризация по типу
-сообщения, не по тому, был ли это ответ на конкретный запрос).
+`GAUGE` reuses the compact per-body GPU sampling path with a zero-size footprint. It never
+enters the fluid obstacle mask or collision pairs. SimulationManager records depth, absolute
+surface, horizontal speed and first wave-arrival time. Incremental samples are streamed in
+`sim_state`; backend and frontend histories are bounded to 600 entries at 10 Hz simulation time.
 
-## Sediment transport (RiverLab, v0.4)
+## Versioning and releases
 
-`ShallowWaterFluidSolver._sediment` — то же поле, что depth, на той же сетке. Каждый substep,
-после расчёта потока: `capacity = SEDIMENT_CAPACITY_SCALE * speed * depth`; где capacity выше
-текущего sediment — эрозия (`terrain -= amount; sediment += amount`, ограничено bedrock floor и
-только на мокрых клетках); где ниже — осаждение (наоборот). Перенос осадка переиспользует уже
-посчитанные и уже clamped flow-значения (не отдельный adverction solver) — концентрация
-(`sediment/depth`) переносится пропорционально объёму воды, ушедшему в каждом направлении, что
-автоматически гарантирует: клетка не может отдать больше осадка, чем в ней есть (то же
-рассуждение о сохранении, что уже используется для depth).
+`backend/app/config.py:VERSION` — единственный источник истины для номера версии. Он
+уходит во frontend через `engine_info()` (виден в заголовке приложения и в
+`/api/status`), и его же читает `tools/make_release.py`, собирая
+`releases/NatureLab_v<version>.zip`.
 
-`terrain.heights` мутируется по ссылке (тот же объект, что `world.terrain`) — значит erosion
-автоматически меняет дальнейший flow тем же путём, что и ручной `terrain.brush()`. Намеренно
-медленно (см. docstring `config.SEDIMENT_*_RATE`) — реальная эрозия медленна относительно
-одного паводка; должна быть заметна на длинных RiverLab-сравнениях (River A vs River B), не
-искажать короткие FloodLab-сценарии.
+Архив самодостаточен: внутрь кладётся собранный `frontend/dist/`, поэтому распакованная
+версия запускается без `npm`. Не кладутся `.git/`, `node_modules/`, `__pycache__/`,
+предыдущие архивы, вывод PyInstaller и скриншоты драйвера. SHA-256 каждого архива
+пишется в `releases/CHECKSUMS.txt`.
 
-## Water temperature / shade (RiverLab, v0.4, Schauberger hypothesis)
-
-`ShallowWaterFluidSolver.set_environment(base_temperature, shade)` пересчитывает
-`_temperature_factor` **каждый tick заново** из `RigidBodySystem.shade_snapshot()` (позиции тел
-с `shade_cooling > 0`, по умолчанию только TREE) — намеренно **не** персистентное/диффундирующее
-поле (решение пользователя 2026-09-01, после разбора первоисточников Шаубергера про тень/русло —
-см. `docs/04_TZ_v0.3_roadmap.md` v0.4). Множитель применяется и к `FLUID_FLOW_GAIN`, и к
-`SEDIMENT_CAPACITY_SCALE`, clamp `[TEMP_FACTOR_MIN, TEMP_FACTOR_MAX]`. `environment.temperature`
-— ручная база (UI-слайдер + op `environment_temperature`), тень — модулирует её локально
-автоматически из позиций деревьев, без ручной покраски.
-
-## River flow (RiverLab, v0.4)
-
-`water.flow_enabled` (чекбокс River flow) → `ShallowWaterFluidSolver.set_river_flow()`,
-читается **живьём каждый tick**. Реализовано граничными условиями, не новым солвером:
-западная кромка удерживается не ниже **`world.water.level`, читаемого живьём** (не снимок на
-`initialize()` — Water Level теперь реально управляет высотой реки во время RUNNING в этом
-режиме), восточная — не выше `FLUID_RIVER_SINK_FRACTION` (10%) той же высоты; постоянный
-перепад между ними уже существующая консервативная flux-схема несёт как течение. Масса намеренно
-не сохраняется **только** на этих двух кромочных столбцах. Без этого плоская заливка
-`depth = level - terrain` даёт нулевой градиент и вода не двигается вообще.
-
-Три доработки 2026-09-01 по итогам **двух отдельных** проверок в запущенном приложении, не
-только по тестам:
-
-1. `FLUID_FLOW_GAIN` поднят 1.6→10.0 (наибольшее стабильное значение под worst-case:
-   препятствие + камень + полное охлаждение тенью — см. `config.py` докстринг и
-   `test_flow_gain_stays_stable_under_worst_case_obstacle_bed_and_shade`). Первая проверка:
-   на старом gain середина сетки 100×100 не двигалась 30 реальных секунд — эффект был
-   физически правильным, но невидимым.
-2. `_seed_river_profile()`: при включении flow (переход false→true) сбрасывает сетку **насухо**
-   и даёт настоящей flux-физике самой протянуть фронт от истока — вторая проверка показала, что
-   предыдущая версия этого метода (мгновенная рампа по всей сетке) была неправильной в другую
-   сторону: пользователь явно попросил, чтобы вода входила с края и текла, а не заполняла всё
-   сразу. Высота истока/устья тоже переведена с констант на `world.water.level` — течение
-   «в соответствии с указанной высотой».
-3. `SceneManager.WATER_VISUAL_EXAGGERATION` на **глубину** (физику не трогает) плюс отдельный
-   per-vertex alpha-attribute `aWet`, который делает по-настоящему сухие клетки полностью
-   прозрачными. Оба нужны вместе: Z-bias один решает z-fighting дряных клеток с terrain, но
-   красит всю карту одинаково «мокрой» на вид — именно то, что дизайн с «начать насухо, видеть
-   фронт» не может себе позволить. См. `docs/04_TZ_v0.3_roadmap.md` v0.4 за полной цепочкой
-   (включая почему первая попытка exaggeration на абсолютную высоту поверхности z-fight'ила).
-
-## Riverbed rocks (RiverLab, v0.4)
-
-ROCK — часть русла, не стена. `obstacle_snapshot()` отдаёт солверу только тела с
-`bed_height == 0` (их бинарная obstacle-mask делает бесконечно высокими — верно для дома);
-тела с `bed_height > 0` идут отдельным каналом `bed_snapshot()` →
-`ShallowWaterFluidSolver.set_bed_obstructions()` и поднимают **эффективное дно** куполом
-(`_bed_offset`, добавляется к `terrain.heights` в `_step`). Отсюда сразу: обтекание, зависимость
-от размера (радиус — горизонтальный `scale`, высота — вертикальный) и от положения (на сухой
-отмели вытеснять нечего), а вместе с sediment-механикой — размыв боков и осаждение в тени, то
-есть meandering.
-
-Как и `_temperature_factor`, поле **stateless**: пересчитывается каждый tick из текущих позиций
-и никогда не пишется в terrain мира, поэтому передвинутый камень не оставляет кратера. Terrain
-под камнем защищён от эрозии (`config.BED_EROSION_SHIELD`) — валун это скальная порода, река
-обтекает его, а не выкапывает под ним яму.
-
-## Bulk protocol v2
-
-Header (16 bytes): `NL | version:u8 | kind:u8 | count:u32 | time_ms:u64`.
-Далее строго проверяемый little-endian float32 payload. Kinds:
-
-- `PARTICLES`
-- `WATER_HEIGHT`
-- `VELOCITY_FIELD`
-- `OBJECT_TRANSFORMS`
-- `TERRAIN_PATCH`
-- `EVENTS`
-
-Simulation particles не определяют visualization. Сейчас backend deterministic-downsample
-до `VISUALIZATION_PARTICLE_LIMIT=25000`; frontend buffer динамически растёт. Будущий CUDA
-gather kernel устранит полный device readback, не меняя протокол.
-
-## Validation
-
-WebSocket root обязан быть JSON object. Vector transforms имеют ровно 3 finite numbers,
-scale strictly positive. Terrain length/dimensions, environment wind, states, duplicate IDs,
-speed/radius/strength и binary frame length/version/kind валидируются до мутации state.
-
-## Launcher
-
-Frozen launcher разрешает install root через `sys.executable.parent`, но никогда не запускает
-backend через frozen `sys.executable`. Он ищет внешний/portable Python, хранит `Popen`,
-останавливает только собственный backend и ждёт завершения. Test mode проверяет отсутствие
-рекурсии и orphan processes.
+Правило именования: номер версии должен говорить, какая физика внутри. 0.5.1 — это
+слияние двух веток без новой физики; следующая версия с эрозией/осадком будет 0.6.0.

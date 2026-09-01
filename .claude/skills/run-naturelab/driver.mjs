@@ -9,11 +9,11 @@
  *
  * Commands (one per line, on stdin):
  *   status              sim status / clock / object + particle counts
- *   add <TYPE>          HOUSE | CAR | TREE | BOX | DEBRIS | ROCK
+ *   add <TYPE>          HOUSE | CAR | TREE | BOX | DEBRIS | GAUGE
  *   start | pause | reset
- *   flow on|off         water.flow_enabled (the continuous river current)
- *   temp <c>            baseline water temperature slider
- *   water <m>           water level slider
+ *   water <m>           edge-inflow level (the river source at the west edge)
+ *   gauge               GAUGE readings: depth, surface, speed, arrival time
+ *   tracers <n>         visible flow-tracer count (0 hides them)
  *   send <json>         raw WebSocket op, e.g. send {"op":"start"}
  *   eval <js>           evaluate in the page, JSON-printed. `__NL` is in scope.
  *   depth               water depth field stats (min/mean/max, wet cells)
@@ -169,44 +169,36 @@ async function status() {
     clock: document.querySelector('#clock')?.textContent,
     objects: globalThis.__NL.store.objects.size,
     types: [...globalThis.__NL.store.objects.values()].map((o) => o.type),
-    waterLevel: globalThis.__NL.store.waterLevel,
-    riverFlow: document.querySelector('#water-flow')?.checked ?? null,
+    edgeInflowLevel: globalThis.__NL.store.waterLevel,
+    tracers: Number(document.querySelector('#tracer-count')?.value ?? 0),
     fps: document.querySelector('#fps')?.textContent,
   }));
 }
 
 async function depthStats() {
-  // SceneManager does not keep the depth array -- updateWaterField() folds it
-  // straight into vertex Z as (terrainZ + depth * WATER_VISUAL_EXAGGERATION).
-  // The exaggeration (2026-09-01, see SceneManager.ts) is a rendering-only
-  // multiplier so gradients read as visible slopes instead of a flat-looking
-  // plane -- it is NOT applied to physics/sampling, only to what gets drawn.
-  // Divide it back out here so these numbers stay the real backend depth
-  // (comparable across a run regardless of what the constant is tuned to),
-  // not the inflated on-screen one. Only while RUNNING/PAUSED, though: the
-  // IDLE editor preview (SceneManager.setWater) paints every vertex at the
-  // flat slider level directly, with NO exaggeration applied at all -- correct
-  // for that path is EXAG=1, and dividing it by 4 anyway was a real bug caught
-  // here (a smoke run reported "0.125m flat" for a 0.5m slider before this).
+  // SceneManager keeps no depth array: setWaterHeights() writes the ABSOLUTE
+  // water-surface elevation into vertex Z (v0.5.1 -- the WATER_HEIGHT bulk
+  // frame carries `bed + depth` for wet cells and `bed - 0.05` for dry ones,
+  // see WarpShallowWaterSolver.get_water_height_field). So the real backend
+  // depth is simply waterZ - terrainZ, clamped at 0 for the dry marker.
+  //
+  // Before v0.5.1 the frame carried raw depth and the renderer applied a x4
+  // WATER_VISUAL_EXAGGERATION plus a WATER_DRY_BIAS lift, which this function
+  // had to divide back out. Both constants are gone: the Warp solver produces
+  // a real gradient that needs no help, and dry cells are now hidden by
+  // dropping their triangles from the index instead of by a Z nudge.
   return page.evaluate(() => {
     const sm = globalThis.__NL.sceneManager;
     const idle = document.querySelector('#sim-status')?.textContent === 'IDLE';
-    const proto = Object.getPrototypeOf(sm).constructor;
-    const EXAG = idle ? 1 : (sm.constructor.WATER_VISUAL_EXAGGERATION ?? proto.WATER_VISUAL_EXAGGERATION ?? 1);
-    // WATER_DRY_BIAS (2026-09-01): a small constant lift added to every water
-    // vertex regardless of depth, to keep genuinely-dry cells from rendering
-    // exactly coplanar with terrain (z-fighting) -- see SceneManager.ts. Not
-    // present in the IDLE flat preview either, same as EXAG above.
-    const BIAS = idle ? 0 : (sm.constructor.WATER_DRY_BIAS ?? proto.WATER_DRY_BIAS ?? 0);
     const w = sm.waterMesh.geometry.attributes.position;
     const t = sm.terrainMesh.geometry.attributes.position;
     const n = Math.min(w.count, t.count);
     let min = Infinity, max = -Infinity, sum = 0, wet = 0;
-    // west/east halves, to show a river current as an actual gradient
+    // west/east quarters, to show a current as an actual gradient
     let westSum = 0, westN = 0, eastSum = 0, eastN = 0;
     const side = Math.round(Math.sqrt(n));
     for (let i = 0; i < n; i++) {
-      const d = (w.getZ(i) - t.getZ(i) - BIAS) / EXAG;
+      const d = Math.max(0, w.getZ(i) - t.getZ(i));
       if (d < min) min = d;
       if (d > max) max = d;
       sum += d;
@@ -221,7 +213,8 @@ async function depthStats() {
       westMean: r(westSum / Math.max(1, westN)),
       eastMean: r(eastSum / Math.max(1, eastN)),
       visible: sm.waterMesh.visible,
-      renderExaggeration: EXAG,
+      drawnTriangles: sm.waterMesh.geometry.drawRange.count / 3,
+      idlePreview: idle,
     };
   });
 }
@@ -250,17 +243,39 @@ async function handle(line) {
       await send({ op: cmd });
       await sleep(300);
       return JSON.stringify(await status());
-    case 'flow':
-      await send({ op: 'water_flow', enabled: arg === 'on' });
-      await page.evaluate((on) => { const c = document.querySelector('#water-flow'); if (c) c.checked = on; },
-                          arg === 'on');
-      return `river flow ${arg}`;
-    case 'temp':
-      await send({ op: 'environment_temperature', temperature: parseFloat(arg) });
-      return `temperature ${arg}`;
     case 'water':
+      // v0.5.1: this is the EDGE INFLOW level -- the height held at the west
+      // source columns, from which the Warp solver grows a real wavefront.
+      // It is not a lake fill, and it is read live while RUNNING.
       await send({ op: 'water_level', level: parseFloat(arg) });
-      return `water level ${arg}`;
+      // also move the slider, so `status` and a screenshot agree with the
+      // value the backend is actually using (sending the op alone left the
+      // UI reading its old value -- caught on a real run).
+      await page.evaluate((v) => {
+        const slider = document.querySelector('#water-level');
+        if (slider) { slider.value = String(v); slider.dispatchEvent(new Event('input')); }
+      }, parseFloat(arg));
+      return `edge inflow level ${arg}`;
+    case 'gauge':
+      return JSON.stringify(await page.evaluate(() => {
+        const store = globalThis.__NL.store;
+        const out = [];
+        for (const o of Object.values(store.objects ?? {})) {
+          if (o.type === 'GAUGE') out.push({ id: o.id, position: o.position,
+                                             reading: o.metadata ?? null });
+        }
+        return { gauges: out, history: (store.gaugeHistory ?? null) };
+      }));
+    case 'tracers': {
+      const n = parseInt(arg, 10) || 0;
+      await page.evaluate((count) => {
+        const box = document.querySelector('#tracer-visible');
+        if (box) { box.checked = count > 0; box.dispatchEvent(new Event('change')); }
+        const slider = document.querySelector('#tracer-count');
+        if (slider) { slider.value = String(count); slider.dispatchEvent(new Event('input')); }
+      }, n);
+      return `tracers ${n}`;
+    }
     case 'send':
       await send(JSON.parse(arg));
       await sleep(200);
@@ -301,8 +316,8 @@ try {
 if (process.argv.includes('--smoke')) {
   const fail = (m) => { console.log(`err SMOKE FAIL: ${m}`); return shutdown(1); };
   try {
-    await handle('place ROCK 0 0');
-    await handle('flow on');
+    await handle('place HOUSE 0 0');
+    await handle('water 1.0');
     const before = JSON.parse(await handle('depth'));
     await handle('start');
     await sleep(5000);
@@ -312,11 +327,11 @@ if (process.argv.includes('--smoke')) {
     const tris = Number(/triangles=(\d+)/.exec(shot)?.[1] ?? 0);
 
     if (st.sim !== 'RUNNING') await fail(`sim status is ${st.sim}, expected RUNNING`);
-    else if (!st.types.includes('ROCK')) await fail('ROCK did not round-trip through the backend');
+    else if (!st.types.includes('HOUSE')) await fail('HOUSE did not round-trip through the backend');
     else if (tris < 1000) await fail(`only ${tris} triangles drawn -- WebGL is not rendering`);
     else if (!(after.westMean > after.eastMean + 0.05)) {
       await fail(`no west->east gradient (west=${after.westMean} east=${after.eastMean}); `
-               + 'river flow is not moving water');
+               + 'the edge inflow is not moving water');
     } else {
       console.log(`ok SMOKE PASS  sim=${st.sim} ${st.clock} objects=${st.objects} `
         + `triangles=${tris} depth ${before.mean}m flat -> west ${after.westMean}m / `

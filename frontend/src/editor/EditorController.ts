@@ -12,6 +12,7 @@ export class EditorController {
   tool: Tool = 'select';
   brushRadius = 6;
   brushStrength = 0.4;
+  terrainEditingEnabled = true;
 
   private transform: TransformControls;
   private painting = false;
@@ -116,6 +117,7 @@ export class EditorController {
   }
 
   private applyBrush(): void {
+    if (!this.terrainEditingEnabled) return;
     const point = this.scene.pickTerrain(this.pointer);
     if (!point) return;
     const sign = this.tool === 'raise' ? 1 : -1;

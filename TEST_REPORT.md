@@ -1,162 +1,146 @@
-# NatureLab Foundation 0.2 / v0.3 / v0.4 — TEST REPORT
+# NatureLab 0.5.1 — TEST REPORT
 
-Дата: 2026-09-01 (v0.4 addendum поверх v0.3/0.2, даты разделов ниже: 2026-08-31 для 0.2). Все
-тесты находятся в `tests/` и запускаются из чисто распакованного проекта командой `tests\run_all.bat`.
+Дата: 2026-09-02. Windows 11 Pro 10.0.26200, RTX 5090 32 GB (sm_120, mempool enabled),
+CUDA Toolkit 12.9 / driver 13.2, Python 3.12.7, NVIDIA Warp 1.17.0, Node v24.18.0.
 
-## v0.4 — температура воды и тень от деревьев, гипотеза Шаубергера (проверено на этой машине, CPU)
+Все результаты ниже — фактический вывод команд на этой машине в этой сессии, а не
+перенос отчёта донорской сборки. Версия 0.5.1 не добавляет своей физики: это перенос
+GPU-движка 0.5.0 в git-репозиторий, поэтому основной смысл прогона — доказать, что
+движок работает **здесь** ровно так же, как работал там.
 
-| Проверка | Статус |
-|---|---|
-| Без источников тени множитель остаётся ровно 1.0 везде | PASS |
-| Тень поднимает локальный множитель выше 1.0 рядом с деревом, не влияет вдалеке | PASS |
-| Множитель ограничен `[TEMP_FACTOR_MIN, TEMP_FACTOR_MAX]` даже при экстремальном shade_cooling | PASS |
-| `shade_snapshot()` включает только объекты с shade_cooling>0 (TREE), не BOX и т.д. | PASS |
-| River A/B: тень реально меняет depth-поле и суммарный sediment при равных остальных условиях | PASS |
-| Интеграционный тест: `_temperature_factor` реально меняется через полный SimulationManager pipeline | PASS (ручной прогон, не в run_all.bat) |
-| Backend op `environment_temperature` реально работает через `_dispatch` (валидация + применение) | PASS (ручной прогон через venv с fastapi, не в run_all.bat) |
-| `npm run build` (tsc --noEmit + vite build) после добавления UI-слайдера температуры | PASS |
-
-## v0.4 — RiverLab: ROCK, эрозия/перенос осадка, terrain-стриминг (проверено на этой машине, CPU)
-
-| Проверка | Статус |
-|---|---|
-| ROCK неподвижен под экстремальным drag и ударом (root_strength=1e8) | PASS |
-| Footprint ROCK масштабируется через obj.scale | PASS |
-| Больший камень сильнее нарушает поток, чем меньший | PASS |
-| Быстрый поток эрозирует terrain и переносит sediment | PASS (после исправления фикстуры теста — `solver.initialize()` даёт гидростатически плоскую поверхность = нулевой поток с первого тика; понадобилось явно задать равномерную глубину поверх наклона, как настоящее русло) |
-| Erosion+deposition сохраняют суммарное количество материала (terrain+sediment) | PASS |
-| Изменение terrain от эрозии реально меняет дальнейший flow (не игнорируется) | PASS |
-| Камень меняет локальный паттерн эрозии (не просто статичная дыра) | PASS |
-| Полный набор из 24 предыдущих тестов остаётся зелёным без изменений | PASS |
-| Интеграционный тест: `terrain_patch` при RUNNING реально соответствует live-состоянию backend в момент отправки (не рассинхронизирован) | PASS (ручной прогон через SimulationManager._stream, не в run_all.bat) |
-
-**Найдено при тестировании, не является багом физики, но честно задокументировано** (см.
-`docs/04_TZ_v0.3_roadmap.md` и README): `ShallowWaterFluidSolver.initialize()` создаёт абсолютно
-плоскую водную поверхность (нулевой поток) с первого тика на закрытой системе без объектов;
-слайдер Water Level не влияет на solver во время RUNNING (читается только при `initialize()`).
-
-## v0.3 — дерево закреплено к земле, root_strength (проверено на этой машине, CPU)
-
-| Проверка | Статус |
-|---|---|
-| Дерево остаётся rooted/INTACT под обычным паводковым потоком (depth=1.0, flow=2 м/с) | PASS |
-| Дерево отрывается (BROKEN) от экстремального потока (depth=2.0, flow=12 м/с) | PASS |
-| Дерево отрывается от удара машиной на большой скорости, даже без воды | PASS |
-| Сломанное дерево остаётся зарегистрированным rigid body и продолжает вырезать препятствие в воде | PASS |
-| Интеграционный прогон через SimulationManager: машина на 15 м/с врезается в дерево → BROKEN, cause=body_impact_exceeded_root_strength, impact_force≈458717 | PASS (ручной прогон, не в run_all.bat) |
-
-## v0.3 — импульсное столкновение объектов (проверено на этой машине, CPU)
-
-| Проверка | Статус |
-|---|---|
-| Два тела не проникают друг в друга дальше суммы footprint_radius | PASS |
-| Момент импульса сохраняется при столкновении (Ньютон 3); тяжёлое тело почти не двигается от лёгкого | PASS |
-| Событие OBJECT_COLLISION пишется один раз на контакт, не каждый tick | PASS |
-| Прямая трассировка через SimulationManager: коробка на 6 м/с останавливается ровно на границе радиусов (3.16м при сумме радиусов 3.1м), с отскоком и одним событием (impact_speed≈4.12 м/с) | PASS (ручной прогон, не в run_all.bat) |
-
-Диагностика NaN-warning в позиционной коррекции (0×-inf на диагонали матрицы столкновений)
-найдена и убрана до коммита — не влияла на результат (маскировалась), но была неаккуратной.
-
-## v0.3 — ShallowWaterFluidSolver (проверено на этой машине, CPU, без GPU)
-
-Реально выполнено в этой сессии (`python3 tests/test_backend.py`), не только заявлено:
-
-| Проверка | Статус |
-|---|---|
-| Conservation: суммарный объём воды не меняется без источника/стока (closed boundary) | PASS |
-| Нет отрицательной глубины; нет phantom water внутри препятствий (клетки под объектом = 0) | PASS |
-| Перемещение препятствия меняет итоговое распределение потока (причинный тест) | PASS (после исправления фикстуры теста — препятствие изначально ставилось в заведомо сухую зону, solver был прав, тест — нет) |
-| Объект видит глубину воды вокруг своего футпринта и может всплыть | PASS (после исправления бага: `sample_for_bodies` сэмплил ровно в центре объекта, а объект сам исключает воду в своей точке — объект физически не мог всплыть; найдено integration smoke-тестом через `SimulationManager`, не unit-тестом) |
-| Полный набор из 4 тестов Foundation 0.2 остаётся зелёным без изменений | PASS |
-| Integration smoke test: BOX на плоском мокром terrain реально переходит в FLOATING | PASS (ручной прогон через SimulationManager, не входит в run_all.bat) |
-
-`REQUIRES GPU VERIFICATION`: нет для этого пункта — solver работает на чистом NumPy, не через
-Warp/CUDA, поэтому численно идентичен на любой машине. GPU-порт для производительности на
-больших сетках — отдельный будущий пункт, не покрыт этим прогоном.
-
-## v0.3 — ForceRigidBodySystem (проверено на этой машине, CPU, без GPU)
-
-| Проверка | Статус |
-|---|---|
-| Лёгкая коробка начинает двигаться раньше тяжёлой машины при одинаковом потоке | PASS |
-| Дом остаётся INTACT на мелкой воде (низкая buoyancy, огромная масса) | PASS |
-| Объект с положительной buoyancy рано или поздно всплывает на достаточной глубине | PASS (после исправления бага: buoyant force капалась на уровне `buoyancy_coeff*weight`, поэтому объект с buoyancy<0.85 не мог всплыть вообще ни при какой глубине) |
-| `foundation_height` реально меняет исход при одинаковой воде (Experiment A/B из `01_vision.md`) | PASS |
-| Полный набор из 14 предыдущих тестов остаётся зелёным без изменений | PASS |
-
-## v0.3 — связка Fluid↔Rigid при нескольких объектах (найдено и исправлено в этой сессии)
-
-Integration smoke test через `SimulationManager` (HOUSE+CAR+BOX на одном поле) вскрыл то, что
-изолированные unit-тесты не ловили:
-
-| Проверка | Статус |
-|---|---|
-| Кольцо сэмплирования не блендится билинейно с dry-клеткой на границе своего же препятствия | PASS (было: ring на +0.5 клетки за краем диска всё равно интерполировался с сухой граничной клеткой, глубина читалась вдвое заниженной даже на полностью открытой воде) |
-| Сэмплинг одного объекта не искажается дырой *соседнего* объекта в многообъектной сцене | PASS (было: HOUSE в 3.6 м от BOX занижал прочитанную у BOX глубину с 1.2 до 0.9 м — направленное кольцо задевало чужой obstacle mask; исправлено маскированным усреднением по всем открытым клеткам в окрестности) |
-| BOX+HOUSE+CAR на одном поле дают физически согласованные состояния | PASS (ручной прогон через SimulationManager) |
-
-## v0.3 — вода реально видна на фронтенде (реальный headless-браузер, эта сессия)
-
-Backend вычислял честное поле глубины с первого коммита v0.3, но не отправлял его, а frontend
-рисовал воду как не связанную с физикой плоскость — то есть вода **визуально** проходила сквозь
-препятствия. Исправлено (`WATER_HEIGHT` bulk-стрим + `SceneManager.updateWaterField`) и
-проверено настоящим Chrome (Chrome for Testing 152, скачан через `@puppeteer/browsers`,
-не входит в архив) с реальным backend и реальной сборкой frontend:
-
-| Проверка | Статус |
-|---|---|
-| `npm run build` (tsc --noEmit + vite build) зелёный после изменений | PASS |
-| Реальный браузер: water mesh получает WATER_HEIGHT-фреймы и становится visible | PASS |
-| Глубина воды в точке объекта = 0.000 м (терраса, не вода) | PASS |
-| Глубина воды в стороне от объекта = 1.200 м (реальная физика, не 0 и не искажена) | PASS |
-
-Этот прогон не автоматизирован в `tests/run_all.bat` (требует скачивание Chrome/Chromium),
-воспроизводился вручную в сессии. `REQUIRES GPU VERIFICATION`: нет — чистый CPU/browser путь.
-
-## Foundation 0.2 (дата 2026-08-31)
-
-| Проверка | Статус |
-|---|---|
-| Python compile + Warp selftest 100 000 points | PASS |
-| START idempotent, InitialWorldState не заменяется | PASS |
-| RUNNING: ADD CAR → MOVE → REMOVE → ADD TREE → PAUSE → RESUME → RESET | PASS |
-| Dynamic rigid register/update/unregister без KeyError | PASS |
-| RESET удаляет runtime edits и восстанавливает baseline | PASS |
-| Strict transform/world validation (length, finite, scale) | PASS |
-| Rotation backend round-trip ровно xyz | PASS |
-| Terrain frontend/backend SHA-256 checksum | PASS |
-| Bulk protocol version/kind/exact length validation | PASS |
-| Dynamic frontend particle buffer, frame 150 001 | PASS |
-| Visualization count отделён от simulation count | PASS |
-| Fluid boundaries + adaptive internal substeps + batched samples | PASS |
-| Browser WebSocket validation и отсутствие console errors | PASS |
-| Frozen NatureLab.exe: root, no recursion, owned backend shutdown | PASS |
-
-## Команды
+## 1. Backend physics (CUDA / Warp)
 
 ```bat
 python tests\test_backend.py
-cd tests
-npm ci
-npm test
 ```
-
-Backend tests: 4 suites PASS. Portable browser E2E: PASS.
-
-Launcher lifecycle test (`NATURELAB_TEST_MODE=1`):
 
 ```text
-launcher root=<archive root>
-backend pid=<pid> python=<external python.exe>
-backend ready; stopping owned process
-launcher done
-orphan backends=0
+Ran 21 tests in 8.894s
+
+OK
+Warp 1.17.0 initialized:
+   CUDA Toolkit 12.9, Driver 13.2
+   Devices:
+     "cpu"      : "Intel64 Family 6 Model 198 Stepping 2, GenuineIntel"
+     "cuda:0"   : "NVIDIA GeForce RTX 5090" (32 GiB, sm_120, mempool enabled)
 ```
 
-## Окружение
+| Physics regression | Result |
+|---|---|
+| Warp selftest 100 000 points на `cuda:0` | PASS |
+| Lake at rest: h постоянна, max velocity 0 | PASS |
+| Closed edge slug: ошибка объёма за 10 с | PASS |
+| Ridge 3 м блокирует 0.5 м воды | PASS |
+| HOUSE footprint отклоняет поток | PASS |
+| Rotated HOUSE — точная yaw-OBB маска | PASS |
+| MOVE/REMOVE HOUSE без phantom water | PASS |
+| Adaptive CFL увеличивает подшаги на глубоком/быстром поле | PASS |
+| Стартовая вода занимает только два столбца у западной кромки | PASS |
+| Runtime edge inflow создаёт физический поток вниз по течению | PASS |
+| BOX реагирует раньше CAR при равной глубине | PASS |
+| 3x3 footprint: частичное смачивание, приподнятый объект сухой | PASS |
+| Миграция buoyancy world v1 и валидация 0..1 | PASS |
+| Нулевая вода/поток оставляет объект строго INTACT | PASS |
+| Плавающие объекты разрешают столкновения | PASS |
+| GAUGE: точечный сэмпл, отсутствие влияния на поток, история, RESET | PASS |
+| Стриминг GPU tracers | PASS |
+| RESET и детерминированный replay | PASS |
+| Terrain edit во время RUNNING отклоняется | PASS |
+| START идемпотентен, RUNNING edit sequence + RESET | PASS |
+| Строгая валидация трансформаций и протокола | PASS |
 
-Python 3.12.10, Warp 1.17.0, CPU device (CUDA driver unavailable), Node 22.14.0,
-Chrome/Edge headless, versions dependencies зафиксированы в lock/requirements files.
+**21 / 21 PASS.**
 
-CUDA на RTX 5090 требует отдельного прогона на целевой машине; device selection `cuda:0`
-реализован, но в данном окружении физически проверить CUDA невозможно.
+## 2. Browser + WebSocket E2E
+
+```bat
+node tests\e2e.mjs
+```
+
+```text
+PASS  frontend + WebSocket
+PASS  strict WebSocket root validation
+PASS  Warp selftest (cuda:0)
+PASS  dynamic particle buffer >120k
+PASS  terrain frontend/backend checksum
+PASS  Warp shallow-water heightfield
+PASS  dry and HOUSE water triangles masked
+PASS  initial wave starts at left map edge
+PASS  flow tracer display controls
+PASS  GPU flow tracers follow fluid velocity
+PASS  GAUGE depth, speed, arrival and history
+PASS  runtime Water level updates fluid field
+PASS  START idempotent
+PASS  floating objects resolve collisions
+PASS  RUNNING edit sequence + RESET integrity
+PASS  rotation xyz round-trip
+PASS  no browser errors
+NatureLab 0.5.1 E2E: PASS
+```
+
+**17 / 17 PASS.** Строка версии читается с работающего backend (`/api/status`), а не
+захардкожена — раньше она осталась бы `0.5.0` после бампа.
+
+## 3. Агентский драйвер (живое приложение)
+
+```bat
+node .claude\skills\run-naturelab\driver.mjs --smoke
+```
+
+```text
+ok SMOKE PASS  sim=RUNNING t = 5.3s objects=1 triangles=27444 depth 1m flat -> west 0.556m / east 0m
+```
+
+Сценарий с тремя объектами, edge inflow 1.5 м, 20 с симуляции:
+
+```text
+t= 6s   {"cells":10201,"wet":2525,"max":1.5,"mean":0.296,"westMean":1.148,"eastMean":0,"drawnTriangles":4800}
+t=20s   {"cells":10201,"wet":6329,"max":1.5,"mean":0.631,"westMean":1.329,"eastMean":0,"drawnTriangles":12309}
+```
+
+Смоченных клеток 2525 → 6329 за 14 с — фронт физически движется, а не заливает карту
+мгновенно. Скриншот `t20.png` показывает воду с чёткой неровной кромкой фронта на
+западной половине и сухой рельеф на восточной; событие `Car_001 OBJECT_FLOATING
+(gpu_buoyancy_supports_weight)` в логе. FPS 57, Sim FPS 58.5.
+
+## 4. Прямой прогон солвера (без сервера и браузера)
+
+```text
+t=  10s  wet= 3030  vol=  2290.4 m3  vmax=2.605 m/s  substeps=1
+t=  20s  wet= 5151  vol=  3484.0 m3  vmax=2.023 m/s  substeps=1
+t=  30s  wet= 6868  vol=  4311.3 m3  vmax=1.587 m/s  substeps=1
+```
+
+Объём растёт монотонно (вода поступает только через кромку-источник), максимальная
+скорость физически правдоподобна (1.5–2.6 м/с), CFL держит один подшаг.
+
+## 5. Проверка релизного архива
+
+```bat
+python tools\make_release.py
+```
+
+```text
+releases\NatureLab_v0.5.1.zip  57 files  0.3 MB
+```
+
+SHA-256 записан в `releases/CHECKSUMS.txt`. Внутрь архива этот файл намеренно не
+кладётся: контрольная сумма архива не может лежать в нём самом — она бы
+самоинвалидировалась при каждой пересборке.
+
+Архив распакован во временный каталог и запущен оттуда **без пересборки фронтенда**:
+
+```text
+GET /  -> 200
+{"app":"NatureLab","backend":"online","engine":{"version":"0.5.1","engine":"warp",
+ "warp_available":true,"cuda":true,"device":"cuda:0","gpu_name":"NVIDIA GeForce RTX 5090", ...}}
+```
+
+**PASS** — требование «распаковал и запустил любую версию» выполняется.
+
+## Не проверено
+
+- `tests\run_all.bat` целиком и `tests\test_launcher.ps1` — требуют собранного
+  `NatureLab.exe` (PyInstaller). `build_exe.bat` в этой сессии не запускался.
+- 30-минутный soak — донорская сборка проходила его (108 000 шагов, 849.3 шага/с);
+  здесь код тот же, но повторно на этой машине не прогонялся.

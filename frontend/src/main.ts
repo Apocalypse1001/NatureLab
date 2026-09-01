@@ -10,6 +10,7 @@ import './style.css';
 const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
 
 const store = new WorldStore();
+let currentSimStatus = 'IDLE';
 
 const canvas = document.createElement('canvas');
 canvas.id = 'viewport';
@@ -30,13 +31,18 @@ const net = new BackendClient(wsUrl, {
   },
   onWorld: (world, simStatus) => applyWorld(world, simStatus),
   onSimState: (state) => {
+    currentSimStatus = state.status;
+    editor.terrainEditingEnabled = state.status !== 'RUNNING';
     ui.setClock(state.time, state.status);
     ui.setSimStats(state);
+    store.applyGaugeStates(state.gauges ?? [], state.gauge_history_capacity ?? 600);
     for (const moved of state.moved_objects) {
       store.updateObject(moved.id, { position: moved.position, state: moved.state });
       const obj = store.objects.get(moved.id);
-      if (obj) sceneManager.setObject(obj);
-      ui.updatePropertyInputs(obj!);
+      if (obj) {
+        sceneManager.setObject(obj);
+        ui.updatePropertyInputs(obj);
+      }
     }
     for (const e of state.events) ui.logEvent(e);
   },
@@ -55,7 +61,12 @@ const net = new BackendClient(wsUrl, {
 });
 
 net.particleHandler = (positions, count) => sceneManager.setParticles(positions, count);
-net.waterHeightHandler = (depths) => sceneManager.updateWaterField(depths);
+net.waterHeightHandler = (heights, count, simTime) => {
+  if (sceneManager.setWaterHeights(heights, count)) {
+    store.waterFrameCount = count;
+    store.waterFrameTime = simTime;
+  }
+};
 
 // ---------------------------------------------------------------------- ui
 const ui = new UI(uiHost, {
@@ -76,14 +87,11 @@ const ui = new UI(uiHost, {
   },
   setWaterLevel: (v) => {
     store.setWaterLevel(v);
-    sceneManager.setWater(v, store.waterVisible);
+    if (currentSimStatus === 'IDLE') sceneManager.setWater(v, store.waterVisible);
     net.send({ op: 'water_level', level: v });
   },
-  setWaterFlow: (enabled) => {
-    store.setWaterFlow(enabled);
-    net.send({ op: 'water_flow', enabled });
-  },
-  setTemperature: (v) => net.send({ op: 'environment_temperature', temperature: v }),
+  setTracerVisible: (visible) => sceneManager.setTracerVisible(visible),
+  setTracerCount: (count) => sceneManager.setTracerDisplayLimit(count),
   setTool: (tool) => editor.setTool(tool),
   setBrush: (radius, strength) => {
     editor.brushRadius = radius;
@@ -97,10 +105,13 @@ const editor = new EditorController(sceneManager, store, net);
 
 // ---------------------------------------------------------------------- world sync
 function applyWorld(world: WorldData, simStatus: string): void {
+  currentSimStatus = simStatus;
+  editor.terrainEditingEnabled = simStatus !== 'RUNNING';
   store.replaceWorld(world);
   sceneManager.rebuildTerrain(store.terrain);
   sceneManager.setWater(store.waterLevel, store.waterVisible);
-  ui.syncWaterControls(store.waterLevel, store.waterFlowEnabled);
+  sceneManager.clearTracers();
+  ui.setReservoirLevel(store.waterLevel);
   sceneManager.clearObjects();
   for (const obj of world.objects) sceneManager.setObject(obj);
   ui.refreshObjectList([...store.objects.values()], null);
@@ -122,6 +133,14 @@ store.on('selection-changed', (id) => {
   const selected = id ? store.objects.get(id as string) ?? null : null;
   ui.refreshObjectList([...store.objects.values()], store.selectedId);
   ui.showProperties(selected);
+  if (selected?.type === 'GAUGE') {
+    ui.updateGaugeReadout(store.gauges.get(selected.id),
+                          store.gaugeHistory.get(selected.id) ?? []);
+  }
+});
+store.on('gauge-updated', (id) => {
+  const gaugeId = id as string;
+  ui.updateGaugeReadout(store.gauges.get(gaugeId), store.gaugeHistory.get(gaugeId) ?? []);
 });
 
 // ---------------------------------------------------------------------- loop

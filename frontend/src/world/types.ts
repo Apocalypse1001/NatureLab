@@ -1,6 +1,6 @@
 /** Shared data model — mirrors backend/app/world_state.py. */
 
-export type ObjectType = 'HOUSE' | 'CAR' | 'TREE' | 'BOX' | 'DEBRIS' | 'ROCK';
+export type ObjectType = 'HOUSE' | 'CAR' | 'TREE' | 'BOX' | 'DEBRIS' | 'GAUGE';
 
 export type ObjectState =
   | 'INTACT' | 'MOVING' | 'FLOATING' | 'COLLIDING'
@@ -15,6 +15,11 @@ export interface ObjectData {
   mass: number;         // kg
   friction: number;
   buoyancy: number;
+  volume_m3: number;
+  drag_coefficient: number;
+  ground_contact_area: number;
+  cross_sectional_area: number;
+  is_static: boolean;
   damage: number;       // 0..1
   state: ObjectState;
   metadata: Record<string, number>;
@@ -30,7 +35,7 @@ export interface TerrainData {
 export interface WorldData {
   version: number;
   terrain: TerrainData;
-  water: { level: number; visible: boolean; flow_enabled?: boolean };
+  water: { level: number; visible: boolean };
   environment: { gravity: number; wind: number[]; temperature: number };
   objects: ObjectData[];
 }
@@ -55,6 +60,25 @@ export interface SimStateMessage {
   particles: number;
   events: SimEvent[];
   moved_objects: { id: string; position: number[]; state: ObjectState }[];
+  gauge_history_capacity: number;
+  gauges: GaugeState[];
+  fluid?: { solver: string; device?: string; grid?: number[]; substeps: number;
+            wet_cells?: number; volume_m3?: number; cfl_dt?: number;
+            max_depth?: number; max_velocity?: number };
+}
+
+export interface GaugeSample {
+  time_s: number;
+  water_depth_m: number;
+  surface_elevation_m: number | null;
+  speed_m_s: number;
+}
+
+export interface GaugeState {
+  id: string;
+  arrival_time_s: number | null;
+  latest: GaugeSample | null;
+  samples: GaugeSample[];
 }
 
 export interface SimEvent {
@@ -66,7 +90,7 @@ export interface SimEvent {
 }
 
 /** Add new object types here (+ backend defaults) without touching the core. */
-export const OBJECT_TYPES: ObjectType[] = ['HOUSE', 'CAR', 'TREE', 'BOX', 'DEBRIS', 'ROCK'];
+export const OBJECT_TYPES: ObjectType[] = ['HOUSE', 'CAR', 'TREE', 'BOX', 'DEBRIS', 'GAUGE'];
 
 export const OBJECT_COLORS: Record<string, number> = {
   HOUSE: 0xc9a27a,
@@ -74,5 +98,5 @@ export const OBJECT_COLORS: Record<string, number> = {
   TREE: 0x3f9d4e,
   BOX: 0xb08050,
   DEBRIS: 0x808080,
-  ROCK: 0x6b6b64,
+  GAUGE: 0x62e6ff,
 };

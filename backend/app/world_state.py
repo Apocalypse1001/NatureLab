@@ -43,7 +43,7 @@ class ObjectType(str, enum.Enum):
     TREE = "TREE"
     BOX = "BOX"
     DEBRIS = "DEBRIS"
-    ROCK = "ROCK"
+    GAUGE = "GAUGE"
 
     @classmethod
     def register(cls, name: str) -> "ObjectType":
@@ -69,72 +69,46 @@ class ObjectState(str, enum.Enum):
 
 
 # Default physical properties per type. New types plug in here.
-# `drag` is a single scalar proxy for (Cd * cross-sectional area), not a real
-# aerodynamic/hydrodynamic decomposition -- see docs/04_TZ_v0.3_roadmap.md
-# section 3 on the causal- vs engineering-realism bar this project targets.
-# `footprint_radius` is the XZ half-extent used to carve the object out of the
-# fluid grid (see fluid_solver.ShallowWaterFluidSolver) -- matches the actual
-# primitive sizes in frontend/src/world/ObjectFactory.ts so a house blocks
-# more of the flow than a box, not a single fixed radius for every object.
-# `root_strength` is extra static resistance (Newtons) ON TOP OF normal
-# Coulomb friction, applied only while the object is still "rooted" (see
-# rigid_body.ForceRigidBodySystem). 0 for everything except TREE -- this is
-# a generic mechanic (any type could opt in), not a TREE special case, and
-# folds docs/01_vision.md's separate "root strength" and "break strength"
-# TREE properties into one threshold: how much force (from water drag OR
-# a body impact) before the anchor is permanently gone and it becomes an
-# ordinary movable/floating body (matching "дерево упало -> стало
-# препятствием" from 01_vision.md, since a broken tree is still a
-# registered rigid body and keeps carving its obstacle hole in the water).
 OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
-    ObjectType.HOUSE: {"mass": 20000.0, "friction": 0.7, "buoyancy": 0.1, "drag": 0.2,
-                       "foundation_height": 0.3, "damage_resistance": 0.8,
-                       "footprint_radius": 2.4, "root_strength": 0.0,
-                       "shade_radius": 0.0, "shade_cooling": 0.0},
-    ObjectType.CAR:   {"mass": 1500.0, "friction": 0.6, "buoyancy": 0.55, "drag": 1.5,
-                       "foundation_height": 0.0, "damage_resistance": 0.3,
-                       "footprint_radius": 2.2, "root_strength": 0.0,
-                       "shade_radius": 0.0, "shade_cooling": 0.0},
-    # shade_radius/shade_cooling (RiverLab, Schauberger): a tree canopy casts
-    # shade well beyond its own footprint_radius (trunk) -- see
-    # docs/04_TZ_v0.3_roadmap.md v0.4 and world_state note near
-    # ShallowWaterFluidSolver._update_temperature_factor for how this is used.
-    ObjectType.TREE:  {"mass": 800.0, "friction": 0.8, "buoyancy": 0.6, "drag": 0.9,
-                       "foundation_height": 0.0, "damage_resistance": 0.4,
-                       "footprint_radius": 1.2, "root_strength": 15000.0,
-                       "shade_radius": 4.0, "shade_cooling": 3.0},
-    ObjectType.BOX:   {"mass": 50.0, "friction": 0.5, "buoyancy": 0.8, "drag": 0.6,
-                       "foundation_height": 0.0, "damage_resistance": 0.5,
-                       "footprint_radius": 0.7, "root_strength": 0.0,
-                       "shade_radius": 0.0, "shade_cooling": 0.0},
-    ObjectType.DEBRIS: {"mass": 10.0, "friction": 0.4, "buoyancy": 0.9, "drag": 0.4,
-                        "foundation_height": 0.0, "damage_resistance": 0.2,
-                        "footprint_radius": 0.7, "root_strength": 0.0,
-                        "shade_radius": 0.0, "shade_cooling": 0.0},
-    # Riverbed rock (RiverLab, docs/04_TZ_v0.3_roadmap.md v0.4): not a Schauberger
-    # special case, just root_strength turned up so high it's permanently
-    # immovable by anything this sim can produce -- reuses 100% of the existing
-    # obstacle/root machinery. footprint_radius already scales with obj.scale
-    # (already editable in the UI), so "effect scales with rock size" falls
-    # out for free instead of needing a new property.
-    # bed_height: how far the boulder stands proud of the bed. The only type with
-    # a non-zero one -- it makes the rock part of the riverbed rather than an
-    # infinitely tall wall, so deep water passes over it and shallow water is
-    # deflected around it. See config.BED_DOME_EXPONENT and
-    # ShallowWaterFluidSolver.set_bed_obstructions.
-    ObjectType.ROCK: {"mass": 2000.0, "friction": 0.9, "buoyancy": 0.0, "drag": 0.1,
-                      "foundation_height": 0.0, "damage_resistance": 1.0,
-                      "footprint_radius": 1.0, "root_strength": 1e8,
-                      "shade_radius": 0.0, "shade_cooling": 0.0,
-                      "bed_height": 0.8},
+    ObjectType.HOUSE: {"mass": 20000.0, "friction": 0.7, "buoyancy": 1.0,
+                       "volume_m3": 15.0, "drag_coefficient": 1.2,
+                       "ground_contact_area": 16.0, "cross_sectional_area": 12.0,
+                       "is_static": True,
+                       "foundation_height": 0.3, "damage_resistance": 0.8},
+    ObjectType.CAR:   {"mass": 1500.0, "friction": 0.6, "buoyancy": 1.0,
+                       "volume_m3": 1.8, "drag_coefficient": 0.9,
+                       "ground_contact_area": 3.5, "cross_sectional_area": 2.4,
+                       "is_static": False,
+                       "foundation_height": 0.0, "damage_resistance": 0.3},
+    ObjectType.TREE:  {"mass": 800.0, "friction": 0.8, "buoyancy": 1.0,
+                       "volume_m3": 1.0, "drag_coefficient": 1.1,
+                       "ground_contact_area": 0.2, "cross_sectional_area": 0.8,
+                       "is_static": False,
+                       "foundation_height": 0.0, "damage_resistance": 0.4},
+    ObjectType.BOX:   {"mass": 50.0, "friction": 0.5, "buoyancy": 1.0,
+                       "volume_m3": 1.728, "drag_coefficient": 1.05,
+                       "ground_contact_area": 1.44, "cross_sectional_area": 1.44,
+                       "is_static": False,
+                       "foundation_height": 0.0, "damage_resistance": 0.5},
+    ObjectType.DEBRIS: {"mass": 10.0, "friction": 0.4, "buoyancy": 1.0,
+                         "volume_m3": 0.025, "drag_coefficient": 1.2,
+                         "ground_contact_area": 0.1, "cross_sectional_area": 0.2,
+                         "is_static": False,
+                          "foundation_height": 0.0, "damage_resistance": 0.2},
+    ObjectType.GAUGE: {"mass": 1.0, "friction": 0.0, "buoyancy": 0.0,
+                       "volume_m3": 1.0, "drag_coefficient": 1.0,
+                       "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
+                       "is_static": True,
+                       "foundation_height": 0.0, "damage_resistance": 1.0},
 }
 
 
 def default_properties(obj_type: str) -> Dict[str, float]:
-    base = {"mass": 100.0, "friction": 0.5, "buoyancy": 0.5, "drag": 0.5,
-            "foundation_height": 0.0, "damage_resistance": 0.5, "footprint_radius": 1.0,
-            "root_strength": 0.0, "shade_radius": 0.0, "shade_cooling": 0.0,
-            "bed_height": 0.0}
+    base = {"mass": 100.0, "friction": 0.5, "buoyancy": 1.0,
+            "volume_m3": 0.1, "drag_coefficient": 1.0,
+            "ground_contact_area": 0.5, "cross_sectional_area": 0.5,
+            "is_static": False,
+            "foundation_height": 0.0, "damage_resistance": 0.5}
     base.update(OBJECT_DEFAULTS.get(ObjectType.register(obj_type), {}))
     return base
 
@@ -149,6 +123,11 @@ class WorldObject:
     mass: float = 100.0
     friction: float = 0.5
     buoyancy: float = 0.5
+    volume_m3: float = 0.1
+    drag_coefficient: float = 1.0
+    ground_contact_area: float = 0.5
+    cross_sectional_area: float = 0.5
+    is_static: bool = False
     damage: float = 0.0
     state: str = ObjectState.INTACT.value
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -170,8 +149,20 @@ class WorldObject:
         values["position"] = vector3(values.get("position", [0, 0, 0]), "position")
         values["rotation"] = vector3(values.get("rotation", [0, 0, 0]), "rotation")
         values["scale"] = vector3(values.get("scale", [1, 1, 1]), "scale", positive=True)
-        for key in ("mass", "friction", "buoyancy", "damage"):
-            values[key] = finite_number(values.get(key, WorldObject.__dataclass_fields__[key].default), key)
+        defaults = default_properties(values["type"])
+        for key in ("mass", "friction", "buoyancy", "damage", "volume_m3",
+                    "drag_coefficient", "ground_contact_area", "cross_sectional_area"):
+            fallback = defaults.get(key, WorldObject.__dataclass_fields__[key].default)
+            values[key] = finite_number(values.get(key, fallback), key)
+        for key in ("mass", "volume_m3", "drag_coefficient", "ground_contact_area",
+                    "cross_sectional_area"):
+            if values[key] <= 0.0:
+                raise ValueError(f"{key} must be greater than zero")
+        if values["friction"] < 0.0:
+            raise ValueError("friction must be non-negative")
+        if not 0.0 <= values["buoyancy"] <= 1.0:
+            raise ValueError("buoyancy must be between 0 and 1")
+        values["is_static"] = bool(values.get("is_static", defaults.get("is_static", False)))
         state = str(values.get("state", ObjectState.INTACT.value))
         if state not in {member.value for member in ObjectState}:
             raise ValueError(f"invalid object state: {state}")
@@ -254,11 +245,9 @@ class TerrainGrid:
 class WaterState:
     level: float = 0.5          # meters above terrain datum
     visible: bool = True
-    flow_enabled: bool = False  # continuous river current, see ShallowWaterFluidSolver
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"level": self.level, "visible": self.visible,
-                "flow_enabled": self.flow_enabled}
+        return {"level": self.level, "visible": self.visible}
 
 
 @dataclass
@@ -286,15 +275,15 @@ class WorldState:
         idx = next(self._counters)
         props = default_properties(obj_type)
         name_prefix = obj_type.capitalize()
-        # everything default_properties() knows that is not already a
-        # first-class field goes to metadata. Derived rather than listed by
-        # hand: the old explicit list silently dropped each newly added
-        # property (bed_height was added and simply never reached any object).
-        promoted = ("mass", "friction", "buoyancy")
         obj = WorldObject(
             id=f"{name_prefix}_{idx:03d}", type=obj_type, position=list(position),
             mass=props["mass"], friction=props["friction"], buoyancy=props["buoyancy"],
-            metadata={k: v for k, v in props.items() if k not in promoted},
+            volume_m3=props["volume_m3"], drag_coefficient=props["drag_coefficient"],
+            ground_contact_area=props["ground_contact_area"],
+            cross_sectional_area=props["cross_sectional_area"],
+            is_static=props["is_static"],
+            metadata={"foundation_height": props["foundation_height"],
+                      "damage_resistance": props["damage_resistance"]},
         )
         self.objects[obj.id] = obj
         return obj
@@ -312,7 +301,7 @@ class WorldState:
     # ------------------------------------------------------------------ (de)serialise
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
             "terrain": {"width": self.terrain.width, "height": self.terrain.height,
                         "cell_size": self.terrain.cell_size,
                         "heights": self.terrain.to_list()},
@@ -329,8 +318,7 @@ class WorldState:
         state.terrain = TerrainGrid.from_dict(data.get("terrain", {}))
         water = data.get("water", {})
         state.water = WaterState(level=finite_number(water.get("level", 0.5), "water.level"),
-                                 visible=bool(water.get("visible", True)),
-                                 flow_enabled=bool(water.get("flow_enabled", False)))
+                                 visible=bool(water.get("visible", True)))
         env = data.get("environment", {})
         state.environment = EnvironmentState(
             gravity=finite_number(env.get("gravity", 9.81), "environment.gravity"),
@@ -339,6 +327,10 @@ class WorldState:
         objects = data.get("objects", [])
         if not isinstance(objects, list):
             raise ValueError("objects must be an array")
+        version = int(data.get("version", 1))
+        if version < 2:
+            objects = [{**o, "buoyancy": 1.0} if isinstance(o, dict) else o
+                       for o in objects]
         parsed = [WorldObject.from_dict(o) for o in objects]
         if len({o.id for o in parsed}) != len(parsed):
             raise ValueError("object IDs must be unique")
