@@ -32,5 +32,13 @@ FLUID_STABILITY_DT = 1.0 / 120.0
 # Shallow-water solver (v0.3): outflow-limited height-field method (Mei/Decaudin/Hu
 # "virtual pipes" style). See docs/04_TZ_v0.3_roadmap.md, milestone v0.3.
 FLUID_FLOW_GAIN = 1.6          # outflow rate per meter of height difference (1/s)
-FLUID_OBSTACLE_RADIUS_M = 1.2  # placeholder footprint until object scale is wired in
+FLUID_OBSTACLE_RADIUS_M = 1.2  # fallback footprint if an object has no footprint_radius
 FLUID_MIN_DEPTH = 1e-4         # below this, a cell is treated as dry
+
+# Rigid body force model (v0.3): gravity + buoyancy + hydrodynamic drag +
+# ground friction. See backend/app/rigid_body.py:ForceRigidBodySystem and
+# docs/04_TZ_v0.3_roadmap.md.
+RIGID_REFERENCE_DEPTH_M = 1.0     # depth at which buoyancy coefficient reaches full effect
+RIGID_WATER_DRAG_SCALE = 1500.0   # N per (drag_coeff * m/s), tuned so a CAR moves at flood depth
+RIGID_FLOAT_CONTACT_THRESHOLD = 0.15  # ground contact fraction below which a body is FLOATING
+RIGID_MOVE_EPS_MPS = 0.02         # speed below which a body counts as "at rest"

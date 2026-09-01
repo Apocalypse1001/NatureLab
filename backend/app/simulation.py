@@ -15,7 +15,7 @@ from .compute_engine import ComputeEngine, create_engine
 from .events import EventLog, EventType
 from .fluid_solver import FluidSolver, ShallowWaterFluidSolver
 from .persistence import load_world, save_world
-from .rigid_body import PlaceholderRigidBodySystem, RigidBodySystem
+from .rigid_body import ForceRigidBodySystem, RigidBodySystem
 from .world_state import WorldState, finite_number, vector3
 
 SendText = Callable[[str], Coroutine[None, None, None]]
@@ -30,7 +30,7 @@ class SimulationManager:
         self.initial: Optional[WorldState] = None
         self.engine: ComputeEngine = create_engine()
         self.fluid: FluidSolver = ShallowWaterFluidSolver()
-        self.rigid: RigidBodySystem = PlaceholderRigidBodySystem()
+        self.rigid: RigidBodySystem = ForceRigidBodySystem()
         self.events = EventLog()
         self.status = self.IDLE
         self.sim_time = 0.0
@@ -198,7 +198,8 @@ class SimulationManager:
         self.engine.step_particles(dt)
         self.fluid.set_boundaries(self.world.terrain, self.rigid.obstacle_snapshot())
         self.fluid.advance(dt, config.FLUID_MAX_SUBSTEPS, config.FLUID_STABILITY_DT)
-        samples = self.fluid.sample_for_bodies(self.rigid.buffer.positions)
+        samples = self.fluid.sample_for_bodies(self.rigid.buffer.positions,
+                                               self.rigid.buffer.footprint_radii)
         self.rigid.step(dt, self.sim_time, samples)
         self.sim_time += dt
         self._steps_in_window += 1

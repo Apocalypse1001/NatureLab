@@ -7,6 +7,7 @@ import math
 import sys
 import unittest
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -14,9 +15,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from app import protocol  # noqa: E402
+from app.events import EventLog  # noqa: E402
 from app.fluid_solver import ShallowWaterFluidSolver  # noqa: E402
+from app.rigid_body import ForceRigidBodySystem  # noqa: E402
 from app.simulation import SimulationManager  # noqa: E402
-from app.world_state import WorldState  # noqa: E402
+from app.world_state import ObjectState, WorldState  # noqa: E402
 
 
 class Foundation02Tests(unittest.IsolatedAsyncioTestCase):
@@ -166,6 +169,106 @@ class ShallowWaterSolverTests(unittest.TestCase):
         solver.set_boundaries(world.terrain, {"positions": position})
         samples = solver.sample_for_bodies(position)
         self.assertGreater(float(samples["depths"][0]), 0.5)
+
+    def test_sampling_ring_clears_bilinear_blend_with_obstacle_edge(self) -> None:
+        """Regression: a ring only 0.5 cells past the obstacle disk edge
+        still bilinear-interpolated with a dry boundary cell (interpolation
+        reaches a full cell beyond the sample point), silently halving the
+        depth reading on flat, fully wet terrain."""
+        world = self._make_world(slope=0.0)
+        world.water.level = 1.2
+        solver = ShallowWaterFluidSolver()
+        solver.initialize(world)
+        position = np.array([[0.0, 0.0, 0.0]])
+        radius = np.array([0.7], dtype=np.float32)
+        solver.set_boundaries(world.terrain, {"positions": position, "radii": radius})
+        samples = solver.sample_for_bodies(position, radius)
+        self.assertAlmostEqual(float(samples["depths"][0]), 1.2, places=2)
+
+    def test_nearby_object_does_not_contaminate_another_objects_reading(self) -> None:
+        """Regression: with a HOUSE (radius 2.4 m) ~3.6 m from a BOX (radius
+        0.7 m) on flat, fully wet terrain, the box's sampled depth dropped
+        from 1.2 m to 0.9 m -- purely from the house's hole being close
+        enough to enter the box's own sampling neighbourhood."""
+        world = self._make_world(slope=0.0)
+        world.water.level = 1.2
+        solver = ShallowWaterFluidSolver()
+        solver.initialize(world)
+        positions = np.array([[-30.0, 0.0, 0.0], [-28.0, 0.0, -3.0]], dtype=np.float32)
+        radii = np.array([2.4, 0.7], dtype=np.float32)
+        solver.set_boundaries(world.terrain, {"positions": positions, "radii": radii})
+        samples = solver.sample_for_bodies(positions, radii)
+        self.assertAlmostEqual(float(samples["depths"][1]), 1.2, places=1)
+
+
+class ForceRigidBodyTests(unittest.TestCase):
+    """v0.3: gravity/buoyancy/drag/friction replacing the buoyancy-threshold
+    placeholder. See docs/04_TZ_v0.3_roadmap.md milestone v0.3 and
+    docs/01_vision.md "Поведение автомобиля" / "Эксперименты"."""
+
+    @staticmethod
+    def _make_system(obj_type: str, **overrides):
+        world = WorldState()
+        obj = world.add_object(obj_type, [0.0, 0.0, 0.0])
+        for key, value in overrides.items():
+            if key in ("mass", "friction", "buoyancy"):
+                setattr(obj, key, value)
+            else:
+                obj.metadata[key] = value
+        rigid = ForceRigidBodySystem()
+        rigid.initialize(world, fluid=None, events=EventLog())
+        return rigid, obj
+
+    @staticmethod
+    def _constant_flow(depth: float, speed: float):
+        return {"depths": np.array([depth], dtype=np.float32),
+                "velocities": np.array([[speed, 0.0, 0.0]], dtype=np.float32)}
+
+    def test_light_box_moves_before_heavy_car_under_same_flow(self) -> None:
+        rigid_box, box = self._make_system("BOX")
+        rigid_car, car = self._make_system("CAR")
+        samples = self._constant_flow(depth=0.5, speed=2.0)
+
+        def steps_to_move(rigid, obj) -> Optional[int]:
+            for step in range(1, 300):
+                rigid.step(1 / 60, step / 60, samples)
+                if obj.state != ObjectState.INTACT.value:
+                    return step
+            return None
+
+        box_step = steps_to_move(rigid_box, box)
+        car_step = steps_to_move(rigid_car, car)
+        self.assertIsNotNone(box_step)
+        self.assertTrue(car_step is None or box_step < car_step)
+
+    def test_house_stays_intact_at_shallow_depth(self) -> None:
+        rigid, house = self._make_system("HOUSE")
+        samples = self._constant_flow(depth=0.3, speed=1.5)
+        for step in range(1, 300):
+            rigid.step(1 / 60, step / 60, samples)
+        self.assertEqual(house.state, ObjectState.INTACT.value)
+
+    def test_deep_enough_water_eventually_floats_any_positive_buoyancy_object(self) -> None:
+        """Regression: buoyant force was capped at buoyancy_coeff * weight, so
+        e.g. a BOX (buoyancy=0.8) could never drop below 20% ground contact
+        and could never reach FLOATING no matter how deep the water got."""
+        rigid, box = self._make_system("BOX")
+        samples = self._constant_flow(depth=3.0, speed=0.0)
+        for step in range(1, 300):
+            rigid.step(1 / 60, step / 60, samples)
+        self.assertEqual(box.state, ObjectState.FLOATING.value)
+
+    def test_foundation_height_changes_flood_outcome(self) -> None:
+        """Experiment A/B from docs/01_vision.md: same water, different
+        foundation height must change the outcome, not be an unused field."""
+        rigid_low, box_low = self._make_system("BOX", foundation_height=0.0)
+        rigid_high, box_high = self._make_system("BOX", foundation_height=2.0)
+        samples = self._constant_flow(depth=1.5, speed=0.0)
+        for step in range(1, 300):
+            rigid_low.step(1 / 60, step / 60, samples)
+            rigid_high.step(1 / 60, step / 60, samples)
+        self.assertNotEqual(box_low.state, box_high.state)
+        self.assertEqual(box_high.state, ObjectState.INTACT.value)
 
 
 if __name__ == "__main__":

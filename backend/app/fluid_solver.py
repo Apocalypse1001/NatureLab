@@ -13,7 +13,7 @@ class FluidSolver:
     def initialize(self, world) -> None: ...
     def set_boundaries(self, terrain, obstacles: dict) -> None: ...
     def advance(self, global_dt: float, max_substeps: int, stability_dt: float) -> int: ...
-    def sample_for_bodies(self, positions: np.ndarray) -> dict: ...
+    def sample_for_bodies(self, positions: np.ndarray, radii: Optional[np.ndarray] = None) -> dict: ...
     def reset(self) -> None: ...
     def get_water_height(self, x: float = 0.0, z: float = 0.0) -> float: ...
     def get_velocity_field(self) -> Optional[np.ndarray]: ...
@@ -48,7 +48,7 @@ class PlaceholderFluidSolver(FluidSolver):
         self.last_substeps = substeps
         return substeps
 
-    def sample_for_bodies(self, positions: np.ndarray) -> dict:
+    def sample_for_bodies(self, positions: np.ndarray, radii: Optional[np.ndarray] = None) -> dict:
         count = len(positions)
         depths = np.zeros(count, dtype=np.float32)
         if self._terrain is not None:
@@ -72,6 +72,20 @@ class PlaceholderFluidSolver(FluidSolver):
 
     def get_velocity_field(self) -> Optional[np.ndarray]:
         return np.array([1.5, 0.0, 0.0], dtype=np.float32)
+
+
+def _footprint_cells(radius: float, cell_size: float) -> float:
+    """Obstacle disk radius in grid cells for a given real-world radius.
+
+    Shared by _rasterize_obstacles (what counts as solid) and
+    sample_for_bodies (how far out a body must sample to clear its own
+    hole) so the two can never drift apart -- a real bug: they used to be
+    computed independently, and a sample ring 0.5 cells past the disk edge
+    still bilinear-blended with a boundary obstacle cell (halving the
+    reading), because interpolation reaches a full cell beyond the sample
+    point.
+    """
+    return max(1.0, float(radius) / cell_size)
 
 
 def _bilinear(grid: np.ndarray, gx: np.ndarray, gz: np.ndarray) -> np.ndarray:
@@ -142,10 +156,13 @@ class ShallowWaterFluidSolver(FluidSolver):
         positions = obstacles.get("positions") if obstacles else None
         if positions is None or len(positions) == 0:
             return mask
+        radii = obstacles.get("radii")
+        if radii is None or len(radii) != len(positions):
+            radii = [config.FLUID_OBSTACLE_RADIUS_M] * len(positions)
         ny, nx = mask.shape
-        r_cells = max(1.0, config.FLUID_OBSTACLE_RADIUS_M / terrain.cell_size)
         yy, xx = np.mgrid[0:ny, 0:nx]
-        for pos in positions:
+        for pos, radius in zip(positions, radii):
+            r_cells = _footprint_cells(radius, terrain.cell_size)
             gx = float(pos[0]) / terrain.cell_size + terrain.width / 2
             gz = float(pos[2]) / terrain.cell_size + terrain.height / 2
             mask |= (xx - gx) ** 2 + (yy - gz) ** 2 <= r_cells ** 2
@@ -206,13 +223,20 @@ class ShallowWaterFluidSolver(FluidSolver):
         self._flow_z = (flow_down - flow_up).astype(np.float32)
 
     # ------------------------------------------------------------------ readback
-    def sample_for_bodies(self, positions: np.ndarray) -> dict:
-        """Sample depth/velocity around each body, not at its exact centre.
+    def sample_for_bodies(self, positions: np.ndarray, radii: Optional[np.ndarray] = None) -> dict:
+        """Ambient depth/velocity around each body, excluding ANY solid cell.
 
         Each registered body carves a dry hole into its own footprint (see
-        set_boundaries), so sampling the centre would always read depth=0
-        and an object could never float. Sample a small ring just outside
-        the body's own obstacle radius and average it instead.
+        set_boundaries), so sampling exactly at its centre would always read
+        depth=0 and an object could never float. A fixed-direction ring just
+        outside a body's own radius does not work either: in a populated
+        scene a *different* nearby object's hole can fall on the ring and
+        get blended in too (a house 3-4 m from a box measurably lowered the
+        box's own reading in testing -- this is not a rare edge case, it is
+        the normal case once a scene has more than one object). Instead,
+        average depth/flow over every non-obstacle cell in a neighbourhood
+        around the body, using the real obstacle mask so any hole -- the
+        body's own or a neighbour's -- is excluded, not guessed around.
         """
         count = len(positions)
         if count == 0 or self._terrain is None:
@@ -220,17 +244,23 @@ class ShallowWaterFluidSolver(FluidSolver):
                     "velocities": np.zeros((0, 3), dtype=np.float32),
                     "forces": np.zeros((0, 3), dtype=np.float32)}
         cell = self._terrain.cell_size
-        gx = positions[:, 0] / cell + self._terrain.width / 2
-        gz = positions[:, 2] / cell + self._terrain.height / 2
-        ring = max(1.0, config.FLUID_OBSTACLE_RADIUS_M / cell) + 0.5
-        depth_samples, vx_samples, vz_samples = [], [], []
-        for dgx, dgz in ((ring, 0.0), (-ring, 0.0), (0.0, ring), (0.0, -ring)):
-            depth_samples.append(_bilinear(self._depth, gx + dgx, gz + dgz))
-            vx_samples.append(_bilinear(self._flow_x, gx + dgx, gz + dgz))
-            vz_samples.append(_bilinear(self._flow_z, gx + dgx, gz + dgz))
-        depths = np.mean(depth_samples, axis=0).astype(np.float32)
-        vx = np.mean(vx_samples, axis=0).astype(np.float32)
-        vz = np.mean(vz_samples, axis=0).astype(np.float32)
+        ny, nx = self._depth.shape
+        if radii is None or len(radii) != count:
+            radii = np.full(count, config.FLUID_OBSTACLE_RADIUS_M, dtype=np.float32)
+        depths = np.zeros(count, dtype=np.float32)
+        vx = np.zeros(count, dtype=np.float32)
+        vz = np.zeros(count, dtype=np.float32)
+        for i in range(count):
+            gx = float(positions[i, 0]) / cell + self._terrain.width / 2
+            gz = float(positions[i, 2]) / cell + self._terrain.height / 2
+            margin = _footprint_cells(radii[i], cell) + 2.0
+            i0, i1 = max(0, int(gx - margin)), min(nx, int(gx + margin) + 1)
+            j0, j1 = max(0, int(gz - margin)), min(ny, int(gz + margin) + 1)
+            open_cells = ~self._obstacle_mask[j0:j1, i0:i1]
+            if open_cells.any():
+                depths[i] = float(self._depth[j0:j1, i0:i1][open_cells].mean())
+                vx[i] = float(self._flow_x[j0:j1, i0:i1][open_cells].mean())
+                vz[i] = float(self._flow_z[j0:j1, i0:i1][open_cells].mean())
         velocities = np.column_stack([vx, np.zeros(count, dtype=np.float32), vz])
         forces = velocities * depths[:, None]
         return {"depths": depths, "velocities": velocities, "forces": forces}

@@ -68,23 +68,35 @@ class ObjectState(str, enum.Enum):
 
 
 # Default physical properties per type. New types plug in here.
+# `drag` is a single scalar proxy for (Cd * cross-sectional area), not a real
+# aerodynamic/hydrodynamic decomposition -- see docs/04_TZ_v0.3_roadmap.md
+# section 3 on the causal- vs engineering-realism bar this project targets.
+# `footprint_radius` is the XZ half-extent used to carve the object out of the
+# fluid grid (see fluid_solver.ShallowWaterFluidSolver) -- matches the actual
+# primitive sizes in frontend/src/world/ObjectFactory.ts so a house blocks
+# more of the flow than a box, not a single fixed radius for every object.
 OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
-    ObjectType.HOUSE: {"mass": 20000.0, "friction": 0.7, "buoyancy": 0.1,
-                       "foundation_height": 0.3, "damage_resistance": 0.8},
-    ObjectType.CAR:   {"mass": 1500.0, "friction": 0.6, "buoyancy": 0.55,
-                       "foundation_height": 0.0, "damage_resistance": 0.3},
-    ObjectType.TREE:  {"mass": 800.0, "friction": 0.8, "buoyancy": 0.6,
-                       "foundation_height": 0.0, "damage_resistance": 0.4},
-    ObjectType.BOX:   {"mass": 50.0, "friction": 0.5, "buoyancy": 0.8,
-                       "foundation_height": 0.0, "damage_resistance": 0.5},
-    ObjectType.DEBRIS: {"mass": 10.0, "friction": 0.4, "buoyancy": 0.9,
-                        "foundation_height": 0.0, "damage_resistance": 0.2},
+    ObjectType.HOUSE: {"mass": 20000.0, "friction": 0.7, "buoyancy": 0.1, "drag": 0.2,
+                       "foundation_height": 0.3, "damage_resistance": 0.8,
+                       "footprint_radius": 2.4},
+    ObjectType.CAR:   {"mass": 1500.0, "friction": 0.6, "buoyancy": 0.55, "drag": 1.5,
+                       "foundation_height": 0.0, "damage_resistance": 0.3,
+                       "footprint_radius": 2.2},
+    ObjectType.TREE:  {"mass": 800.0, "friction": 0.8, "buoyancy": 0.6, "drag": 0.9,
+                       "foundation_height": 0.0, "damage_resistance": 0.4,
+                       "footprint_radius": 1.2},
+    ObjectType.BOX:   {"mass": 50.0, "friction": 0.5, "buoyancy": 0.8, "drag": 0.6,
+                       "foundation_height": 0.0, "damage_resistance": 0.5,
+                       "footprint_radius": 0.7},
+    ObjectType.DEBRIS: {"mass": 10.0, "friction": 0.4, "buoyancy": 0.9, "drag": 0.4,
+                        "foundation_height": 0.0, "damage_resistance": 0.2,
+                        "footprint_radius": 0.7},
 }
 
 
 def default_properties(obj_type: str) -> Dict[str, float]:
-    base = {"mass": 100.0, "friction": 0.5, "buoyancy": 0.5,
-            "foundation_height": 0.0, "damage_resistance": 0.5}
+    base = {"mass": 100.0, "friction": 0.5, "buoyancy": 0.5, "drag": 0.5,
+            "foundation_height": 0.0, "damage_resistance": 0.5, "footprint_radius": 1.0}
     base.update(OBJECT_DEFAULTS.get(ObjectType.register(obj_type), {}))
     return base
 
@@ -238,7 +250,9 @@ class WorldState:
             id=f"{name_prefix}_{idx:03d}", type=obj_type, position=list(position),
             mass=props["mass"], friction=props["friction"], buoyancy=props["buoyancy"],
             metadata={"foundation_height": props["foundation_height"],
-                      "damage_resistance": props["damage_resistance"]},
+                      "damage_resistance": props["damage_resistance"],
+                      "drag": props["drag"],
+                      "footprint_radius": props["footprint_radius"]},
         )
         self.objects[obj.id] = obj
         return obj
