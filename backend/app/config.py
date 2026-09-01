@@ -31,7 +31,27 @@ FLUID_STABILITY_DT = 1.0 / 120.0
 
 # Shallow-water solver (v0.3): outflow-limited height-field method (Mei/Decaudin/Hu
 # "virtual pipes" style). See docs/04_TZ_v0.3_roadmap.md, milestone v0.3.
-FLUID_FLOW_GAIN = 1.6          # outflow rate per meter of height difference (1/s)
+#
+# Recalibrated 2026-09-01 (was 1.6): the original value made the solver
+# correct but effectively invisible in a live demo -- measured directly, a
+# 100-cell-wide grid with River flow on still had its MIDDLE column sitting
+# at its 30-seconds-ago value after a full 30 real seconds of RUNNING (only
+# the few cells nearest each forced edge had moved at all). Matches the
+# user-reported symptom exactly: with flow on, it still just looked like a
+# still pool ("просто бассейн"), not the edge-to-edge current asked for.
+# 10.0 was chosen as the highest value that stayed stable under the worst
+# combination this project actually produces: an obstacle AND a bed-height
+# ROCK AND full Schauberger shade cooling (temperature_factor clamped at
+# TEMP_FACTOR_MAX=2.0, which multiplies this constant directly in _step) all
+# at once, run 90 simulated seconds. Swept in steps of 2: instability first
+# appeared at effective gain (this constant * TEMP_FACTOR_MAX) of 16 -- a
+# checkerboard blow-up next to the obstacle within a couple of seconds, not a
+# slow drift, so there is no "it'll be fine over a longer run" margin to
+# rely on above that line. 10.0 keeps roughly 30% headroom under it while
+# still being a ~6x speedup over the old value. Raising this further without
+# re-running that same three-way stress sweep will eventually reproduce the
+# blow-up.
+FLUID_FLOW_GAIN = 10.0         # outflow rate per meter of height difference (1/s)
 FLUID_OBSTACLE_RADIUS_M = 1.2  # fallback footprint if an object has no footprint_radius
 FLUID_MIN_DEPTH = 1e-4         # below this, a cell is treated as dry
 

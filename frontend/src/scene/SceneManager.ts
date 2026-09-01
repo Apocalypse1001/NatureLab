@@ -162,16 +162,40 @@ export class SceneManager {
    * plane implying it flows straight through. `depths` is indexed exactly
    * like the terrain grid (see rebuildTerrain).
    */
+  // Visual-only vertical exaggeration of the water LAYER'S THICKNESS (depth),
+  // not its absolute surface height. A real, physically-correct river-flow
+  // gradient (backend config.FLUID_RIVER_SOURCE_DEPTH/SINK_DEPTH) is only
+  // ~1-1.5m of relief across a 100m-wide grid -- true to the physics, but at
+  // this camera's default viewing angle that reads as a flat blue plane.
+  // Measured directly: a real west/east depth split of 1.24m vs 0.30m was
+  // completely imperceptible in a screenshot (user-reported: "no dynamics
+  // visible"). This does not touch physics sampling (`sample_for_bodies` etc.)
+  // or the real `depth` field -- only what gets drawn.
+  //
+  // First attempt exaggerated the SURFACE's departure from its own mean
+  // height, clamped so it never drew below the terrain -- that clamp made a
+  // whole contiguous swath of shallow cells exactly coplanar with the
+  // terrain mesh (both pinned to the same value), and coplanar transparent
+  // geometry z-fights: a large, ugly, moving checkerboard, worse than the
+  // original complaint. Multiplying `depth` itself (always >= 0, so the
+  // water surface is always >= terrain and the clamp is never needed) has no
+  // such failure mode, and still exaggerates real gradients/ripples/wakes --
+  // a genuinely flat, unmoving lake has zero depth variance, so it correctly
+  // still looks flat at any multiplier: this is not a way to fake motion
+  // that was never physically there.
+  private static readonly WATER_VISUAL_EXAGGERATION = 4;
+
   updateWaterField(depths: Float32Array): void {
     const geo = this.waterMesh.geometry as THREE.PlaneGeometry;
     const pos = geo.attributes.position;
     const terrainPos = (this.terrainMesh.geometry as THREE.PlaneGeometry).attributes.position;
     const count = Math.min(pos.count, depths.length);
+    const k = SceneManager.WATER_VISUAL_EXAGGERATION;
     let anyWet = false;
     for (let idx = 0; idx < count; idx++) {
       const depth = Math.max(0, depths[idx]);
       if (depth > 0.01) anyWet = true;
-      pos.setZ(idx, terrainPos.getZ(idx) + depth);
+      pos.setZ(idx, terrainPos.getZ(idx) + depth * k);
     }
     pos.needsUpdate = true;
     geo.computeVertexNormals();

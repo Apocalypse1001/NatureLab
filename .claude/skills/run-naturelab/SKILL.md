@@ -61,7 +61,7 @@ node .claude/skills/run-naturelab/driver.mjs --smoke
 ```
 
 ```
-ok SMOKE PASS  sim=RUNNING t = 5.3s objects=1 triangles=60260 depth 0.5m flat -> west 0.629m / east 0.447m
+ok SMOKE PASS  sim=RUNNING t = 5.2s objects=1 triangles=60260 depth 0.5m flat -> west 1.244m / east 0.3m
 ok .../shots/smoke.png bytes=281164 triangles=60260 drawCalls=20
 ```
 
@@ -78,7 +78,7 @@ ok placed ROCK at (0, 0)
 ok river flow on
 ok {"ws":"connected","sim":"RUNNING","clock":"t = 0.2s","objects":1,...}
 ok waited 5000ms
-ok {"cells":10201,"wet":10200,"min":0,"max":1.4,"mean":0.52,"westMean":0.629,"eastMean":0.447,"visible":true}
+ok {"cells":10201,"wet":10200,"min":0,"max":1.4,"mean":0.775,"westMean":1.244,"eastMean":0.3,"visible":true,"renderExaggeration":4}
 ok .../shots/river.png bytes=281645 triangles=60260 drawCalls=20
 ```
 
@@ -107,9 +107,12 @@ printf 'eval __NL.sceneManager.renderer.info.render.triangles\nquit\n' \
 ```
 
 `depth` is the load-bearing one for physics: `SceneManager` never keeps the depth
-array (it folds it straight into vertex Z), so the driver recovers it as
-`waterMeshZ - terrainMeshZ` — the same numbers the backend streamed. `westMean >
-eastMean` is how you confirm a river is actually flowing.
+array (it folds it straight into vertex Z, `terrainZ + depth * WATER_VISUAL_EXAGGERATION`
+— the exaggeration is render-only, added 2026-09-01 so gradients read as a visible
+slope instead of a flat-looking plane), so the driver recovers the **real** depth
+as `(waterMeshZ - terrainMeshZ) / WATER_VISUAL_EXAGGERATION`, matching the numbers
+the backend actually streamed. `westMean > eastMean` is how you confirm a river is
+actually flowing.
 
 ## Direct invocation (physics work)
 
@@ -139,8 +142,8 @@ print('lateral deflection max |flow_z|: %.5f' % abs(s._flow_z).max())
 ```
 
 ```
-depth west/east: 0.717 / 0.534
-lateral deflection max |flow_z|: 0.02888
+depth west/east: 0.851 / 0.455
+lateral deflection max |flow_z|: 0.15177
 ```
 
 Note `set_boundaries` / `set_bed_obstructions` must be called **every step** —
@@ -149,7 +152,7 @@ both are stateless by design and recompute from live positions.
 ## Test
 
 ```bash
-python tests/test_backend.py          # 45 tests, ~11s, needs no server
+python tests/test_backend.py          # 47 tests, ~13s, needs no server
 cd tests && npm test && cd ..         # browser E2E, spawns its own backend on 8756
 ```
 
@@ -200,10 +203,35 @@ the browser for you. Ctrl-C to stop — and **actually stop it** (see Gotchas).
   world with `START` pressed shows a still lake forever. Turn on `flow on` (or
   place an obstacle / edit terrain) or you will conclude the solver is broken.
   This is documented behaviour, not a bug — see `docs/04_TZ_v0.3_roadmap.md` v0.4
-  "Важная находка".
-- **The river gradient is real but nearly invisible on screen.** 0.63 m vs 0.45 m
-  across 100 m reads as a flat blue sheet in a screenshot. Verify flow with
-  `depth` (numbers), not with your eyes.
+  "Важная находка". `flow on` itself is now instant (`_seed_river_profile()`
+  jumps the depth field straight to the steady-state ramp rather than waiting
+  for it to diffuse in from the edges — that used to take real *minutes* for
+  the grid's centre to move at all), so this gotcha is now scoped tightly to
+  "flow off = genuinely static," not "flow looks static for a while too."
+- **Raising terrain above the current water line briefly draped it in a
+  visible "wet slope" before this session's fix.** Not a bug in the physics
+  (the depth field was always correct — a dry cell here, a filling moat
+  there), but at the old `FLUID_FLOW_GAIN` a newly displaced ring of water
+  took tens of seconds to redistribute, so a freshly raised hill looked
+  permanently flooded on its flanks instead of settling into a dry island
+  within a normal viewing window. Fixed together with the flow-gain
+  recalibration below.
+- **Don't push `SceneManager.WATER_VISUAL_EXAGGERATION` up casually.** A first
+  attempt exaggerated the water *surface's* departure from its own mean,
+  clamped to never draw below terrain -- that clamp pinned a whole swath of
+  shallow cells to *exactly* the terrain's height, and coplanar transparent
+  geometry z-fights: a large, ugly, moving checkerboard (screenshot it if you
+  don't believe how bad it looked). The fix was to exaggerate `depth` itself
+  (always >= 0, so the clamp is never needed) rather than surface height. If
+  you see a checkerboard/moiré on the water again, this is almost certainly
+  why — check what changed the Z formula in `updateWaterField`, not the physics.
+- **The river gradient is deliberately over-drawn, 4x.** `SceneManager.
+  WATER_VISUAL_EXAGGERATION` (2026-09-01) multiplies *displayed* depth only —
+  a real 1.24m/0.30m west/east split used to read as a flat blue sheet in a
+  screenshot (user-reported: "no dynamics visible"), so the mesh now draws
+  it at 4x. The `depth` command divides that factor back out (unless the sim
+  is IDLE, where the flat preview plane was never exaggerated to begin with),
+  so its numbers are always the true backend depth — don't re-multiply them.
 - **The Water Level slider does nothing while RUNNING.** The solver reads
   `world.water.level` only in `initialize()`. `flow on/off` *is* live. Not a driver
   bug; a known open item.

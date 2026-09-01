@@ -177,10 +177,22 @@ async function status() {
 
 async function depthStats() {
   // SceneManager does not keep the depth array -- updateWaterField() folds it
-  // straight into vertex Z as (terrainZ + depth). Recover it by subtracting
-  // the terrain mesh again; that is the same number the backend streamed.
+  // straight into vertex Z as (terrainZ + depth * WATER_VISUAL_EXAGGERATION).
+  // The exaggeration (2026-09-01, see SceneManager.ts) is a rendering-only
+  // multiplier so gradients read as visible slopes instead of a flat-looking
+  // plane -- it is NOT applied to physics/sampling, only to what gets drawn.
+  // Divide it back out here so these numbers stay the real backend depth
+  // (comparable across a run regardless of what the constant is tuned to),
+  // not the inflated on-screen one. Only while RUNNING/PAUSED, though: the
+  // IDLE editor preview (SceneManager.setWater) paints every vertex at the
+  // flat slider level directly, with NO exaggeration applied at all -- correct
+  // for that path is EXAG=1, and dividing it by 4 anyway was a real bug caught
+  // here (a smoke run reported "0.125m flat" for a 0.5m slider before this).
   return page.evaluate(() => {
     const sm = globalThis.__NL.sceneManager;
+    const idle = document.querySelector('#sim-status')?.textContent === 'IDLE';
+    const EXAG = idle ? 1 : (sm.constructor.WATER_VISUAL_EXAGGERATION
+      ?? Object.getPrototypeOf(sm).constructor.WATER_VISUAL_EXAGGERATION ?? 1);
     const w = sm.waterMesh.geometry.attributes.position;
     const t = sm.terrainMesh.geometry.attributes.position;
     const n = Math.min(w.count, t.count);
@@ -189,7 +201,7 @@ async function depthStats() {
     let westSum = 0, westN = 0, eastSum = 0, eastN = 0;
     const side = Math.round(Math.sqrt(n));
     for (let i = 0; i < n; i++) {
-      const d = w.getZ(i) - t.getZ(i);
+      const d = (w.getZ(i) - t.getZ(i)) / EXAG;
       if (d < min) min = d;
       if (d > max) max = d;
       sum += d;
@@ -204,6 +216,7 @@ async function depthStats() {
       westMean: r(westSum / Math.max(1, westN)),
       eastMean: r(eastSum / Math.max(1, eastN)),
       visible: sm.waterMesh.visible,
+      renderExaggeration: EXAG,
     };
   });
 }

@@ -171,16 +171,47 @@ class ShallowWaterFluidSolver(FluidSolver):
         self._temperature_factor = np.ones(shape, dtype=np.float32)
         self._bed_offset = np.zeros(shape, dtype=np.float32)
         self._flow_enabled = bool(world.water.flow_enabled)
+        if self._flow_enabled:
+            self._seed_river_profile()
         self._time = 0.0
+
+    def _seed_river_profile(self) -> None:
+        """Jump the depth field straight to (an approximation of) the
+        steady-state west->east profile the boundary clamps would otherwise
+        take a long time to diffuse in from the edges.
+
+        Measured directly: with only the two edge clamps in `_step` and no
+        seeding, the MIDDLE of a 100-cell grid was still sitting at its
+        30-seconds-ago value after a full 30 seconds of real running --
+        exactly the "just a still pool" symptom this was built to fix. The
+        true steady-state curve has a bit of extra curvature right at each
+        forced edge, but is close to linear in between (checked against a
+        long free-running reference), so a straight ramp is a fair one-shot
+        approximation. It is only ever the *starting point*: every following
+        tick still runs the same real flux/erosion physics as always, so any
+        obstacle, rock or terrain edit immediately perturbs it for real --
+        this is not a fake decal, it is fast-forwarding through a transient
+        the numbers show nobody would sit through.
+        """
+        source, sink = config.FLUID_RIVER_SOURCE_DEPTH, config.FLUID_RIVER_SINK_DEPTH
+        nx = self._depth.shape[1]
+        ramp = np.linspace(source, sink, nx, dtype=np.float32)
+        self._depth[:, :] = np.broadcast_to(ramp, self._depth.shape)
+        self._depth[self._obstacle_mask] = 0.0
 
     def set_river_flow(self, enabled: bool) -> None:
         """Toggle the continuous west->east river current, see config.py.
 
         Read live every tick (SimulationManager._step_once), unlike
         water_level which only takes effect at initialize() -- so this can
-        be switched on/off while RUNNING.
+        be switched on/off while RUNNING. On the off->on edge specifically
+        (not every tick it stays on), seeds the steady-state profile --
+        see _seed_river_profile() for why that matters.
         """
-        self._flow_enabled = bool(enabled)
+        enabled = bool(enabled)
+        if enabled and not self._flow_enabled:
+            self._seed_river_profile()
+        self._flow_enabled = enabled
 
     def set_boundaries(self, terrain, obstacles: dict) -> None:
         self._terrain = terrain
