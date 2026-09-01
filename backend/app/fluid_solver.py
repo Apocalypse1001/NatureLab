@@ -13,6 +13,7 @@ class FluidSolver:
     def initialize(self, world) -> None: ...
     def set_boundaries(self, terrain, obstacles: dict) -> None: ...
     def set_environment(self, base_temperature: float, shade: dict) -> None: ...
+    def set_river_flow(self, enabled: bool) -> None: ...
     def advance(self, global_dt: float, max_substeps: int, stability_dt: float) -> int: ...
     def sample_for_bodies(self, positions: np.ndarray, radii: Optional[np.ndarray] = None) -> dict: ...
     def reset(self) -> None: ...
@@ -146,6 +147,7 @@ class ShallowWaterFluidSolver(FluidSolver):
         # effect) wherever nothing casts shade; broadcasts safely against
         # the real grid shape even before set_environment() is ever called.
         self._temperature_factor: np.ndarray = np.ones((1, 1), dtype=np.float32)
+        self._flow_enabled = False
         self._time = 0.0
         self.last_substeps = 0
 
@@ -161,7 +163,17 @@ class ShallowWaterFluidSolver(FluidSolver):
         self._sediment = np.zeros(shape, dtype=np.float32)
         self._obstacle_mask = np.zeros(shape, dtype=bool)
         self._temperature_factor = np.ones(shape, dtype=np.float32)
+        self._flow_enabled = bool(world.water.flow_enabled)
         self._time = 0.0
+
+    def set_river_flow(self, enabled: bool) -> None:
+        """Toggle the continuous west->east river current, see config.py.
+
+        Read live every tick (SimulationManager._step_once), unlike
+        water_level which only takes effect at initialize() -- so this can
+        be switched on/off while RUNNING.
+        """
+        self._flow_enabled = bool(enabled)
 
     def set_boundaries(self, terrain, obstacles: dict) -> None:
         self._terrain = terrain
@@ -279,6 +291,15 @@ class ShallowWaterFluidSolver(FluidSolver):
         new_depth = depth + dt * (inflow - (flow_right + flow_left + flow_down + flow_up))
         new_depth = np.maximum(0.0, new_depth)
         new_depth[self._obstacle_mask] = 0.0
+        if self._flow_enabled:
+            # Upstream reservoir (west edge, i=0) never runs dry; downstream
+            # outlet (east edge, i=-1) never backs up -- see config.py for why
+            # this alone is enough to keep the interior flux scheme moving
+            # continuously instead of settling flat. Obstacles at either edge
+            # stay dry (reapplied after the clamp).
+            new_depth[:, 0] = np.maximum(new_depth[:, 0], config.FLUID_RIVER_SOURCE_DEPTH)
+            new_depth[:, -1] = np.minimum(new_depth[:, -1], config.FLUID_RIVER_SINK_DEPTH)
+            new_depth[self._obstacle_mask] = 0.0
         new_depth[new_depth < config.FLUID_MIN_DEPTH] = 0.0
 
         self._depth = new_depth.astype(np.float32)

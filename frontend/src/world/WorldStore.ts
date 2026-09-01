@@ -15,6 +15,7 @@ export class WorldStore {
   objects = new Map<string, ObjectData>();
   waterLevel = 0.5;
   waterVisible = true;
+  waterFlowEnabled = false;   // continuous river current, see backend WaterState
   selectedId: string | null = null;
 
   private listeners = new Map<StoreEvent, Set<Listener>>();
@@ -36,6 +37,7 @@ export class WorldStore {
     this.objects = new Map(world.objects.map((o) => [o.id, o]));
     this.waterLevel = world.water.level;
     this.waterVisible = world.water.visible;
+    this.waterFlowEnabled = world.water.flow_enabled ?? false;
     this.selectedId = null;
     this.emit('world-replaced');
   }
@@ -73,6 +75,11 @@ export class WorldStore {
 
   setWaterLevel(level: number): void {
     this.waterLevel = level;
+    this.emit('water-changed');
+  }
+
+  setWaterFlow(enabled: boolean): void {
+    this.waterFlowEnabled = enabled;
     this.emit('water-changed');
   }
 }

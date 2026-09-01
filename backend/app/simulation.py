@@ -129,6 +129,12 @@ class SimulationManager:
     def apply_water_level(self, level: float) -> None:
         self.world.water.level = finite_number(level, "water.level")
 
+    def apply_water_flow(self, enabled: bool) -> None:
+        """Continuous river current toggle -- read live each tick in
+        _step_once(), so unlike water_level this takes effect immediately
+        even while RUNNING."""
+        self.world.water.flow_enabled = bool(enabled)
+
     def apply_environment_temperature(self, value: float) -> None:
         """Baseline water temperature (v0.4 RiverLab, Schauberger hypothesis).
 
@@ -212,6 +218,7 @@ class SimulationManager:
         self.engine.step_particles(dt)
         self.fluid.set_boundaries(self.world.terrain, self.rigid.obstacle_snapshot())
         self.fluid.set_environment(self.world.environment.temperature, self.rigid.shade_snapshot())
+        self.fluid.set_river_flow(self.world.water.flow_enabled)
         self.fluid.advance(dt, config.FLUID_MAX_SUBSTEPS, config.FLUID_STABILITY_DT)
         samples = self.fluid.sample_for_bodies(self.rigid.buffer.positions,
                                                self.rigid.buffer.footprint_radii)

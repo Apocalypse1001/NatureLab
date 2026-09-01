@@ -30,7 +30,7 @@ export interface TerrainData {
 export interface WorldData {
   version: number;
   terrain: TerrainData;
-  water: { level: number; visible: boolean };
+  water: { level: number; visible: boolean; flow_enabled?: boolean };
   environment: { gravity: number; wind: number[]; temperature: number };
   objects: ObjectData[];
 }

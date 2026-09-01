@@ -35,6 +35,21 @@ FLUID_FLOW_GAIN = 1.6          # outflow rate per meter of height difference (1/
 FLUID_OBSTACLE_RADIUS_M = 1.2  # fallback footprint if an object has no footprint_radius
 FLUID_MIN_DEPTH = 1e-4         # below this, a cell is treated as dry
 
+# Continuous river current (optional, off by default -- see WaterState.flow_enabled).
+# initialize() fills depth = water_level - terrain, which makes the surface flat
+# from tick 1 (zero gradient, zero flow -- documented in
+# docs/04_TZ_v0.3_roadmap.md v0.4 "Важная находка"). Enabling flow_enabled clamps
+# the west edge column (i=0) to at least FLUID_RIVER_SOURCE_DEPTH and the east edge
+# column (i=-1) to at most FLUID_RIVER_SINK_DEPTH every step, i.e. an upstream
+# reservoir that never runs dry and a downstream outlet that never backs up. That
+# keeps a permanent height difference across the grid, which the existing
+# unconditionally-conservative interior flux scheme then carries as real,
+# continuous west->east flow. Mass is intentionally NOT conserved at those two
+# edge columns while flow_enabled is on (water enters at the source, leaves at the
+# sink) -- everywhere else the same conservative scheme as always applies.
+FLUID_RIVER_SOURCE_DEPTH = 1.4  # depth (m) held at the west edge (i=0) when flowing
+FLUID_RIVER_SINK_DEPTH = 0.15   # depth (m) capped at the east edge (i=-1) when flowing
+
 # Sediment transport / erosion / deposition (v0.4 RiverLab). See
 # fluid_solver.ShallowWaterFluidSolver._step and
 # docs/04_TZ_v0.3_roadmap.md v0.4. Tuned deliberately slow relative to a

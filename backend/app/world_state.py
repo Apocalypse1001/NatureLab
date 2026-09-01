@@ -247,9 +247,11 @@ class TerrainGrid:
 class WaterState:
     level: float = 0.5          # meters above terrain datum
     visible: bool = True
+    flow_enabled: bool = False  # continuous river current, see ShallowWaterFluidSolver
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"level": self.level, "visible": self.visible}
+        return {"level": self.level, "visible": self.visible,
+                "flow_enabled": self.flow_enabled}
 
 
 @dataclass
@@ -321,7 +323,8 @@ class WorldState:
         state.terrain = TerrainGrid.from_dict(data.get("terrain", {}))
         water = data.get("water", {})
         state.water = WaterState(level=finite_number(water.get("level", 0.5), "water.level"),
-                                 visible=bool(water.get("visible", True)))
+                                 visible=bool(water.get("visible", True)),
+                                 flow_enabled=bool(water.get("flow_enabled", False)))
         env = data.get("environment", {})
         state.environment = EnvironmentState(
             gravity=finite_number(env.get("gravity", 9.81), "environment.gravity"),

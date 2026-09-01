@@ -158,6 +158,44 @@ class ShallowWaterSolverTests(unittest.TestCase):
         self.assertFalse(np.allclose(depth_no_obstacle, depth_with_obstacle))
         self.assertFalse(np.allclose(depth_with_obstacle, depth_moved_obstacle))
 
+    def test_flat_water_stays_static_when_flow_disabled(self) -> None:
+        """Documents the reported symptom (docs/04_TZ_v0.3_roadmap.md v0.4
+        'Важная находка'): initialize() fills depth = water_level - terrain,
+        which is flat (zero gradient) from tick 1, so with flow_enabled off
+        (the default) water on flat terrain never moves on its own."""
+        world = self._make_world(slope=0.0)
+        solver = ShallowWaterFluidSolver()
+        solver.initialize(world)
+        depth_before = solver._depth.copy()
+        for _ in range(120):
+            solver.set_boundaries(world.terrain, {})
+            solver.advance(1 / 60, 8, 1 / 120)
+        self.assertTrue(np.allclose(solver._depth, depth_before))
+
+    def test_river_flow_creates_sustained_current_on_flat_terrain(self) -> None:
+        """water.flow_enabled fixes the above: a west-edge source held full
+        and an east-edge sink held near-empty keep a permanent height
+        difference, so the same conservative interior flux scheme now
+        carries a real, continuous west->east current -- not just a
+        one-off transient that resettles."""
+        world = self._make_world(slope=0.0)
+        solver = ShallowWaterFluidSolver()
+        solver.initialize(world)
+        solver.set_river_flow(True)
+        depth_before = solver._depth.copy()
+        for _ in range(120):
+            solver.set_boundaries(world.terrain, {})
+            solver.advance(1 / 60, 8, 1 / 120)
+        self.assertFalse(np.allclose(solver._depth, depth_before))
+        self.assertGreater(float(solver._flow_x.mean()), 0.0)
+
+        depth_mid = solver._depth.copy()
+        for _ in range(120):
+            solver.set_boundaries(world.terrain, {})
+            solver.advance(1 / 60, 8, 1 / 120)
+        self.assertFalse(np.allclose(solver._depth, depth_mid),
+                         "river flow must stay continuous, not settle back to equilibrium")
+
     def test_body_senses_water_around_its_own_footprint(self) -> None:
         """A registered body carves a dry hole at its own position (no phantom
         water inside a solid). sample_for_bodies must not sample exactly that

@@ -14,6 +14,7 @@ export interface UICallbacks {
   removeSelected(): void;
   updateObject(id: string, patch: Partial<ObjectData>): void;
   setWaterLevel(v: number): void;
+  setWaterFlow(enabled: boolean): void;
   setTemperature(v: number): void;
   setTool(tool: 'select' | 'raise' | 'lower'): void;
   setBrush(radius: number, strength: number): void;
@@ -118,12 +119,28 @@ export class UI {
     const slider = el('input', '') as HTMLInputElement;
     slider.type = 'range'; slider.min = '-2'; slider.max = '8'; slider.step = '0.1';
     slider.value = '0.5';
+    slider.id = 'water-level';
     slider.oninput = () => {
       this.root.querySelector<HTMLSpanElement>('#water-out')!.textContent = slider.value;
       this.cb.setWaterLevel(parseFloat(slider.value));
     };
     water.append(slider);
     panel.append(water);
+
+    // Continuous river current (west edge held full, east edge held near-
+    // empty -- see backend config.FLUID_RIVER_SOURCE_DEPTH/SINK_DEPTH).
+    // Off by default: a flat lake with a flat initial fill has zero surface
+    // gradient and never moves on its own, see docs/04_TZ_v0.3_roadmap.md
+    // v0.4 "Важная находка".
+    const flowRow = el('div', 'slider-row');
+    const flowLabel = el('label', '') as HTMLLabelElement;
+    const flowCheckbox = el('input', '') as HTMLInputElement;
+    flowCheckbox.type = 'checkbox';
+    flowCheckbox.id = 'water-flow';
+    flowCheckbox.onchange = () => this.cb.setWaterFlow(flowCheckbox.checked);
+    flowLabel.append(flowCheckbox, document.createTextNode(' River flow'));
+    flowRow.append(flowLabel);
+    panel.append(flowRow);
 
     // v0.4 RiverLab (Schauberger hypothesis): baseline water temperature.
     // Tree shade cools it locally/automatically -- this is only the manual
@@ -200,6 +217,18 @@ export class UI {
     this.warpEl.textContent = engine.warp_available ? 'ready' : 'missing';
     this.cudaEl.textContent = engine.cuda ? 'yes' : 'no (CPU mode)';
     this.gpuEl.textContent = engine.gpu_name;
+  }
+
+  /** Push loaded world state into the water controls (load / reset / initial
+   *  hello), so the panel never claims a level or a flow state the backend
+   *  does not actually have. */
+  syncWaterControls(level: number, flowEnabled: boolean): void {
+    const slider = this.root.querySelector<HTMLInputElement>('#water-level');
+    if (slider) slider.value = String(level);
+    const out = this.root.querySelector<HTMLSpanElement>('#water-out');
+    if (out) out.textContent = String(level);
+    const flow = this.root.querySelector<HTMLInputElement>('#water-flow');
+    if (flow) flow.checked = flowEnabled;
   }
 
   setClock(time: number, status: string): void {

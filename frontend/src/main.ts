@@ -79,6 +79,10 @@ const ui = new UI(uiHost, {
     sceneManager.setWater(v, store.waterVisible);
     net.send({ op: 'water_level', level: v });
   },
+  setWaterFlow: (enabled) => {
+    store.setWaterFlow(enabled);
+    net.send({ op: 'water_flow', enabled });
+  },
   setTemperature: (v) => net.send({ op: 'environment_temperature', temperature: v }),
   setTool: (tool) => editor.setTool(tool),
   setBrush: (radius, strength) => {
@@ -96,6 +100,7 @@ function applyWorld(world: WorldData, simStatus: string): void {
   store.replaceWorld(world);
   sceneManager.rebuildTerrain(store.terrain);
   sceneManager.setWater(store.waterLevel, store.waterVisible);
+  ui.syncWaterControls(store.waterLevel, store.waterFlowEnabled);
   sceneManager.clearObjects();
   for (const obj of world.objects) sceneManager.setObject(obj);
   ui.refreshObjectList([...store.objects.values()], null);
