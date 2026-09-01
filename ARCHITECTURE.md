@@ -1,4 +1,4 @@
-# NatureLab 0.9.0 - Architecture
+# NatureLab 0.10.0 - Architecture
 
 Проектная документация, которая объясняет *почему* архитектура такая, живёт в `docs/`:
 [`01_vision.md`](docs/01_vision.md) (цели и критерий качества),
@@ -99,6 +99,22 @@ Whether a body is a wall or a riverbed is decided from data, not from a type nam
 everything in `SOLID_OBSTACLE_TYPES` as wall. `SimulationManager._affects_fluid_boundary()`
 uses the same rule to decide when adding, moving, scaling or deleting an object must
 bump `obstacle_revision`.
+
+## Water rendering (v0.10.0)
+
+The renderer derives everything from streamed physics, never from invented motion:
+
+```text
+WATER_HEIGHT    absolute surface elevation -> vertex Z, and depth per vertex (aDepth)
+VELOCITY_FIELD  real u/v                   -> flow map per vertex (aFlow), throttled
+```
+
+From those two attributes the shader gets ripple direction and speed, foam (fast AND
+shallow), and depth-based colour; the CPU picks spray emitters from the same fields.
+No painted flow map, no FFT ocean, no `THREE.Water` -- all of those assume a flat plane
+with fabricated motion, which is the decorative water this project rules out.
+
+The deliberate consequence: wrong physics looks wrong. That is a feature.
 
 ## What is solid to the flow
 

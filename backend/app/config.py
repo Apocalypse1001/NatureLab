@@ -9,7 +9,7 @@ from pathlib import Path
 # running build always says which version it is -- the donor 0.5.0 tree carried
 # no version string anywhere, which made "which build am I looking at?"
 # answerable only by file timestamps.
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_DIR = BACKEND_DIR.parent
@@ -47,6 +47,14 @@ ENABLE_DEBUG_PARTICLES = False
 # kernel over this many particles per substep plus 12 bytes each per stream
 # frame (~430 KB/s at 30 Hz), not a per-particle CPU update.
 FLOW_TRACER_COUNT = 36_000
+
+# --------------------------------------------------- Water rendering (v0.10.0)
+# How often the real velocity field is streamed, in broadcast frames. The
+# frontend uses it as a physics-derived flow map (ripple direction, foam,
+# spray); that is a low-frequency visual signal, so every third frame at 30 Hz
+# is ample and keeps the largest remaining payload off the wire two frames in
+# three. Set to 1 to stream every frame.
+VELOCITY_STREAM_EVERY = 3
 FLUID_MAX_SUBSTEPS = 8
 FLUID_STABILITY_DT = 1.0 / 120.0
 FLUID_CFL = 0.45

@@ -1178,5 +1178,96 @@ class BridgeAndPeopleTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(person.mass, 70.0, places=1)
 
 
+class VelocityStreamTests(unittest.IsolatedAsyncioTestCase):
+    """v0.10.0: the real velocity field reaches the renderer.
+
+    FrameKind.VELOCITY_FIELD existed in the protocol from the very first version
+    and was never filled. The water shader now builds its flow map from it, so
+    if this stream is wrong the water animates in a direction the water is not
+    going -- which is exactly the decorative behaviour docs/01_vision.md rules
+    out, and is why it is tested rather than assumed.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+        self.manager.attach(self._text, self._binary)
+        self.text_frames: list[str] = []
+        self.binary_frames: list[bytes] = []
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    async def _text(self, value: str) -> None:
+        self.text_frames.append(value)
+
+    async def _binary(self, value: bytes) -> None:
+        self.binary_frames.append(value)
+
+    def _velocity_frames(self) -> list:
+        found = []
+        for payload in self.binary_frames:
+            kind, count, _, values = protocol.decode_frame(payload)
+            if kind == protocol.FrameKind.VELOCITY_FIELD:
+                found.append((count, values))
+        return found
+
+    async def test_the_velocity_field_is_streamed_and_matches_the_solver(self) -> None:
+        self.manager.apply_water_level(1.5)
+        self.manager.start()
+        for _ in range(600):
+            self.manager._step_once()
+        for _ in range(config.VELOCITY_STREAM_EVERY):
+            await self.manager._stream()
+        frames = self._velocity_frames()
+        self.assertTrue(frames, "the velocity field was never streamed")
+        count, values = frames[-1]
+        self.assertEqual(count, N * N)
+        # the frame carries (u, 0, v) per cell, in terrain-vertex order
+        streamed = values.reshape(N * N, 3)
+        u = np.asarray(self.manager.fluid._u.numpy(), dtype=np.float32)
+        v = np.asarray(self.manager.fluid._v.numpy(), dtype=np.float32)
+        np.testing.assert_allclose(streamed[:, 0], u, atol=1e-6)
+        np.testing.assert_allclose(streamed[:, 2], v, atol=1e-6)
+        np.testing.assert_allclose(streamed[:, 1], 0.0, atol=1e-6)
+        self.assertGreater(float(np.abs(streamed[:, 0]).max()), 0.1,
+                           "a still field proves nothing about direction")
+
+    async def test_the_streamed_direction_matches_where_the_water_goes(self) -> None:
+        """Sign check, not just magnitude: water fed from the west edge must
+        stream a positive u. A flow map with the sign flipped would animate the
+        river backwards and every magnitude assertion would still pass."""
+        self.manager.apply_water_level(1.5)
+        self.manager.start()
+        for _ in range(900):
+            self.manager._step_once()
+        for _ in range(config.VELOCITY_STREAM_EVERY):
+            await self.manager._stream()
+        count, values = self._velocity_frames()[-1]
+        streamed = values.reshape(N, N, 3)
+        depth = np.asarray(self.manager.fluid._h.numpy(), dtype=np.float32).reshape(N, N)
+        wet = depth > 0.05
+        self.assertTrue(wet.any())
+        self.assertGreater(float(streamed[:, :, 0][wet].mean()), 0.05,
+                           "the streamed current points upstream")
+
+    async def test_the_velocity_stream_is_throttled(self) -> None:
+        """It is the largest payload on the wire after the tracers, and a flow
+        map is a low-frequency visual signal -- so it is deliberately not sent
+        every frame."""
+        self.manager.apply_water_level(1.0)
+        self.manager.start()
+        for _ in range(60):
+            self.manager._step_once()
+        for _ in range(config.VELOCITY_STREAM_EVERY * 4):
+            await self.manager._stream()
+        heights = sum(1 for payload in self.binary_frames
+                      if protocol.decode_frame(payload)[0] == protocol.FrameKind.WATER_HEIGHT)
+        velocities = len(self._velocity_frames())
+        self.assertGreater(heights, velocities,
+                           "the velocity field is not throttled below the height frames")
+        self.assertGreaterEqual(velocities, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

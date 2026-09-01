@@ -60,6 +60,7 @@ class SimulationManager:
         self._obstacle_snapshot: Optional[dict] = None
         self._last_terrain_resync = 0.0
         self._flooded_decks: set = set()
+        self._velocity_frame = 0
         self._gauges: Dict[str, GaugeRuntime] = {}
         self.selftest_result: Dict[str, Any] = {}
         try:
@@ -462,6 +463,20 @@ class SimulationManager:
                     await self._send_bytes(protocol.encode_water_height(heights, self.sim_time))
                 except Exception:
                     return
+            # v0.10.0: the real velocity field, so the renderer can build its
+            # flow map from physics instead of inventing one. Throttled to
+            # config.VELOCITY_STREAM_EVERY frames: a flow map is a low-frequency
+            # visual signal and does not need every tick, while the field is the
+            # largest payload on the wire after the tracers.
+            self._velocity_frame += 1
+            if self._velocity_frame % config.VELOCITY_STREAM_EVERY == 0:
+                velocities = self.fluid.get_velocity_field()
+                if velocities is not None and len(velocities):
+                    try:
+                        await self._send_bytes(
+                            protocol.encode_velocity_field(velocities, self.sim_time))
+                    except Exception:
+                        return
             # RiverLab (v0.6.0): erosion mutates the bed on the GPU every tick,
             # so without this the new channel would be physically real on the
             # backend and invisible on screen -- the exact class of bug this

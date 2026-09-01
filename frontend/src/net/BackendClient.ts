@@ -118,11 +118,13 @@ export class BackendClient {
     if (kind === 0) this.particleHandler?.(floats, count);
     if (kind === 1) this.waterHeightHandler?.(floats, count,
       Number(view.getBigUint64(8, true)) / 1000);
+    if (kind === 2) this.velocityFieldHandler?.(floats, count);
   }
 
   particleHandler: ((positions: Float32Array, count: number) => void) | null = null;
   waterHeightHandler: ((heights: Float32Array, count: number,
                          simTime: number) => void) | null = null;
+  velocityFieldHandler: ((velocities: Float32Array, count: number) => void) | null = null;
 
   send(op: Record<string, unknown>): boolean {
     if (this.ws?.readyState === WebSocket.OPEN) {

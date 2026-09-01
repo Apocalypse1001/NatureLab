@@ -22,6 +22,16 @@ export class SceneManager {
   private waterBaseIndices: Uint16Array | Uint32Array;
   private waterDynamicIndices: Uint16Array | Uint32Array;
   private gridHelper: THREE.GridHelper;
+  private waterFlow = new Float32Array(0);
+  private waterDepth = new Float32Array(0);
+  private sprayPoints: THREE.Points | null = null;
+  private sprayPositions = new Float32Array(0);
+  private sprayPhase = 0;
+  private static readonly MAX_SPRAY = 4000;
+  // (1.4 m/s)^2 -- below this the surface stays unbroken
+  private static readonly SPRAY_SPEED_SQ = 1.96;
+  private waterTime = { value: 0 };
+  private _clockStart = performance.now();
   private tracersVisible = true;
   private tracerDisplayLimit = 36000;   // matches config.FLOW_TRACER_COUNT
   private receivedTracerCount = 0;
@@ -74,12 +84,8 @@ export class SceneManager {
     this.waterDynamicIndices = sourceIndices instanceof Uint32Array
       ? new Uint32Array(sourceIndices.length) : new Uint16Array(sourceIndices.length);
     waterGeometry.setIndex(new THREE.BufferAttribute(this.waterDynamicIndices, 1));
-    this.waterMesh = new THREE.Mesh(
-      waterGeometry,
-      new THREE.MeshStandardMaterial({
-        color: 0x2f7fd0, transparent: true, opacity: 0.45,
-        roughness: 0.2, metalness: 0.1, depthWrite: false, side: THREE.DoubleSide,
-      }));
+    this.attachWaterAttributes(waterGeometry);
+    this.waterMesh = new THREE.Mesh(waterGeometry, this.buildWaterMaterial());
     this.waterMesh.rotation.x = -Math.PI / 2;
     this.waterMesh.frustumCulled = false;
     this.scene.add(this.waterMesh);
@@ -140,6 +146,95 @@ export class SceneManager {
     geo.computeVertexNormals();
   }
 
+  /**
+   * Water material driven by the REAL velocity field, not a painted flow map.
+   *
+   * Every off-the-shelf option considered -- THREE.Water, FFT oceans, painted
+   * flow-map textures -- assumes a flat plane with invented motion. This project
+   * has the opposite situation: a deforming height-field mesh carrying a real
+   * `u/v` field from the Warp solver. So the flow map is streamed from physics
+   * (FrameKind.VELOCITY_FIELD, which existed in the protocol from the start and
+   * had never been sent) and everything visual is derived from it:
+   *
+   * - ripples travel ALONG the direction the water actually moves, at a rate set
+   *   by how fast it actually moves, so still water is visibly still;
+   * - foam appears where the flow is genuinely fast or genuinely shallow-and-
+   *   fast, which is where white water forms -- around piers, over rocks, along
+   *   a wave front -- rather than wherever a texture happened to be painted;
+   * - colour deepens with real depth, so a shallow margin reads as shallow.
+   *
+   * The consequence worth stating: if the physics is wrong, this looks wrong.
+   * That is the point. A prettier shader that hid the physics would be the
+   * decorative water docs/01_vision.md explicitly rules out.
+   */
+  private buildWaterMaterial(): THREE.MeshStandardMaterial {
+    const material = new THREE.MeshStandardMaterial({
+      color: 0x2f7fd0, transparent: true, opacity: 0.45,
+      roughness: 0.2, metalness: 0.1, depthWrite: false, side: THREE.DoubleSide,
+    });
+    material.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = this.waterTime;
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', `
+          #include <common>
+          attribute vec2 aFlow;
+          attribute float aDepth;
+          varying vec2 vFlow;
+          varying float vDepth;
+          varying float vSpeed;
+        `)
+        .replace('#include <begin_vertex>', `
+          #include <begin_vertex>
+          vFlow = aFlow;
+          vDepth = aDepth;
+          vSpeed = length(aFlow);
+        `);
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', `
+          #include <common>
+          uniform float uTime;
+          varying vec2 vFlow;
+          varying float vDepth;
+          varying float vSpeed;
+
+          // cheap value noise, enough for surface texture at this scale
+          float hash(vec2 p) {
+            return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+          }
+          float noise(vec2 p) {
+            vec2 i = floor(p);
+            vec2 f = fract(p);
+            f = f * f * (3.0 - 2.0 * f);
+            return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
+                       mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+          }
+        `)
+        .replace('#include <dithering_fragment>', `
+          #include <dithering_fragment>
+          // Ripples advected along the real current: the sample point is pushed
+          // backwards along the flow, so the pattern travels downstream at the
+          // water's own speed. Still water gets a still surface, for free.
+          vec2 world = vec2(vViewPosition.x, vViewPosition.z);
+          vec2 drift = vFlow * uTime * 0.6;
+          float ripple = noise(gl_FragCoord.xy * 0.05 - drift * 4.0)
+                       + 0.5 * noise(gl_FragCoord.xy * 0.11 + drift * 2.0);
+          // Foam where the water is genuinely fast, and more of it where fast
+          // water is also shallow -- that is where white water actually breaks.
+          float shallow = 1.0 - smoothstep(0.05, 0.6, vDepth);
+          float foam = smoothstep(0.55, 1.9, vSpeed) * (0.45 + 0.55 * shallow);
+          foam *= smoothstep(0.55, 1.15, ripple);
+          gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.92, 0.96, 1.0), foam * 0.85);
+          // depth colour: shallow margins read lighter and greener than the
+          // channel, which is what makes a river's shape legible from above
+          float deep = smoothstep(0.0, 1.6, vDepth);
+          gl_FragColor.rgb *= mix(1.28, 0.82, deep);
+          gl_FragColor.rgb += vec3(0.0, 0.05, 0.02) * (1.0 - deep);
+          gl_FragColor.a = clamp(gl_FragColor.a + foam * 0.5 + 0.12 * (1.0 - deep), 0.0, 1.0);
+        `);
+    };
+    return material;
+  }
+
   /** Rebuild every piece of geometry whose resolution follows the grid. */
   private rebuildGridGeometry(): void {
     const { sizeM, width, height } = this.terrain;
@@ -159,6 +254,7 @@ export class SceneManager {
       ? new Uint32Array(sourceIndices.length) : new Uint16Array(sourceIndices.length);
     waterGeometry.setIndex(new THREE.BufferAttribute(this.waterDynamicIndices, 1));
     waterGeometry.setDrawRange(0, 0);
+    this.attachWaterAttributes(waterGeometry);
     this.waterMesh.geometry.dispose();
     this.waterMesh.geometry = waterGeometry;
 
@@ -178,6 +274,81 @@ export class SceneManager {
     this.controls.update();
   }
 
+  private attachWaterAttributes(geometry: THREE.BufferGeometry): void {
+    const count = geometry.attributes.position.count;
+    this.waterFlow = new Float32Array(count * 2);
+    this.waterDepth = new Float32Array(count);
+    geometry.setAttribute('aFlow', new THREE.BufferAttribute(this.waterFlow, 2));
+    geometry.setAttribute('aDepth', new THREE.BufferAttribute(this.waterDepth, 1));
+  }
+
+  /**
+   * Apply a streamed VELOCITY_FIELD frame. Values are the solver's real u/v in
+   * m/s, in terrain-vertex order -- the same ordering as the height frame.
+   */
+  setVelocityField(values: Float32Array, count: number): boolean {
+    const attribute = this.waterMesh.geometry.attributes.aFlow as THREE.BufferAttribute;
+    if (!attribute || count !== attribute.count) return false;
+    for (let i = 0; i < count; i++) {
+      // the field arrives as vec3 (u, 0, v); the shader only needs the plane
+      this.waterFlow[i * 2] = values[i * 3];
+      this.waterFlow[i * 2 + 1] = values[i * 3 + 2];
+    }
+    attribute.needsUpdate = true;
+    this.updateSpray(values, count);
+    return true;
+  }
+
+  /**
+   * Spray at the genuinely violent places, picked from the real fields.
+   *
+   * A cell qualifies when it is fast AND shallow -- that is where water breaks
+   * white in reality: over a submerged boulder, between bridge piers, along an
+   * advancing front. Nothing is emitted for a broad slow flood however large it
+   * is, which is correct and is the difference between this and a particle
+   * effect sprinkled over the whole surface.
+   */
+  private updateSpray(velocities: Float32Array, count: number): void {
+    if (!this.sprayPoints) {
+      this.sprayPositions = new Float32Array(SceneManager.MAX_SPRAY * 3);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position',
+        new THREE.BufferAttribute(this.sprayPositions, 3));
+      geometry.setDrawRange(0, 0);
+      this.sprayPoints = new THREE.Points(geometry, new THREE.PointsMaterial({
+        color: 0xffffff, size: 0.45, sizeAttenuation: true,
+        transparent: true, opacity: 0.75, depthWrite: false,
+      }));
+      this.sprayPoints.frustumCulled = false;
+      this.scene.add(this.sprayPoints);
+    }
+    const heightAttribute = this.waterMesh.geometry.attributes.position as THREE.BufferAttribute;
+    const grid = this.terrain.width + 1;
+    const half = this.terrain.sizeM / 2;
+    const cell = this.terrain.cellSize;
+    let emitted = 0;
+    // stride keeps the scan cheap and the sampling even; the phase walks so the
+    // spray shimmers instead of sitting on the same vertices every frame
+    const stride = 7;
+    const phase = (this.sprayPhase = (this.sprayPhase + 1) % stride);
+    for (let i = phase; i < count && emitted < SceneManager.MAX_SPRAY; i += stride) {
+      const depth = this.waterDepth[i];
+      if (depth <= 0.02 || depth > 0.9) continue;
+      const u = velocities[i * 3];
+      const v = velocities[i * 3 + 2];
+      if (u * u + v * v < SceneManager.SPRAY_SPEED_SQ) continue;
+      const gx = i % grid;
+      const gz = (i / grid) | 0;
+      this.sprayPositions[emitted * 3] = gx * cell - half + (Math.random() - 0.5) * cell;
+      this.sprayPositions[emitted * 3 + 1] = heightAttribute.getZ(i) + 0.05 + Math.random() * 0.3;
+      this.sprayPositions[emitted * 3 + 2] = gz * cell - half + (Math.random() - 0.5) * cell;
+      emitted++;
+    }
+    (this.sprayPoints.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+    this.sprayPoints.geometry.setDrawRange(0, emitted);
+    this.sprayPoints.visible = this.tracersVisible && emitted > 0;
+  }
+
   setWater(level: number, visible: boolean): void {
     this.waterMesh.position.y = 0;
     this.waterMesh.visible = visible;
@@ -194,9 +365,13 @@ export class SceneManager {
     const wet = new Uint8Array(count);
     for (let i = 0; i < count; i++) {
       pos.setZ(i, heights[i]);
-      wet[i] = heights[i] > this.terrain.heights[i] + 1e-4 ? 1 : 0;
+      const depth = heights[i] - this.terrain.heights[i];
+      this.waterDepth[i] = depth > 0 ? depth : 0;
+      wet[i] = depth > 1e-4 ? 1 : 0;
     }
     pos.needsUpdate = true;
+    const depthAttribute = this.waterMesh.geometry.attributes.aDepth as THREE.BufferAttribute;
+    if (depthAttribute) depthAttribute.needsUpdate = true;
     let used = 0;
     for (let i = 0; i < this.waterBaseIndices.length; i += 3) {
       const a = this.waterBaseIndices[i], b = this.waterBaseIndices[i + 1];
@@ -314,6 +489,8 @@ export class SceneManager {
   }
 
   render(): void {
+    // drives the advected ripple pattern in the water shader
+    this.waterTime.value = (performance.now() - this._clockStart) / 1000;
     this.controls.update();
     if (this._selectionHelper) this._selectionHelper.update();
     this.renderer.render(this.scene, this.camera);

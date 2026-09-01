@@ -48,6 +48,19 @@ def encode_water_height(heights: np.ndarray, sim_time: float) -> bytes:
     return encode_float_frame(FrameKind.WATER_HEIGHT, heights, sim_time)
 
 
+def encode_velocity_field(velocities: np.ndarray, sim_time: float) -> bytes:
+    """Encode the real per-cell velocity field, terrain-vertex row-major.
+
+    Never sent before v0.10.0 -- FrameKind.VELOCITY_FIELD existed in this enum
+    from the start and nothing filled it. The frontend uses it as a flow map
+    DERIVED FROM THE PHYSICS: ripples travel along the direction water actually
+    moves and foam appears where it is actually fast. Off-the-shelf water
+    (THREE.Water, FFT oceans, painted flow maps) all assume a flat plane with
+    invented motion, which is precisely what this project's own rules forbid.
+    """
+    return encode_float_frame(FrameKind.VELOCITY_FIELD, velocities, sim_time)
+
+
 def decode_frame(payload: bytes) -> tuple[FrameKind, int, float, np.ndarray]:
     if len(payload) < HEADER.size:
         raise ValueError("truncated frame header")

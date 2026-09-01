@@ -61,6 +61,12 @@ const net = new BackendClient(wsUrl, {
 });
 
 net.particleHandler = (positions, count) => sceneManager.setParticles(positions, count);
+// v0.10.0: the real velocity field, used as a physics-derived flow map -- see
+// SceneManager.buildWaterMaterial for why an off-the-shelf water shader was the
+// wrong shape for this project.
+net.velocityFieldHandler = (velocities, count) => {
+  sceneManager.setVelocityField(velocities, count);
+};
 net.waterHeightHandler = (heights, count, simTime) => {
   if (sceneManager.setWaterHeights(heights, count)) {
     store.waterFrameCount = count;
