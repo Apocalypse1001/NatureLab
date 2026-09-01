@@ -667,5 +667,218 @@ class RiverbedRockTests(unittest.TestCase):
         self.assertGreater(disruption_big, disruption_small)
 
 
+class RiverbedRockDeflectionTests(unittest.TestCase):
+    """v0.4 RiverLab, the roadmap's "камни на дне реки меняют русло" item.
+
+    Its explicit note is that a rock is part of the terrain/riverbed, not a
+    rigid body with mass and buoyancy -- so ROCK is kept out of the binary
+    obstacle mask (an infinitely tall wall) and instead raises the effective
+    bed by a dome of `bed_height` (see ShallowWaterFluidSolver
+    .set_bed_obstructions). These tests check the three things the roadmap
+    actually asks for and that the earlier rock work did not cover: real
+    lateral deflection, an effect that scales with the rock's size *and
+    position*, and meandering (deposition on one side, scour on the other)
+    emerging from the existing sediment mechanic rather than being scripted.
+    """
+
+    @staticmethod
+    def _river(slope: float = 2.0, depth: float = 0.6,
+               bank: float = 0.0) -> tuple[WorldState, ShallowWaterFluidSolver]:
+        """A flowing channel: bed falls west->east, optional raised z-banks.
+
+        Uses water.flow_enabled, otherwise the surface is flat from tick 1
+        and nothing moves at all -- see the v0.4 "Важная находка" note and
+        test_flat_water_stays_static_when_flow_disabled.
+        """
+        world = WorldState()
+        w, h = world.terrain.width, world.terrain.height
+        xs = np.linspace(slope, 0.0, w + 1, dtype=np.float32)
+        bed = np.tile(xs, (h + 1, 1))
+        zs = np.linspace(-1.0, 1.0, h + 1, dtype=np.float32)
+        world.terrain.heights[:, :] = bed + bank * (zs ** 2)[:, None]
+        world.water.flow_enabled = True
+        solver = ShallowWaterFluidSolver()
+        solver.initialize(world)
+        # water surface parallels the downstream slope, so raised banks are
+        # genuinely shallow/dry rather than uniformly deep
+        solver._depth[:, :] = np.maximum(0.0, (bed + depth) - world.terrain.heights)
+        return world, solver
+
+    @staticmethod
+    def _advance(world, solver, bed: dict, steps: int, walls: Optional[dict] = None) -> None:
+        for _ in range(steps):
+            solver.set_boundaries(world.terrain, walls or {})
+            solver.set_bed_obstructions(bed)
+            solver.advance(1 / 60, 8, 1 / 120)
+
+    @staticmethod
+    def _rock(x: float = 0.0, z: float = 0.0, radius: float = 3.0,
+              height: float = 0.8) -> dict:
+        return {"positions": [[x, 0.0, z]], "radii": [radius], "heights": [height]}
+
+    def test_deep_water_flows_over_a_rock_but_never_over_a_wall(self) -> None:
+        """The whole point of bed_height: the same footprint a HOUSE would
+        carve as a dry, infinitely tall hole must, for a boulder, end up
+        submerged and still carrying water once the river is deeper than the
+        rock is tall."""
+        over_rock = 0.0
+        for depth in (0.4, 2.5):
+            world, solver = self._river(depth=depth)
+            self._advance(world, solver, self._rock(), steps=300)
+            over_rock = float(solver._depth[48:53, 48:53].mean())
+
+            wall_world, wall_solver = self._river(depth=depth)
+            self._advance(wall_world, wall_solver, {}, steps=300,
+                          walls={"positions": [[0.0, 0.0, 0.0]], "radii": [3.0]})
+            over_wall = float(wall_solver._depth[48:53, 48:53].mean())
+
+            self.assertEqual(over_wall, 0.0, f"a wall must stay dry at depth {depth}")
+            self.assertGreater(over_rock, 0.0,
+                               f"a riverbed rock must not be a dry wall at depth {depth}")
+        # the deep case must be properly submerged, not merely damp
+        self.assertGreater(over_rock, 0.8)
+
+    def test_rock_deflects_the_current_sideways(self) -> None:
+        """Straight channel, so any lateral (z) flow at all is deflection
+        caused by the rock and nothing else."""
+        world, solver = self._river()
+        self._advance(world, solver, {}, steps=300)
+        self.assertEqual(float(np.abs(solver._flow_z).max()), 0.0)
+
+        world, solver = self._river()
+        self._advance(world, solver, self._rock(), steps=300)
+        self.assertGreater(float(np.abs(solver._flow_z).max()), 0.0)
+
+    def test_mid_channel_rock_disturbs_flow_more_than_the_same_rock_at_the_bank(self) -> None:
+        """The roadmap asks for the effect to scale with position, not only
+        size: an identical rock out on the shallow bank must matter far less
+        than one in the deep middle. Nothing encodes that rule -- it falls
+        out of a rock displacing water only where there is water."""
+        def flow_field(bed: dict) -> tuple[np.ndarray, np.ndarray]:
+            world, solver = self._river(bank=1.5)
+            self._advance(world, solver, bed, steps=600)
+            return solver._flow_x.copy(), solver._flow_z.copy()
+
+        base_x, base_z = flow_field({})
+        mid_x, mid_z = flow_field(self._rock(z=0.0))
+        bank_x, bank_z = flow_field(self._rock(z=30.0))
+
+        mid = float(np.abs(mid_x - base_x).sum() + np.abs(mid_z - base_z).sum())
+        bank = float(np.abs(bank_x - base_x).sum() + np.abs(bank_z - base_z).sum())
+        self.assertGreater(mid, bank * 1.5,
+                           "a mid-channel rock must dominate a bank rock, not merely beat it")
+
+    def test_taller_rock_deflects_more_than_a_flatter_one_of_equal_footprint(self) -> None:
+        """bed_height is a real degree of freedom, not decoration: same disk,
+        different protrusion, different amount of deflected flow."""
+        def deflection(height: float) -> float:
+            world, solver = self._river()
+            self._advance(world, solver, self._rock(height=height), steps=300)
+            return float(np.abs(solver._flow_z).sum())
+
+        self.assertGreater(deflection(0.8), deflection(0.2))
+
+    def test_rock_scours_its_flanks_and_fills_its_lee(self) -> None:
+        """The actual meandering claim, as a River A vs River B comparison
+        (the methodology docs/01_vision.md requires): identical channels,
+        only the rock differs. Downstream of the rock the flow stalls and
+        drops its load (bed rises), while squeezing past the flanks speeds it
+        up and scours (bed falls). That asymmetry is what bends a straight
+        channel.
+
+        Needs a long enough run: the lee first scours while the flow
+        reorganises around the new obstruction and only then starts filling,
+        so the sign settles at roughly 25s of sim time (measured) -- erosion
+        is deliberately slow, see the config module docstring.
+        """
+        def bed_change(bed: dict) -> np.ndarray:
+            world, solver = self._river()
+            before = world.terrain.heights.copy()
+            self._advance(world, solver, bed, steps=1800)
+            return world.terrain.heights - before
+
+        delta = bed_change(self._rock()) - bed_change({})
+        lee = float(delta[49:52, 54:61].mean())
+        flanks = float(np.r_[delta[44:47, 48:54].ravel(),
+                             delta[54:57, 48:54].ravel()].mean())
+        self.assertGreater(lee, 0.0, "sediment must be deposited in the rock's lee")
+        self.assertLess(flanks, 0.0, "the flow squeezing past the flanks must scour them")
+
+    def test_rock_is_never_eroded_away_by_the_river_it_deflects(self) -> None:
+        """A boulder is bedrock. Unshielded, the river would just dig a
+        symmetric pit under the rock and drown the flank/lee asymmetry the
+        test above depends on."""
+        world, solver = self._river()
+        before = world.terrain.heights.copy()
+        self._advance(world, solver, self._rock(), steps=900)
+        under_rock = (world.terrain.heights - before)[48:53, 48:53]
+        self.assertGreaterEqual(float(under_rock.min()), 0.0)
+
+    def test_moving_a_rock_leaves_no_crater_behind(self) -> None:
+        """The bed dome is recomputed from live positions every tick and
+        never written into world terrain (same stateless choice as the shade
+        temperature field), so dragging a rock in the editor must not leave a
+        permanent bump at the old spot."""
+        world, solver = self._river()
+        self._advance(world, solver, self._rock(x=-20.0), steps=120)
+        self.assertGreater(float(solver._bed_offset.max()), 0.0)
+        solver.set_bed_obstructions({})
+        self.assertEqual(float(solver._bed_offset.max()), 0.0)
+
+    def test_rock_is_kept_out_of_the_solid_obstacle_mask(self) -> None:
+        """A ROCK must reach the solver as bed, not as a wall -- otherwise the
+        infinitely tall obstacle mask would win and none of the above could
+        happen. A HOUSE must still be a wall."""
+        world = WorldState()
+        rock = world.add_object("ROCK", [0.0, 0.0, 0.0])
+        house = world.add_object("HOUSE", [10.0, 0.0, 0.0])
+        rigid = ForceRigidBodySystem()
+        rigid.initialize(world, fluid=None, events=EventLog())
+
+        self.assertEqual(rigid.obstacle_snapshot()["ids"], [house.id])
+        bed = rigid.bed_snapshot()
+        self.assertEqual(len(bed["positions"]), 1)
+        self.assertGreater(float(bed["heights"][0]), 0.0)
+        self.assertEqual(float(rigid.buffer.bed_heights[rigid.buffer.index[rock.id]]),
+                         float(bed["heights"][0]))
+
+    def test_bed_height_scales_with_vertical_scale_not_horizontal(self) -> None:
+        """Footprint radius already scales with the horizontal scale; height
+        must follow the vertical one, so a rock stretched only sideways gets
+        wider without also getting taller."""
+        world = WorldState()
+        tall = world.add_object("ROCK", [-10.0, 0.0, 0.0])
+        tall.scale = [1.0, 3.0, 1.0]
+        wide = world.add_object("ROCK", [10.0, 0.0, 0.0])
+        wide.scale = [3.0, 1.0, 3.0]
+        rigid = ForceRigidBodySystem()
+        rigid.initialize(world, fluid=None, events=EventLog())
+        buf = rigid.buffer
+        tall_i, wide_i = buf.index[tall.id], buf.index[wide.id]
+
+        self.assertGreater(float(buf.bed_heights[tall_i]), float(buf.bed_heights[wide_i]))
+        self.assertGreater(float(buf.footprint_radii[wide_i]), float(buf.footprint_radii[tall_i]))
+
+    def test_rock_added_to_a_running_world_reaches_the_solver_as_bed(self) -> None:
+        """End-to-end through SimulationManager, not just the solver in
+        isolation: a rock placed in the editor must actually arrive as a bed
+        dome (bed_snapshot -> set_bed_obstructions) and not as a wall. This is
+        the wiring that the class of bug this project keeps hitting lives in --
+        real physics on the backend that nothing ever connects up.
+        """
+        manager = SimulationManager()
+        manager.world.water.flow_enabled = True
+        manager.start()
+        manager._step_once()
+        self.assertEqual(float(manager.fluid._bed_offset.max()), 0.0)
+
+        manager.apply_object_add({"type": "ROCK", "position": [0.0, 0.0, 0.0]})
+        manager._step_once()
+        self.assertGreater(float(manager.fluid._bed_offset.max()), 0.0,
+                           "a ROCK must raise the effective bed")
+        self.assertFalse(bool(manager.fluid._obstacle_mask.any()),
+                         "a ROCK must not become a solid wall")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

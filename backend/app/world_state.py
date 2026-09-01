@@ -117,17 +117,24 @@ OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
     # obstacle/root machinery. footprint_radius already scales with obj.scale
     # (already editable in the UI), so "effect scales with rock size" falls
     # out for free instead of needing a new property.
+    # bed_height: how far the boulder stands proud of the bed. The only type with
+    # a non-zero one -- it makes the rock part of the riverbed rather than an
+    # infinitely tall wall, so deep water passes over it and shallow water is
+    # deflected around it. See config.BED_DOME_EXPONENT and
+    # ShallowWaterFluidSolver.set_bed_obstructions.
     ObjectType.ROCK: {"mass": 2000.0, "friction": 0.9, "buoyancy": 0.0, "drag": 0.1,
                       "foundation_height": 0.0, "damage_resistance": 1.0,
                       "footprint_radius": 1.0, "root_strength": 1e8,
-                      "shade_radius": 0.0, "shade_cooling": 0.0},
+                      "shade_radius": 0.0, "shade_cooling": 0.0,
+                      "bed_height": 0.8},
 }
 
 
 def default_properties(obj_type: str) -> Dict[str, float]:
     base = {"mass": 100.0, "friction": 0.5, "buoyancy": 0.5, "drag": 0.5,
             "foundation_height": 0.0, "damage_resistance": 0.5, "footprint_radius": 1.0,
-            "root_strength": 0.0, "shade_radius": 0.0, "shade_cooling": 0.0}
+            "root_strength": 0.0, "shade_radius": 0.0, "shade_cooling": 0.0,
+            "bed_height": 0.0}
     base.update(OBJECT_DEFAULTS.get(ObjectType.register(obj_type), {}))
     return base
 
@@ -279,16 +286,15 @@ class WorldState:
         idx = next(self._counters)
         props = default_properties(obj_type)
         name_prefix = obj_type.capitalize()
+        # everything default_properties() knows that is not already a
+        # first-class field goes to metadata. Derived rather than listed by
+        # hand: the old explicit list silently dropped each newly added
+        # property (bed_height was added and simply never reached any object).
+        promoted = ("mass", "friction", "buoyancy")
         obj = WorldObject(
             id=f"{name_prefix}_{idx:03d}", type=obj_type, position=list(position),
             mass=props["mass"], friction=props["friction"], buoyancy=props["buoyancy"],
-            metadata={"foundation_height": props["foundation_height"],
-                      "damage_resistance": props["damage_resistance"],
-                      "drag": props["drag"],
-                      "footprint_radius": props["footprint_radius"],
-                      "root_strength": props["root_strength"],
-                      "shade_radius": props["shade_radius"],
-                      "shade_cooling": props["shade_cooling"]},
+            metadata={k: v for k, v in props.items() if k not in promoted},
         )
         self.objects[obj.id] = obj
         return obj

@@ -62,6 +62,21 @@ SEDIMENT_ERODE_RATE = 0.3       # fraction of the capacity gap eroded per second
 SEDIMENT_DEPOSIT_RATE = 0.3     # fraction of the excess deposited per second
 TERRAIN_RESYNC_INTERVAL_S = 1.0  # how often erosion-driven terrain changes are re-broadcast
 
+# Riverbed rock obstruction (v0.4 RiverLab -- docs/04_TZ_v0.3_roadmap.md v0.4,
+# the "камни на дне реки меняют русло" item). Its explicit note: a rock is not a
+# rigid body with mass and buoyancy, it is part of the terrain/riverbed. So a
+# body with bed_height > 0 is deliberately NOT rasterized into the binary
+# obstacle mask (which is an infinitely tall wall -- correct for a house, wrong
+# for a boulder). Instead it raises the *effective bed* by a dome of that
+# height, so water is deflected around it near the bed and still passes over it
+# when the river is deeper than the rock is tall. That single change is what
+# produces meandering together with the existing sediment mechanic: the flow
+# accelerates around the flanks (erosion) and stalls in the lee (deposition).
+# The dome is added to terrain for flow purposes only -- world terrain is never
+# mutated by it, so a rock can be moved or deleted without leaving a crater.
+BED_DOME_EXPONENT = 0.5      # 0.5 = hemispherical profile; 1.0 would be a cone
+BED_EROSION_SHIELD = 0.05    # bed offset (m) above which terrain under a rock is unerodible
+
 # Water temperature (v0.4 RiverLab, Schauberger hypothesis -- docs/04_TZ_v0.3_roadmap.md
 # v0.4 and docs/01_vision.md "Viktor Schauberger Lab"; NOT asserted as physically
 # correct, only implemented as a testable, comparable effect per that section's own

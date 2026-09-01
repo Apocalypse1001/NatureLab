@@ -218,6 +218,7 @@ class SimulationManager:
         self.engine.step_particles(dt)
         self.fluid.set_boundaries(self.world.terrain, self.rigid.obstacle_snapshot())
         self.fluid.set_environment(self.world.environment.temperature, self.rigid.shade_snapshot())
+        self.fluid.set_bed_obstructions(self.rigid.bed_snapshot())
         self.fluid.set_river_flow(self.world.water.flow_enabled)
         self.fluid.advance(dt, config.FLUID_MAX_SUBSTEPS, config.FLUID_STABILITY_DT)
         samples = self.fluid.sample_for_bodies(self.rigid.buffer.positions,

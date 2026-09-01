@@ -12,7 +12,7 @@ import numpy as np
 
 from . import config
 from .events import EventLog, EventType
-from .world_state import ObjectState, WorldObject
+from .world_state import ObjectState, WorldObject, default_properties
 
 
 @dataclass
@@ -33,6 +33,7 @@ class RigidStateBuffer:
     rooted: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
     shade_radii: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
     shade_coolings: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    bed_heights: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
 
     @staticmethod
     def _footprint_radius(obj: WorldObject) -> float:
@@ -43,6 +44,22 @@ class RigidStateBuffer:
     def _shade_radius(obj: WorldObject) -> float:
         base = float(obj.metadata.get("shade_radius", 0.0))
         return base * max(float(obj.scale[0]), float(obj.scale[2]))
+
+    @staticmethod
+    def _bed_height(obj: WorldObject) -> float:
+        """How far a riverbed obstruction stands proud of the bed (m).
+
+        Scales with the object's *vertical* scale, while the footprint radius
+        scales with the horizontal one -- so a rock stretched only sideways
+        gets wider without getting taller. Zero for every type except ROCK.
+        """
+        # falls back to the type default, not 0.0: worlds saved before
+        # bed_height existed carry no such key, and a ROCK loaded from one of
+        # them must still behave like a rock rather than silently reverting to
+        # the pre-v0.4 infinitely-tall-wall behaviour.
+        default = default_properties(obj.type).get("bed_height", 0.0)
+        base = float(obj.metadata.get("bed_height", default))
+        return base * max(0.0, float(obj.scale[1]))
 
     def register(self, obj: WorldObject) -> int:
         if obj.id in self.index:
@@ -71,6 +88,7 @@ class RigidStateBuffer:
         self.shade_radii = np.append(self.shade_radii, np.float32(self._shade_radius(obj)))
         self.shade_coolings = np.append(
             self.shade_coolings, np.float32(obj.metadata.get("shade_cooling", 0.0)))
+        self.bed_heights = np.append(self.bed_heights, np.float32(self._bed_height(obj)))
         return idx
 
     def update(self, obj: WorldObject) -> None:
@@ -89,6 +107,7 @@ class RigidStateBuffer:
         self.root_strengths[idx] = obj.metadata.get("root_strength", self.root_strengths[idx])
         self.shade_radii[idx] = self._shade_radius(obj)
         self.shade_coolings[idx] = obj.metadata.get("shade_cooling", self.shade_coolings[idx])
+        self.bed_heights[idx] = self._bed_height(obj)
 
     def unregister(self, object_id: str) -> None:
         idx = self.index.pop(object_id, None)
@@ -103,7 +122,7 @@ class RigidStateBuffer:
                           self.masses, self.buoyancies, self.states,
                           self.frictions, self.drags, self.foundation_heights,
                           self.footprint_radii, self.root_strengths, self.rooted,
-                          self.shade_radii, self.shade_coolings):
+                          self.shade_radii, self.shade_coolings, self.bed_heights):
                 array[idx] = array[last]
         self.ids.pop()
         self.positions = self.positions[:-1]
@@ -120,6 +139,7 @@ class RigidStateBuffer:
         self.rooted = self.rooted[:-1]
         self.shade_radii = self.shade_radii[:-1]
         self.shade_coolings = self.shade_coolings[:-1]
+        self.bed_heights = self.bed_heights[:-1]
 
 
 class RigidBodySystem:
@@ -129,6 +149,7 @@ class RigidBodySystem:
     def unregister_body(self, object_id: str) -> None: ...
     def obstacle_snapshot(self) -> dict: ...
     def shade_snapshot(self) -> dict: ...
+    def bed_snapshot(self) -> dict: ...
     def step(self, dt: float, sim_time: float, fluid_samples=None) -> List[str]: ...
     def reset(self) -> None: ...
     def get_transforms(self) -> List[Tuple[str, List[float]]]: ...
@@ -159,12 +180,36 @@ class _ArrayRigidBodySystem(RigidBodySystem):
         self.buffer.unregister(object_id)
 
     def obstacle_snapshot(self) -> dict:
+        """Bodies the fluid must treat as solid walls.
+
+        Riverbed obstructions (bed_height > 0, i.e. ROCK) are deliberately
+        excluded: the obstacle mask is an infinitely tall wall, which is right
+        for a house and wrong for a boulder a deep river simply flows over.
+        They go through bed_snapshot() instead -- see
+        ShallowWaterFluidSolver.set_bed_obstructions and the roadmap's own note
+        that a rock is part of the riverbed, not a rigid body with buoyancy.
+        """
+        wall = self.buffer.bed_heights <= 0.0
         return {
-            "ids": list(self.buffer.ids),
-            "positions": self.buffer.positions.copy(),
-            "rotations": self.buffer.rotations.copy(),
-            "masses": self.buffer.masses.copy(),
-            "radii": self.buffer.footprint_radii.copy(),
+            "ids": [oid for oid, is_wall in zip(self.buffer.ids, wall) if is_wall],
+            "positions": self.buffer.positions[wall].copy(),
+            "rotations": self.buffer.rotations[wall].copy(),
+            "masses": self.buffer.masses[wall].copy(),
+            "radii": self.buffer.footprint_radii[wall].copy(),
+        }
+
+    def bed_snapshot(self) -> dict:
+        """Positions/radii/heights of bodies that raise the riverbed (ROCK).
+
+        Counterpart of shade_snapshot(): same shape of data, consumed by
+        ShallowWaterFluidSolver.set_bed_obstructions() fresh every tick, so a
+        rock that is moved in the editor takes its bump with it.
+        """
+        obstructing = self.buffer.bed_heights > 0.0
+        return {
+            "positions": self.buffer.positions[obstructing].copy(),
+            "radii": self.buffer.footprint_radii[obstructing].copy(),
+            "heights": self.buffer.bed_heights[obstructing].copy(),
         }
 
     def shade_snapshot(self) -> dict:

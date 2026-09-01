@@ -13,6 +13,7 @@ class FluidSolver:
     def initialize(self, world) -> None: ...
     def set_boundaries(self, terrain, obstacles: dict) -> None: ...
     def set_environment(self, base_temperature: float, shade: dict) -> None: ...
+    def set_bed_obstructions(self, bed: dict) -> None: ...
     def set_river_flow(self, enabled: bool) -> None: ...
     def advance(self, global_dt: float, max_substeps: int, stability_dt: float) -> int: ...
     def sample_for_bodies(self, positions: np.ndarray, radii: Optional[np.ndarray] = None) -> dict: ...
@@ -147,6 +148,11 @@ class ShallowWaterFluidSolver(FluidSolver):
         # effect) wherever nothing casts shade; broadcasts safely against
         # the real grid shape even before set_environment() is ever called.
         self._temperature_factor: np.ndarray = np.ones((1, 1), dtype=np.float32)
+        # per-cell rise of the effective riverbed from ROCK domes (v0.4) --
+        # like _temperature_factor, recomputed fresh each tick from current
+        # rock positions and never written back into world terrain, so moving
+        # or deleting a rock leaves no crater behind. Zero = flat bed.
+        self._bed_offset: np.ndarray = np.zeros((1, 1), dtype=np.float32)
         self._flow_enabled = False
         self._time = 0.0
         self.last_substeps = 0
@@ -163,6 +169,7 @@ class ShallowWaterFluidSolver(FluidSolver):
         self._sediment = np.zeros(shape, dtype=np.float32)
         self._obstacle_mask = np.zeros(shape, dtype=bool)
         self._temperature_factor = np.ones(shape, dtype=np.float32)
+        self._bed_offset = np.zeros(shape, dtype=np.float32)
         self._flow_enabled = bool(world.water.flow_enabled)
         self._time = 0.0
 
@@ -182,6 +189,7 @@ class ShallowWaterFluidSolver(FluidSolver):
             self._depth = np.zeros(terrain.heights.shape, dtype=np.float32)
             self._sediment = np.zeros(terrain.heights.shape, dtype=np.float32)
             self._temperature_factor = np.ones(terrain.heights.shape, dtype=np.float32)
+            self._bed_offset = np.zeros(terrain.heights.shape, dtype=np.float32)
         self._obstacle_mask = self._rasterize_obstacles(terrain, obstacles)
         self._depth[self._obstacle_mask] = 0.0
 
@@ -224,6 +232,53 @@ class ShallowWaterFluidSolver(FluidSolver):
         self._temperature_factor = np.clip(
             factor, config.TEMP_FACTOR_MIN, config.TEMP_FACTOR_MAX).astype(np.float32)
 
+    def set_bed_obstructions(self, bed: dict) -> None:
+        """Rebuild the effective-bed rise from riverbed rocks (v0.4 RiverLab).
+
+        The roadmap item this implements ("камни на дне реки меняют русло")
+        asks for two things the binary obstacle mask cannot give: an effect
+        that scales with the rock's size *and position*, and meandering as an
+        emergent result rather than a scripted one. Both fall out of treating
+        the rock as bed rather than as a wall:
+
+        - a dome of `height` (config.BED_DOME_EXPONENT) is added to the bed,
+          so shallow water is pushed around the rock while deeper water still
+          passes over it -- that is the position dependence, for free: the
+          same rock is a major obstruction mid-channel and nearly irrelevant
+          on a dry bank;
+        - the flow squeezing past the flanks speeds up (erosion) and stalls in
+          the lee (deposition), which the existing sediment mechanic then
+          turns into a channel that actually moves.
+
+        Stateless per tick, exactly like set_environment(): no memory, no
+        accumulation, and world terrain is never mutated here -- only the
+        sediment code may do that.
+        """
+        if self._terrain is None:
+            return
+        shape = self._terrain.heights.shape
+        positions = bed.get("positions") if bed else None
+        if positions is None or len(positions) == 0:
+            self._bed_offset = np.zeros(shape, dtype=np.float32)
+            return
+        radii = bed.get("radii", [])
+        heights = bed.get("heights", [])
+        cell = self._terrain.cell_size
+        ny, nx = shape
+        yy, xx = np.mgrid[0:ny, 0:nx]
+        offset = np.zeros(shape, dtype=np.float32)
+        for pos, radius, height in zip(positions, radii, heights):
+            if radius <= 0.0 or height <= 0.0:
+                continue
+            r_cells = _footprint_cells(float(radius), cell)
+            gx = float(pos[0]) / cell + self._terrain.width / 2
+            gz = float(pos[2]) / cell + self._terrain.height / 2
+            dist2 = (xx - gx) ** 2 + (yy - gz) ** 2
+            # dome: full height at the centre, tapering to 0 at the edge
+            inside = np.clip(1.0 - dist2 / (r_cells ** 2), 0.0, 1.0)
+            offset = np.maximum(offset, float(height) * inside ** config.BED_DOME_EXPONENT)
+        self._bed_offset = offset.astype(np.float32)
+
     def _rasterize_obstacles(self, terrain, obstacles: dict) -> np.ndarray:
         mask = np.zeros(terrain.heights.shape, dtype=bool)
         positions = obstacles.get("positions") if obstacles else None
@@ -254,7 +309,7 @@ class ShallowWaterFluidSolver(FluidSolver):
     def _step(self, dt: float) -> None:
         terrain_h = self._terrain.heights
         depth = self._depth
-        effective = terrain_h.astype(np.float32).copy()
+        effective = terrain_h.astype(np.float32) + self._bed_offset  # rocks raise the bed
         effective[self._obstacle_mask] += 1e4  # solid: never a flow target
         total = effective + depth
 
@@ -332,6 +387,11 @@ class ShallowWaterFluidSolver(FluidSolver):
         erode = np.minimum(erode, np.maximum(0.0, self._terrain.heights - config.HEIGHT_MIN))
         # never erode terrain that's carrying no water at all (dry banks)
         erode[old_depth <= config.FLUID_MIN_DEPTH] = 0.0
+        # a boulder is bedrock, not sediment: the river scours around it, not
+        # through it -- without this the rock would dig its own hole and the
+        # flank-erosion/lee-deposition asymmetry that makes a channel meander
+        # would be swamped by a symmetric pit underneath it
+        erode[self._bed_offset > config.BED_EROSION_SHIELD] = 0.0
 
         deposit = np.where(diff < 0, np.minimum(-diff, sediment) * config.SEDIMENT_DEPOSIT_RATE * dt, 0.0)
         deposit = np.minimum(deposit, sediment)
