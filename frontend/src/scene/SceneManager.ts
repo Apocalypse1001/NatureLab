@@ -63,6 +63,15 @@ export class SceneManager {
     // level, matching the original placeholder behaviour.
     const waterGeo = new THREE.PlaneGeometry(
       this.terrain.sizeM, this.terrain.sizeM, this.terrain.width, this.terrain.height);
+    // Per-vertex wetness (2026-09-01, river-flow wavefront): 0 for a cell
+    // real depth has never reached, ramping to 1 for real water. Consumed in
+    // the fragment shader below to fade dry cells to fully transparent --
+    // see the long comment on WATER_DRY_BIAS for why this exists at all
+    // (before it, a whole dry hemisphere of the grid rendered as a uniform
+    // "wet-looking" haze, because a same-height Z bias alone can only fix
+    // z-fighting, not the fact that dry ground shouldn't look wet).
+    waterGeo.setAttribute('aWet',
+      new THREE.BufferAttribute(new Float32Array(waterGeo.attributes.position.count), 1));
     const waterMat = new THREE.MeshStandardMaterial({
       color: 0x2f7fd0, transparent: true, opacity: 0.55,
       roughness: 0.15, metalness: 0.1, depthWrite: false, side: THREE.DoubleSide,
@@ -79,6 +88,8 @@ export class SceneManager {
         .replace('#include <common>', `
           #include <common>
           uniform float uTime;
+          attribute float aWet;
+          varying float vWet;
         `)
         .replace('#include <beginnormal_vertex>', `
           #include <beginnormal_vertex>
@@ -88,8 +99,18 @@ export class SceneManager {
         `)
         .replace('#include <begin_vertex>', `
           #include <begin_vertex>
+          vWet = aWet;
           transformed.z += sin(position.x * 0.8 + uTime * 1.6) * 0.03
                           + sin(position.y * 0.6 - uTime * 1.1) * 0.025;
+        `);
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', `
+          #include <common>
+          varying float vWet;
+        `)
+        .replace('#include <dithering_fragment>', `
+          #include <dithering_fragment>
+          gl_FragColor.a *= vWet;
         `);
       this._waterTimeUniform = shader.uniforms.uTime;
     };
@@ -164,9 +185,10 @@ export class SceneManager {
    */
   // Visual-only vertical exaggeration of the water LAYER'S THICKNESS (depth),
   // not its absolute surface height. A real, physically-correct river-flow
-  // gradient (backend config.FLUID_RIVER_SOURCE_DEPTH/SINK_DEPTH) is only
-  // ~1-1.5m of relief across a 100m-wide grid -- true to the physics, but at
-  // this camera's default viewing angle that reads as a flat blue plane.
+  // gradient (backend world.water.level at the source edge, see config.py's
+  // FLUID_RIVER_SINK_FRACTION) is only on the order of a metre or so of
+  // relief across a 100m-wide grid -- true to the physics, but at this
+  // camera's default viewing angle that reads as a flat blue plane.
   // Measured directly: a real west/east depth split of 1.24m vs 0.30m was
   // completely imperceptible in a screenshot (user-reported: "no dynamics
   // visible"). This does not touch physics sampling (`sample_for_bodies` etc.)
@@ -185,19 +207,54 @@ export class SceneManager {
   // that was never physically there.
   private static readonly WATER_VISUAL_EXAGGERATION = 4;
 
+  // A cell that has never been reached by water has depth EXACTLY 0, which
+  // -- even without the exaggeration clamp bug above -- puts the water mesh
+  // exactly coplanar with the terrain mesh there, and coplanar transparent
+  // geometry z-fights regardless of what multiplies depth. Harmless while
+  // the dry area was small (an obstacle footprint, a dry hilltop). Became a
+  // large, ugly, moving checkerboard once river flow (2026-09-01) started
+  // the grid bone dry and let a wavefront advance in from one edge -- most
+  // of the map is now genuinely, contiguously at depth 0 until the front
+  // arrives. Fix: always lift water a hair above terrain, dry cells
+  // included. Must clear more than depth-buffer precision alone: the cosmetic
+  // ripple shader below adds up to +-0.055m of its own animated offset
+  // (0.03 + 0.025, its two sine terms at worst-case phase) on TOP of this
+  // bias, GPU-side, after this value is computed -- an earlier 0.03m bias
+  // left a regular polka-dot pattern of terrain poking through wherever the
+  // ripple's trough lined up with a rendered vertex. 0.08m clears that with
+  // margin and is still visually negligible against the water's own 0.5m+
+  // typical depth.
+  //
+  // The bias alone isn't enough, though: lifting EVERY vertex -- dry ones
+  // included -- by a constant made the entire grid render as a uniform
+  // "wet-looking" haze the instant flow was enabled, hiding the exact thing
+  // a wavefront demo needs to show (where water has and hasn't reached).
+  // aWet (the geometry attribute set up in the constructor) fixes that at
+  // the fragment shader level: it fades a cell's ALPHA from 0 to 1 as real
+  // depth crosses this threshold, independent of the Z bias above -- a
+  // never-reached cell is fully transparent (pure terrain shows through)
+  // regardless of the small Z lift under it.
+  private static readonly WATER_DRY_BIAS = 0.08;
+  private static readonly WATER_WET_FADE_DEPTH = 0.05;
+
   updateWaterField(depths: Float32Array): void {
     const geo = this.waterMesh.geometry as THREE.PlaneGeometry;
     const pos = geo.attributes.position;
+    const wet = geo.attributes.aWet as THREE.BufferAttribute;
     const terrainPos = (this.terrainMesh.geometry as THREE.PlaneGeometry).attributes.position;
     const count = Math.min(pos.count, depths.length);
     const k = SceneManager.WATER_VISUAL_EXAGGERATION;
+    const bias = SceneManager.WATER_DRY_BIAS;
+    const fade = SceneManager.WATER_WET_FADE_DEPTH;
     let anyWet = false;
     for (let idx = 0; idx < count; idx++) {
       const depth = Math.max(0, depths[idx]);
       if (depth > 0.01) anyWet = true;
-      pos.setZ(idx, terrainPos.getZ(idx) + depth * k);
+      pos.setZ(idx, terrainPos.getZ(idx) + depth * k + bias);
+      wet.setX(idx, Math.min(1, depth / fade));
     }
     pos.needsUpdate = true;
+    wet.needsUpdate = true;
     geo.computeVertexNormals();
     this.waterMesh.visible = anyWet;
   }

@@ -196,40 +196,91 @@ class ShallowWaterSolverTests(unittest.TestCase):
         self.assertFalse(np.allclose(solver._depth, depth_mid),
                          "river flow must stay continuous, not settle back to equilibrium")
 
-    def test_river_flow_is_visible_the_instant_it_is_enabled(self) -> None:
-        """User-reported symptom (2026-09-01): with flow on, a fresh lake
-        still just looked like a still pool. Measured cause: the two edge
-        clamps alone need real minutes to diffuse a gradient into the middle
-        of a 100-cell grid -- at 30 real seconds of running, the centre
-        column had not moved from its start value at all. Fix is
-        _seed_river_profile(): the moment flow goes from off to on, jump the
-        depth field straight to an approximation of the steady-state ramp
-        instead of waiting for it to arrive. This checks the "instant" part
-        specifically -- zero physics steps, not even one tick."""
+    def test_river_flow_enters_from_the_edge_as_a_wavefront_at_the_set_height(self) -> None:
+        """User feedback 2026-09-01, a second pass after testing the running
+        app again: water should visibly ENTER from an edge and flow across
+        the map at the height the user set -- not appear everywhere at once.
+        (An earlier version of this test checked the opposite: an instant
+        full-grid ramp. That was itself a fix for a separate, earlier
+        complaint that flow was invisible -- see config.py's
+        FLUID_FLOW_GAIN comment for how both problems shared one root cause,
+        now fixed, so neither hack is needed any more.)
+
+        _seed_river_profile() now resets the grid to bone dry on the off->on
+        edge; `_step`'s edge clamp then pins the west (source) column to
+        world.water.level -- read live, so the Water Level slider controls
+        the river's height, not a value disconnected from it -- and the real
+        flux physics advances a genuine wavefront in from there.
+        """
         world = self._make_world(slope=0.0)
+        world.water.level = 0.5
         solver = ShallowWaterFluidSolver()
         solver.initialize(world)
         self.assertTrue(np.allclose(solver._depth, solver._depth.flat[0]),
                         "sanity check: starts flat")
 
         solver.set_river_flow(True)
-        self.assertFalse(np.allclose(solver._depth, solver._depth.flat[0]),
-                         "enabling flow must show a gradient before advance() ever runs")
-        self.assertAlmostEqual(float(solver._depth[0, 0]), config.FLUID_RIVER_SOURCE_DEPTH, places=5)
-        self.assertAlmostEqual(float(solver._depth[0, -1]), config.FLUID_RIVER_SINK_DEPTH, places=5)
-        # monotonic west->east, matching the flow direction the edge clamps enforce
-        row = solver._depth[0, :]
-        self.assertTrue(np.all(np.diff(row) <= 1e-6), "seeded ramp must descend west->east")
+        self.assertEqual(float(solver._depth.max()), 0.0,
+                         "enabling flow must reset to bone dry, not fill anything yet")
 
-        # re-enabling (already on) must NOT reseed over live simulated state --
-        # only the off->on edge should jump the field.
-        for _ in range(30):
+        solver.set_boundaries(world.terrain, {})
+        solver.advance(1 / 60, 8, 1 / 120)
+        self.assertAlmostEqual(float(solver._depth[50, 0]), world.water.level, places=5,
+                               msg="source column must be held at the user's Water Level, live")
+        self.assertEqual(float(solver._depth[50, 50]), 0.0,
+                         "the middle must still be dry after a single tick -- a wavefront, not a fill")
+
+        for _ in range(119):
             solver.set_boundaries(world.terrain, {})
             solver.advance(1 / 60, 8, 1 / 120)
-        mid_after_running = solver._depth[50, 50]
+        # 2s in: the front has advanced partway, but a real wavefront -- not
+        # an instant fill -- must not have reached the middle or far edge yet
+        self.assertGreater(float(solver._depth[50, 10]), 0.0, "front must have advanced into the domain")
+        self.assertEqual(float(solver._depth[50, 50]), 0.0, "front must not yet have reached the middle at 2s")
+        self.assertEqual(float(solver._depth[50, -1]), 0.0, "front must not yet have reached the far edge at 2s")
+
+        # re-enabling (already on) must NOT reseed over live simulated state --
+        # only the off->on edge should dry the field.
+        front_position = solver._depth[50, 10]
         solver.set_river_flow(True)
-        self.assertEqual(float(solver._depth[50, 50]), float(mid_after_running),
+        self.assertEqual(float(solver._depth[50, 10]), float(front_position),
                          "calling set_river_flow(True) while already on must not reset progress")
+
+    def test_river_flow_source_height_follows_the_water_level_setting(self) -> None:
+        """The whole point of tying the source to world.water.level rather
+        than a fixed constant: the west edge must be held at exactly the
+        user's Water Level, live (works even though only initialize() reads
+        it for the lake-fill amount -- see set_river_flow's docstring), and
+        the east-edge sink must cap at FLUID_RIVER_SINK_FRACTION of that same
+        height, so a taller river also gets a proportionally taller outlet.
+
+        Pre-loads only the east edge with a large excess rather than waiting
+        for a natural wavefront to cross the 100-cell grid (which the sibling
+        test shows takes on the order of a minute) -- the sink is a per-step
+        `minimum`, exactly as exercised whether the excess arrived by real
+        flow or was placed there directly. The west edge is left dry so its
+        own clamp (a `maximum`) has to do real work raising it, not just
+        leave an already-larger value alone.
+        """
+        def source_and_sink_after(level: float) -> tuple[float, float]:
+            world = self._make_world(slope=0.0)
+            world.water.level = level
+            solver = ShallowWaterFluidSolver()
+            solver.initialize(world)
+            solver.set_river_flow(True)
+            solver._depth[:, -1] = 100.0  # excess only at the sink edge
+            solver.set_boundaries(world.terrain, {})
+            solver.advance(1 / 60, 8, 1 / 120)
+            return float(solver._depth[50, 0]), float(solver._depth[50, -1])
+
+        low_source, low_sink = source_and_sink_after(0.3)
+        high_source, high_sink = source_and_sink_after(2.0)
+        self.assertAlmostEqual(low_source, 0.3, places=5)
+        self.assertAlmostEqual(high_source, 2.0, places=5)
+        self.assertAlmostEqual(low_sink, 0.3 * config.FLUID_RIVER_SINK_FRACTION, places=5)
+        self.assertAlmostEqual(high_sink, 2.0 * config.FLUID_RIVER_SINK_FRACTION, places=5)
+        self.assertGreater(high_sink, low_sink, "a taller river must also cap its outlet higher")
+        self.assertLess(high_sink, high_source, "the outlet must still stay below its own source")
 
     def test_flow_gain_stays_stable_under_worst_case_obstacle_bed_and_shade(self) -> None:
         """Guards the calibration in config.py's FLUID_FLOW_GAIN comment: an

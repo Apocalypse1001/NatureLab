@@ -127,11 +127,14 @@ export class UI {
     water.append(slider);
     panel.append(water);
 
-    // Continuous river current (west edge held full, east edge held near-
-    // empty -- see backend config.FLUID_RIVER_SOURCE_DEPTH/SINK_DEPTH).
-    // Off by default: a flat lake with a flat initial fill has zero surface
-    // gradient and never moves on its own, see docs/04_TZ_v0.3_roadmap.md
-    // v0.4 "Важная находка".
+    // Continuous river current: west edge held at the Water Level slider's
+    // value (live, not a snapshot), east edge held at a small fraction of it
+    // -- see backend config.FLUID_RIVER_SINK_FRACTION. Enabling it resets
+    // the grid dry and lets a real wavefront advance in from the west edge
+    // (ShallowWaterFluidSolver._seed_river_profile) rather than filling the
+    // whole map at once. Off by default: a flat lake with a flat initial
+    // fill has zero surface gradient and never moves on its own, see
+    // docs/04_TZ_v0.3_roadmap.md v0.4 "Важная находка".
     const flowRow = el('div', 'slider-row');
     const flowLabel = el('label', '') as HTMLLabelElement;
     const flowCheckbox = el('input', '') as HTMLInputElement;

@@ -176,37 +176,37 @@ class ShallowWaterFluidSolver(FluidSolver):
         self._time = 0.0
 
     def _seed_river_profile(self) -> None:
-        """Jump the depth field straight to (an approximation of) the
-        steady-state west->east profile the boundary clamps would otherwise
-        take a long time to diffuse in from the edges.
+        """Reset the grid to bone dry so the real flux physics can advance a
+        genuine wavefront in from the source edge, instead of the enable
+        action itself deciding what the whole grid looks like.
 
-        Measured directly: with only the two edge clamps in `_step` and no
-        seeding, the MIDDLE of a 100-cell grid was still sitting at its
-        30-seconds-ago value after a full 30 seconds of real running --
-        exactly the "just a still pool" symptom this was built to fix. The
-        true steady-state curve has a bit of extra curvature right at each
-        forced edge, but is close to linear in between (checked against a
-        long free-running reference), so a straight ramp is a fair one-shot
-        approximation. It is only ever the *starting point*: every following
-        tick still runs the same real flux/erosion physics as always, so any
-        obstacle, rock or terrain edit immediately perturbs it for real --
-        this is not a fake decal, it is fast-forwarding through a transient
-        the numbers show nobody would sit through.
+        User feedback 2026-09-01 (tested the running app, not just the test
+        suite): water should visibly ENTER from an edge and flow across at
+        the height they set, not appear across the whole map at once. An
+        earlier version of this method pre-filled the entire grid with a
+        source->sink ramp for exactly the opposite reason (an even earlier
+        round of feedback: the gradient was too slow to become visible on its
+        own) -- both problems share one root cause, FLUID_FLOW_GAIN having
+        been too weak (see its docstring in config.py), which is now fixed.
+        With that fixed, starting dry and letting `_step`'s edge clamp do the
+        work produces a real, watchable flood wave on its own: measured, the
+        front reaches 15% of a 100-cell grid by 1s of running, 43% by 10s,
+        77% by 40s -- see config.py's FLUID_RIVER_SINK_FRACTION comment.
         """
-        source, sink = config.FLUID_RIVER_SOURCE_DEPTH, config.FLUID_RIVER_SINK_DEPTH
-        nx = self._depth.shape[1]
-        ramp = np.linspace(source, sink, nx, dtype=np.float32)
-        self._depth[:, :] = np.broadcast_to(ramp, self._depth.shape)
+        self._depth[:, :] = 0.0
         self._depth[self._obstacle_mask] = 0.0
 
     def set_river_flow(self, enabled: bool) -> None:
         """Toggle the continuous west->east river current, see config.py.
 
         Read live every tick (SimulationManager._step_once), unlike
-        water_level which only takes effect at initialize() -- so this can
-        be switched on/off while RUNNING. On the off->on edge specifically
-        (not every tick it stays on), seeds the steady-state profile --
-        see _seed_river_profile() for why that matters.
+        water_level which only takes effect at initialize() for the
+        *lake-fill* amount -- but note world.water.level DOES additionally
+        drive the flow source height live every tick while flow is on (see
+        `_step`), so with flow enabled the slider is no longer inert while
+        RUNNING the way the roadmap's "честные нюансы" note originally flagged.
+        On the off->on edge specifically (not every tick it stays on), resets
+        the grid dry -- see _seed_river_profile() for why that matters.
         """
         enabled = bool(enabled)
         if enabled and not self._flow_enabled:
@@ -378,13 +378,20 @@ class ShallowWaterFluidSolver(FluidSolver):
         new_depth = np.maximum(0.0, new_depth)
         new_depth[self._obstacle_mask] = 0.0
         if self._flow_enabled:
-            # Upstream reservoir (west edge, i=0) never runs dry; downstream
-            # outlet (east edge, i=-1) never backs up -- see config.py for why
-            # this alone is enough to keep the interior flux scheme moving
-            # continuously instead of settling flat. Obstacles at either edge
-            # stay dry (reapplied after the clamp).
-            new_depth[:, 0] = np.maximum(new_depth[:, 0], config.FLUID_RIVER_SOURCE_DEPTH)
-            new_depth[:, -1] = np.minimum(new_depth[:, -1], config.FLUID_RIVER_SINK_DEPTH)
+            # Upstream reservoir (west edge, i=0) never runs dry, held at the
+            # user's own Water Level setting -- read live here, not snapshotted
+            # at initialize(), so the slider actually controls the river's
+            # height while RUNNING (see set_river_flow's docstring). Downstream
+            # outlet (east edge, i=-1) never backs up, held at a fraction of
+            # that same source so the gradient direction holds regardless of
+            # what height the user picks. See config.py for why this alone is
+            # enough to keep the interior flux scheme moving continuously
+            # instead of settling flat. Obstacles at either edge stay dry
+            # (reapplied after the clamp).
+            source = max(0.0, float(self._world.water.level)) if self._world is not None else 0.0
+            sink = source * config.FLUID_RIVER_SINK_FRACTION
+            new_depth[:, 0] = np.maximum(new_depth[:, 0], source)
+            new_depth[:, -1] = np.minimum(new_depth[:, -1], sink)
             new_depth[self._obstacle_mask] = 0.0
         new_depth[new_depth < config.FLUID_MIN_DEPTH] = 0.0
 

@@ -61,7 +61,7 @@ node .claude/skills/run-naturelab/driver.mjs --smoke
 ```
 
 ```
-ok SMOKE PASS  sim=RUNNING t = 5.2s objects=1 triangles=60260 depth 0.5m flat -> west 1.244m / east 0.3m
+ok SMOKE PASS  sim=RUNNING t = 5.3s objects=1 triangles=60260 depth 0.5m flat -> west 0.161m / east 0m
 ok .../shots/smoke.png bytes=281164 triangles=60260 drawCalls=20
 ```
 
@@ -78,7 +78,7 @@ ok placed ROCK at (0, 0)
 ok river flow on
 ok {"ws":"connected","sim":"RUNNING","clock":"t = 0.2s","objects":1,...}
 ok waited 5000ms
-ok {"cells":10201,"wet":10200,"min":0,"max":1.4,"mean":0.775,"westMean":1.244,"eastMean":0.3,"visible":true,"renderExaggeration":4}
+ok {"cells":10201,"wet":2828,"min":0,"max":0.5,"mean":0.041,"westMean":0.161,"eastMean":0,"visible":true,"renderExaggeration":4}
 ok .../shots/river.png bytes=281645 triangles=60260 drawCalls=20
 ```
 
@@ -107,12 +107,15 @@ printf 'eval __NL.sceneManager.renderer.info.render.triangles\nquit\n' \
 ```
 
 `depth` is the load-bearing one for physics: `SceneManager` never keeps the depth
-array (it folds it straight into vertex Z, `terrainZ + depth * WATER_VISUAL_EXAGGERATION`
-— the exaggeration is render-only, added 2026-09-01 so gradients read as a visible
-slope instead of a flat-looking plane), so the driver recovers the **real** depth
-as `(waterMeshZ - terrainMeshZ) / WATER_VISUAL_EXAGGERATION`, matching the numbers
-the backend actually streamed. `westMean > eastMean` is how you confirm a river is
-actually flowing.
+array (it folds it straight into vertex Z, `terrainZ + depth * WATER_VISUAL_EXAGGERATION
++ WATER_DRY_BIAS` — both render-only, added 2026-09-01, see Gotchas), so the driver
+recovers the **real** depth as `(waterMeshZ - terrainMeshZ - WATER_DRY_BIAS) /
+WATER_VISUAL_EXAGGERATION`, matching the numbers the backend actually streamed.
+`westMean > eastMean` confirms a river is flowing -- but note `eastMean` legitimately
+stays exactly `0` for a while after enabling flow: the current design (2026-09-01)
+resets the grid dry and grows a real wavefront in from the west edge, it does not
+fill the whole map at once, so the east edge is genuinely untouched until the front
+reaches it (can take upwards of a minute for the full 100-cell width).
 
 ## Direct invocation (physics work)
 
@@ -142,7 +145,7 @@ print('lateral deflection max |flow_z|: %.5f' % abs(s._flow_z).max())
 ```
 
 ```
-depth west/east: 0.851 / 0.455
+depth west/east: 0.569 / 0.423
 lateral deflection max |flow_z|: 0.15177
 ```
 
@@ -203,19 +206,31 @@ the browser for you. Ctrl-C to stop — and **actually stop it** (see Gotchas).
   world with `START` pressed shows a still lake forever. Turn on `flow on` (or
   place an obstacle / edit terrain) or you will conclude the solver is broken.
   This is documented behaviour, not a bug — see `docs/04_TZ_v0.3_roadmap.md` v0.4
-  "Важная находка". `flow on` itself is now instant (`_seed_river_profile()`
-  jumps the depth field straight to the steady-state ramp rather than waiting
-  for it to diffuse in from the edges — that used to take real *minutes* for
-  the grid's centre to move at all), so this gotcha is now scoped tightly to
-  "flow off = genuinely static," not "flow looks static for a while too."
-- **Raising terrain above the current water line briefly draped it in a
-  visible "wet slope" before this session's fix.** Not a bug in the physics
-  (the depth field was always correct — a dry cell here, a filling moat
-  there), but at the old `FLUID_FLOW_GAIN` a newly displaced ring of water
-  took tens of seconds to redistribute, so a freshly raised hill looked
-  permanently flooded on its flanks instead of settling into a dry island
-  within a normal viewing window. Fixed together with the flow-gain
-  recalibration below.
+  "Важная находка".
+- **`flow on` resets the grid dry and grows a real wavefront in from the west
+  edge — it does not fill the whole map.** This went through two designs in one
+  day, both from testing the live app rather than trusting the numbers: a first
+  version instantly ramped the *entire* grid to a source→sink gradient the
+  moment flow was enabled (to fix "flow on still looks like a still pool" —
+  the old `FLUID_FLOW_GAIN=1.6` needed real *minutes* for the grid's centre to
+  move at all). The user then tested that and asked for the opposite: water
+  should visibly *enter* from an edge and flow across at the height they set,
+  not appear everywhere at once. Current design
+  (`ShallowWaterFluidSolver._seed_river_profile`) resets to bone dry on
+  enable and lets `FLUID_FLOW_GAIN=10` carry a genuine front in — measured,
+  it reaches 15% of a 100-cell grid by 1s, 43% by 10s, 77% by 40s. So `depth`
+  reading `eastMean: 0` for a good while after enabling flow is correct, not
+  broken — the front just hasn't arrived yet.
+- **The river's source/sink height follows `world.water.level`, live — not a
+  fixed constant.** `FLUID_RIVER_SOURCE_DEPTH`/`FLUID_RIVER_SINK_DEPTH` were
+  removed; the west edge is held at `max(0, world.water.level)` and the east
+  at `FLUID_RIVER_SINK_FRACTION` (0.1) of that, both read every tick. This
+  also means the Water Level slider now actually does something while
+  RUNNING **when River flow is on** — see the next gotcha for the general case.
+- **The Water Level slider does nothing while RUNNING, *except* when River
+  flow is on.** The lake-fill solver otherwise reads `world.water.level` only
+  in `initialize()`. `flow on/off`, and the river's source height while flow
+  is on, *are* live. Not a driver bug; a known partially-open item.
 - **Don't push `SceneManager.WATER_VISUAL_EXAGGERATION` up casually.** A first
   attempt exaggerated the water *surface's* departure from its own mean,
   clamped to never draw below terrain -- that clamp pinned a whole swath of
@@ -225,16 +240,21 @@ the browser for you. Ctrl-C to stop — and **actually stop it** (see Gotchas).
   (always >= 0, so the clamp is never needed) rather than surface height. If
   you see a checkerboard/moiré on the water again, this is almost certainly
   why — check what changed the Z formula in `updateWaterField`, not the physics.
-- **The river gradient is deliberately over-drawn, 4x.** `SceneManager.
-  WATER_VISUAL_EXAGGERATION` (2026-09-01) multiplies *displayed* depth only —
-  a real 1.24m/0.30m west/east split used to read as a flat blue sheet in a
-  screenshot (user-reported: "no dynamics visible"), so the mesh now draws
-  it at 4x. The `depth` command divides that factor back out (unless the sim
-  is IDLE, where the flat preview plane was never exaggerated to begin with),
-  so its numbers are always the true backend depth — don't re-multiply them.
-- **The Water Level slider does nothing while RUNNING.** The solver reads
-  `world.water.level` only in `initialize()`. `flow on/off` *is* live. Not a driver
-  bug; a known open item.
+- **The river gradient is deliberately over-drawn, 4x — and dry cells are
+  deliberately faded to fully transparent, separately.** `WATER_VISUAL_EXAGGERATION`
+  multiplies *displayed* depth only (a real ~0.15-1.5m depth split used to read
+  as a flat blue sheet in a screenshot). Once the design above started resetting
+  the grid dry, the checkerboard from the previous gotcha came back *much*
+  bigger — half the map, not just a dry hilltop, since a genuinely-untouched
+  cell is exactly coplanar with terrain regardless of exaggeration. A constant
+  `WATER_DRY_BIAS` Z-offset fixes the z-fighting but, applied everywhere, made
+  the *entire* map look uniformly wet — exactly what a wavefront demo must not
+  do. The actual fix is a separate per-vertex alpha attribute (`aWet`) that
+  fades genuinely-dry cells to fully transparent in the fragment shader,
+  independent of the Z bias. Both are needed; neither replaces the other. The
+  `depth` command divides the exaggeration and subtracts the bias back out
+  (unless the sim is IDLE, where the flat preview plane has neither applied),
+  so its numbers are always the true backend depth.
 - **`npm ci` under npm 12 blocks install scripts** — it warns that
   `esbuild@0.21.5 (postinstall)` was blocked. The build still succeeded, so ignore
   it; only if `npm run build` fails would you need `npm install-scripts approve esbuild`.

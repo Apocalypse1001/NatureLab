@@ -191,8 +191,13 @@ async function depthStats() {
   return page.evaluate(() => {
     const sm = globalThis.__NL.sceneManager;
     const idle = document.querySelector('#sim-status')?.textContent === 'IDLE';
-    const EXAG = idle ? 1 : (sm.constructor.WATER_VISUAL_EXAGGERATION
-      ?? Object.getPrototypeOf(sm).constructor.WATER_VISUAL_EXAGGERATION ?? 1);
+    const proto = Object.getPrototypeOf(sm).constructor;
+    const EXAG = idle ? 1 : (sm.constructor.WATER_VISUAL_EXAGGERATION ?? proto.WATER_VISUAL_EXAGGERATION ?? 1);
+    // WATER_DRY_BIAS (2026-09-01): a small constant lift added to every water
+    // vertex regardless of depth, to keep genuinely-dry cells from rendering
+    // exactly coplanar with terrain (z-fighting) -- see SceneManager.ts. Not
+    // present in the IDLE flat preview either, same as EXAG above.
+    const BIAS = idle ? 0 : (sm.constructor.WATER_DRY_BIAS ?? proto.WATER_DRY_BIAS ?? 0);
     const w = sm.waterMesh.geometry.attributes.position;
     const t = sm.terrainMesh.geometry.attributes.position;
     const n = Math.min(w.count, t.count);
@@ -201,7 +206,7 @@ async function depthStats() {
     let westSum = 0, westN = 0, eastSum = 0, eastN = 0;
     const side = Math.round(Math.sqrt(n));
     for (let i = 0; i < n; i++) {
-      const d = (w.getZ(i) - t.getZ(i)) / EXAG;
+      const d = (w.getZ(i) - t.getZ(i) - BIAS) / EXAG;
       if (d < min) min = d;
       if (d > max) max = d;
       sum += d;

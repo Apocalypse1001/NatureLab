@@ -59,16 +59,31 @@ FLUID_MIN_DEPTH = 1e-4         # below this, a cell is treated as dry
 # initialize() fills depth = water_level - terrain, which makes the surface flat
 # from tick 1 (zero gradient, zero flow -- documented in
 # docs/04_TZ_v0.3_roadmap.md v0.4 "Важная находка"). Enabling flow_enabled clamps
-# the west edge column (i=0) to at least FLUID_RIVER_SOURCE_DEPTH and the east edge
-# column (i=-1) to at most FLUID_RIVER_SINK_DEPTH every step, i.e. an upstream
-# reservoir that never runs dry and a downstream outlet that never backs up. That
-# keeps a permanent height difference across the grid, which the existing
-# unconditionally-conservative interior flux scheme then carries as real,
-# continuous west->east flow. Mass is intentionally NOT conserved at those two
-# edge columns while flow_enabled is on (water enters at the source, leaves at the
-# sink) -- everywhere else the same conservative scheme as always applies.
-FLUID_RIVER_SOURCE_DEPTH = 1.4  # depth (m) held at the west edge (i=0) when flowing
-FLUID_RIVER_SINK_DEPTH = 0.15   # depth (m) capped at the east edge (i=-1) when flowing
+# the west edge column (i=0) to at least world.water.level (read live every tick,
+# see ShallowWaterFluidSolver._step -- so the Water Level slider now directly
+# controls the river's source height, not a value disconnected from it) and the
+# east edge column (i=-1) to at most FLUID_RIVER_SINK_FRACTION of that same
+# source, i.e. an upstream reservoir that never runs dry and a downstream outlet
+# that never backs up. That keeps a permanent height difference across the grid,
+# which the existing unconditionally-conservative interior flux scheme then
+# carries as real, continuous west->east flow. Mass is intentionally NOT
+# conserved at those two edge columns while flow_enabled is on (water enters at
+# the source, leaves at the sink) -- everywhere else the same conservative
+# scheme as always applies.
+#
+# Recalibrated 2026-09-01 (user tested the running app a second time): the
+# previous design pre-filled the ENTIRE grid to a fixed source/sink ramp the
+# instant flow was enabled, specifically so the gradient was visible right
+# away (see the FLUID_FLOW_GAIN comment below for why that mattered). But the
+# user's actual ask was the opposite of "instantly full": water should visibly
+# enter FROM the edge and flow across, at the height they set -- not appear
+# everywhere at once. So enabling flow now instead RESETS the grid to dry
+# (ShallowWaterFluidSolver._seed_river_profile) and lets the real flux physics
+# advance a genuine wavefront in from the source column each tick. Measured
+# directly at FLUID_FLOW_GAIN=10 starting bone dry: front reaches 15% of the
+# domain by 1s, 43% by 10s, 77% by 40s -- a real, watchable flood wave, not an
+# instant fill and not an imperceptibly slow one either.
+FLUID_RIVER_SINK_FRACTION = 0.1  # east-edge cap, as a fraction of the west-edge source
 
 # Sediment transport / erosion / deposition (v0.4 RiverLab). See
 # fluid_solver.ShallowWaterFluidSolver._step and
