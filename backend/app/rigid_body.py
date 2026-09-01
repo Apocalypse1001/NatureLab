@@ -29,6 +29,8 @@ class RigidStateBuffer:
     drags: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
     foundation_heights: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
     footprint_radii: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    root_strengths: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    rooted: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
 
     @staticmethod
     def _footprint_radius(obj: WorldObject) -> float:
@@ -53,6 +55,12 @@ class RigidStateBuffer:
         self.foundation_heights = np.append(
             self.foundation_heights, np.float32(obj.metadata.get("foundation_height", 0.0)))
         self.footprint_radii = np.append(self.footprint_radii, np.float32(self._footprint_radius(obj)))
+        root_strength = float(obj.metadata.get("root_strength", 0.0))
+        self.root_strengths = np.append(self.root_strengths, np.float32(root_strength))
+        # rooted only ever goes True -> False (broken), set once on first
+        # registration -- update() below must NOT reset an already-broken
+        # anchor back to rooted just because the object was edited.
+        self.rooted = np.append(self.rooted, root_strength > 0.0)
         return idx
 
     def update(self, obj: WorldObject) -> None:
@@ -68,6 +76,7 @@ class RigidStateBuffer:
         self.drags[idx] = obj.metadata.get("drag", self.drags[idx])
         self.foundation_heights[idx] = obj.metadata.get("foundation_height", self.foundation_heights[idx])
         self.footprint_radii[idx] = self._footprint_radius(obj)
+        self.root_strengths[idx] = obj.metadata.get("root_strength", self.root_strengths[idx])
 
     def unregister(self, object_id: str) -> None:
         idx = self.index.pop(object_id, None)
@@ -81,7 +90,7 @@ class RigidStateBuffer:
             for array in (self.positions, self.velocities, self.rotations,
                           self.masses, self.buoyancies, self.states,
                           self.frictions, self.drags, self.foundation_heights,
-                          self.footprint_radii):
+                          self.footprint_radii, self.root_strengths, self.rooted):
                 array[idx] = array[last]
         self.ids.pop()
         self.positions = self.positions[:-1]
@@ -94,6 +103,8 @@ class RigidStateBuffer:
         self.drags = self.drags[:-1]
         self.foundation_heights = self.foundation_heights[:-1]
         self.footprint_radii = self.footprint_radii[:-1]
+        self.root_strengths = self.root_strengths[:-1]
+        self.rooted = self.rooted[:-1]
 
 
 class RigidBodySystem:
@@ -230,19 +241,25 @@ class ForceRigidBodySystem(_ArrayRigidBodySystem):
         super().initialize(world, fluid, events)
         self._active_contacts = set()
 
-    def _resolve_collisions(self, n: int) -> List[Tuple[int, int, float]]:
+    def _resolve_collisions(
+        self, n: int, dt: float
+    ) -> Tuple[List[Tuple[int, int, float]], List[Tuple[int, float]]]:
         """Mass-weighted impulse + positional correction for overlapping
         footprints (disks of radius footprint_radii in the XZ plane -- the
         same radius the fluid solver already carves obstacles with).
 
-        Returns (i, j, impact_speed) for pairs whose contact just started
-        this tick, so the caller can emit one OBJECT_COLLISION event per
-        contact instead of every tick two bodies stay touching.
+        Returns:
+        - (i, j, impact_speed) for pairs whose contact just started this
+          tick, so the caller can emit one OBJECT_COLLISION event per
+          contact instead of every tick two bodies stay touching.
+        - (i, impact_force) for still-rooted bodies whose impulse/dt this
+          tick exceeded their root_strength -- a body impact (e.g. a car
+          slamming into a tree) can uproot it, not just water drag.
         """
         buf = self.buffer
         if n < 2:
             self._active_contacts = set()
-            return []
+            return [], []
         pos_xz = buf.positions[:, [0, 2]]
         diff = pos_xz[:, None, :] - pos_xz[None, :, :]
         dist = np.linalg.norm(diff, axis=-1)
@@ -255,9 +272,10 @@ class ForceRigidBodySystem(_ArrayRigidBodySystem):
         colliding = overlap > 0
         current_contacts: set = set()
         new_events: List[Tuple[int, int, float]] = []
+        uprooted: List[Tuple[int, float]] = []
         if not colliding.any():
             self._active_contacts = current_contacts
-            return new_events
+            return new_events, uprooted
 
         normal = diff / np.maximum(dist[..., None], 1e-6)
         inv_mass = 1.0 / np.maximum(buf.masses, 1e-6)
@@ -286,6 +304,7 @@ class ForceRigidBodySystem(_ArrayRigidBodySystem):
         buf.velocities[:, 0] = vel_xz[:, 0]
         buf.velocities[:, 2] = vel_xz[:, 1]
 
+        impact_force = np.abs(j_impulse) / max(dt, 1e-9)
         for i in range(n):
             for j in range(i + 1, n):
                 if not colliding[i, j]:
@@ -294,8 +313,16 @@ class ForceRigidBodySystem(_ArrayRigidBodySystem):
                 current_contacts.add(key)
                 if key not in self._active_contacts:
                     new_events.append((i, j, float(abs(vel_along_normal[i, j]))))
+        # a body impact (not just water drag) can uproot a still-rooted body
+        for i in range(n):
+            if not buf.rooted[i]:
+                continue
+            worst = float(np.max(np.where(colliding[i], impact_force[i], 0.0)))
+            if worst > buf.root_strengths[i]:
+                buf.rooted[i] = False
+                uprooted.append((i, worst))
         self._active_contacts = current_contacts
-        return new_events
+        return new_events, uprooted
 
     def step(self, dt: float, sim_time: float, fluid_samples=None) -> List[str]:
         if self._world is None or not self.buffer.ids:
@@ -326,6 +353,11 @@ class ForceRigidBodySystem(_ArrayRigidBodySystem):
         submerge = np.clip(depth_ratio, 0.0, 1.0)  # drag exposure caps once fully wet
         contact_fraction = np.where(weight > 1e-9, normal / np.maximum(weight, 1e-9), 0.0)
         friction_max = buf.frictions * normal
+        # while still rooted, a body resists with friction PLUS root_strength
+        # (Newtons) on top -- once drag exceeds this combined resistance the
+        # anchor is gone for good (see docs/01_vision.md TREE "root strength"
+        # / "break strength", folded into one threshold here).
+        resistance = friction_max + np.where(buf.rooted, buf.root_strengths, 0.0)
 
         rel = flow.copy()
         rel[:, 1] = 0.0
@@ -338,21 +370,27 @@ class ForceRigidBodySystem(_ArrayRigidBodySystem):
         was_moving = prev_speed > config.RIGID_MOVE_EPS_MPS
 
         net = np.zeros_like(drag)
-        # at rest: static friction holds unless drag overcomes it
+        # at rest: static friction (+ root_strength while rooted) holds
+        # unless drag overcomes it
         drag_dir = np.zeros_like(drag)
         nonzero_drag = drag_mag > 1e-9
         drag_dir[nonzero_drag] = drag[nonzero_drag] / drag_mag[nonzero_drag, None]
         at_rest = ~was_moving
-        overcomes_static = at_rest & (drag_mag > friction_max)
+        overcomes_static = at_rest & (drag_mag > resistance)
         net[overcomes_static] = (drag[overcomes_static]
-                                  - drag_dir[overcomes_static] * friction_max[overcomes_static, None])
-        # already moving: kinetic friction opposes current velocity direction
+                                  - drag_dir[overcomes_static] * resistance[overcomes_static, None])
+        # already moving: kinetic friction (+ root_strength while rooted)
+        # opposes current velocity direction
         vel_dir = np.zeros_like(buf.velocities)
         nonzero_speed = prev_speed > 1e-9
         vel_xz = buf.velocities.copy()
         vel_xz[:, 1] = 0.0
         vel_dir[nonzero_speed] = vel_xz[nonzero_speed] / prev_speed[nonzero_speed, None]
-        net[was_moving] = drag[was_moving] - vel_dir[was_moving] * friction_max[was_moving, None]
+        net[was_moving] = drag[was_moving] - vel_dir[was_moving] * resistance[was_moving, None]
+
+        # drag alone broke the anchor this tick -- record before mutating
+        # buf.rooted so the event/state logic below still sees "just broke"
+        uprooted_by_drag = buf.rooted & (drag_mag > resistance)
 
         accel = net / np.maximum(buf.masses[:, None], 1e-6)
         new_velocities = buf.velocities + accel * dt
@@ -360,19 +398,40 @@ class ForceRigidBodySystem(_ArrayRigidBodySystem):
         holding = at_rest & ~overcomes_static
         new_velocities[holding] = 0.0
         new_speed = np.linalg.norm(new_velocities[:, [0, 2]], axis=1)
-        # a moving body whose drag can no longer beat friction comes to rest
-        # rather than oscillating around zero at fixed dt
-        stopping = was_moving & (drag_mag <= friction_max) & (new_speed < config.RIGID_MOVE_EPS_MPS)
+        # a moving body whose drag can no longer beat resistance comes to
+        # rest rather than oscillating around zero at fixed dt
+        stopping = was_moving & (drag_mag <= resistance) & (new_speed < config.RIGID_MOVE_EPS_MPS)
         new_velocities[stopping] = 0.0
 
         buf.velocities = new_velocities.astype(np.float32)
         buf.positions = (buf.positions + buf.velocities * dt).astype(np.float32)
-        collision_pairs = self._resolve_collisions(n)
-        for i, j, speed in collision_pairs:
+        buf.rooted[uprooted_by_drag] = False
+        collision_events, collision_uprooted = self._resolve_collisions(n, dt)
+        for i, j, speed in collision_events:
             oid_i, oid_j = buf.ids[i], buf.ids[j]
             if self._events:
                 self._events.record(sim_time, EventType.OBJECT_COLLISION, oid_i,
                                     cause="body_contact", other=oid_j, impact_speed=speed)
+        for idx in np.flatnonzero(uprooted_by_drag):
+            oid = buf.ids[int(idx)]
+            obj = self._world.objects.get(oid)
+            if obj is not None:
+                obj.state = ObjectState.BROKEN.value
+            if self._events:
+                self._events.record(sim_time, EventType.OBJECT_BROKEN, oid,
+                                    cause="drag_exceeded_root_strength",
+                                    drag_force=float(drag_mag[idx]),
+                                    root_strength=float(buf.root_strengths[idx]))
+        for idx, impact_force in collision_uprooted:
+            oid = buf.ids[idx]
+            obj = self._world.objects.get(oid)
+            if obj is not None:
+                obj.state = ObjectState.BROKEN.value
+            if self._events:
+                self._events.record(sim_time, EventType.OBJECT_BROKEN, oid,
+                                    cause="body_impact_exceeded_root_strength",
+                                    impact_force=impact_force,
+                                    root_strength=float(buf.root_strengths[idx]))
         new_speed = np.linalg.norm(buf.velocities[:, [0, 2]], axis=1)
 
         floating_mask = contact_fraction < config.RIGID_FLOAT_CONTACT_THRESHOLD

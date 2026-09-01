@@ -299,7 +299,7 @@ class ForceRigidBodyTests(unittest.TestCase):
         rigid.initialize(world, fluid=None, events=EventLog())
         rigid.buffer.velocities[0] = [4.0, 0.0, 0.0]  # light body moving toward heavy one
         momentum_before = (rigid.buffer.masses[:, None] * rigid.buffer.velocities).sum(axis=0)
-        rigid._resolve_collisions(2)
+        rigid._resolve_collisions(2, 1 / 60)
         momentum_after = (rigid.buffer.masses[:, None] * rigid.buffer.velocities).sum(axis=0)
         np.testing.assert_allclose(momentum_before, momentum_after, atol=1e-3)
         self.assertLess(abs(float(rigid.buffer.velocities[1, 0])), 0.05,
@@ -317,6 +317,92 @@ class ForceRigidBodyTests(unittest.TestCase):
             rigid.step(1 / 60, step / 60, samples)
         collisions = [e for e in events.all() if e["type"] == "OBJECT_COLLISION"]
         self.assertEqual(len(collisions), 1)
+
+
+class TreeRootAnchorTests(unittest.TestCase):
+    """v0.3: TREE gets root_strength -- extra static resistance on top of
+    Coulomb friction -- so it does not slide away like a BOX under an
+    ordinary flood, only uproots (BROKEN) once drag or a body impact
+    exceeds that threshold. See docs/01_vision.md "root strength" /
+    "break strength" and the user's questions 2026-09-01 about whether a
+    tsunami-scale flow or a car impact should be able to detach a tree."""
+
+    def test_tree_stays_rooted_under_ordinary_flood_flow(self) -> None:
+        world = WorldState()
+        world.add_object("TREE", [0.0, 0.0, 0.0])
+        events = EventLog()
+        rigid = ForceRigidBodySystem()
+        rigid.initialize(world, fluid=None, events=events)
+        samples = {"depths": np.array([1.0], dtype=np.float32),
+                   "velocities": np.array([[2.0, 0.0, 0.0]], dtype=np.float32)}
+        for step in range(1, 300):
+            rigid.step(1 / 60, step / 60, samples)
+        tree = next(iter(world.objects.values()))
+        self.assertTrue(bool(rigid.buffer.rooted[0]))
+        self.assertNotEqual(tree.state, ObjectState.BROKEN.value)
+
+    def test_tree_uproots_under_extreme_flow(self) -> None:
+        world = WorldState()
+        world.add_object("TREE", [0.0, 0.0, 0.0])
+        events = EventLog()
+        rigid = ForceRigidBodySystem()
+        rigid.initialize(world, fluid=None, events=events)
+        samples = {"depths": np.array([2.0], dtype=np.float32),
+                   "velocities": np.array([[12.0, 0.0, 0.0]], dtype=np.float32)}
+        broke = False
+        for step in range(1, 120):
+            rigid.step(1 / 60, step / 60, samples)
+            if not rigid.buffer.rooted[0]:
+                broke = True
+                break
+        self.assertTrue(broke, "extreme flow should eventually uproot the tree")
+        tree = next(iter(world.objects.values()))
+        # BROKEN is set the instant it uproots, but the same tick can also
+        # already reclassify it as FLOATING (it was already in deep water,
+        # which is exactly why it broke) -- that's correct, not a bug: the
+        # OBJECT_BROKEN event is the authoritative record of the moment,
+        # the object's current state reflects what it's doing right now.
+        self.assertIn(tree.state, (ObjectState.BROKEN.value, ObjectState.FLOATING.value,
+                                    ObjectState.MOVING.value))
+        broken_events = [e for e in events.all() if e["type"] == "OBJECT_BROKEN"]
+        self.assertEqual(len(broken_events), 1)
+        self.assertEqual(broken_events[0]["cause"], "drag_exceeded_root_strength")
+
+    def test_tree_uproots_from_body_impact(self) -> None:
+        """A fast-moving car slamming into a tree can uproot it even with
+        no water at all -- root_strength must be checked against collision
+        impact force, not only against water drag."""
+        world = WorldState()
+        world.add_object("TREE", [3.0, 0.0, 0.0])
+        world.add_object("CAR", [-2.0, 0.0, 0.0])
+        events = EventLog()
+        rigid = ForceRigidBodySystem()
+        rigid.initialize(world, fluid=None, events=events)
+        car_idx = rigid.buffer.ids.index(next(o.id for o in world.objects.values() if o.type == "CAR"))
+        rigid.buffer.velocities[car_idx] = [15.0, 0.0, 0.0]  # a very hard, direct hit
+        no_water = {"depths": np.zeros(2, dtype=np.float32), "velocities": np.zeros((2, 3), dtype=np.float32)}
+        tree_idx = rigid.buffer.ids.index(next(o.id for o in world.objects.values() if o.type == "TREE"))
+        for step in range(1, 60):
+            rigid.step(1 / 60, step / 60, no_water)
+            if not rigid.buffer.rooted[tree_idx]:
+                break
+        self.assertFalse(bool(rigid.buffer.rooted[tree_idx]), "hard car impact should uproot the tree")
+        broken_events = [e for e in events.all() if e["type"] == "OBJECT_BROKEN"]
+        self.assertEqual(len(broken_events), 1)
+        self.assertEqual(broken_events[0]["cause"], "body_impact_exceeded_root_strength")
+
+    def test_broken_tree_still_carves_a_fluid_obstacle(self) -> None:
+        """A fallen tree remains a registered rigid body, so it keeps
+        blocking water exactly like before it broke -- 'дерево упало ->
+        стало препятствием' from docs/01_vision.md falls out for free."""
+        world = WorldState()
+        tree = world.add_object("TREE", [0.0, 0.0, 0.0])
+        rigid = ForceRigidBodySystem()
+        rigid.initialize(world, fluid=None, events=EventLog())
+        rigid.buffer.rooted[0] = False  # simulate an already-broken tree
+        snapshot = rigid.obstacle_snapshot()
+        self.assertIn(tree.id, snapshot["ids"])
+        self.assertGreater(float(snapshot["radii"][0]), 0.0)
 
 
 if __name__ == "__main__":

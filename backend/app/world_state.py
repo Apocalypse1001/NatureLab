@@ -75,28 +75,39 @@ class ObjectState(str, enum.Enum):
 # fluid grid (see fluid_solver.ShallowWaterFluidSolver) -- matches the actual
 # primitive sizes in frontend/src/world/ObjectFactory.ts so a house blocks
 # more of the flow than a box, not a single fixed radius for every object.
+# `root_strength` is extra static resistance (Newtons) ON TOP OF normal
+# Coulomb friction, applied only while the object is still "rooted" (see
+# rigid_body.ForceRigidBodySystem). 0 for everything except TREE -- this is
+# a generic mechanic (any type could opt in), not a TREE special case, and
+# folds docs/01_vision.md's separate "root strength" and "break strength"
+# TREE properties into one threshold: how much force (from water drag OR
+# a body impact) before the anchor is permanently gone and it becomes an
+# ordinary movable/floating body (matching "дерево упало -> стало
+# препятствием" from 01_vision.md, since a broken tree is still a
+# registered rigid body and keeps carving its obstacle hole in the water).
 OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
     ObjectType.HOUSE: {"mass": 20000.0, "friction": 0.7, "buoyancy": 0.1, "drag": 0.2,
                        "foundation_height": 0.3, "damage_resistance": 0.8,
-                       "footprint_radius": 2.4},
+                       "footprint_radius": 2.4, "root_strength": 0.0},
     ObjectType.CAR:   {"mass": 1500.0, "friction": 0.6, "buoyancy": 0.55, "drag": 1.5,
                        "foundation_height": 0.0, "damage_resistance": 0.3,
-                       "footprint_radius": 2.2},
+                       "footprint_radius": 2.2, "root_strength": 0.0},
     ObjectType.TREE:  {"mass": 800.0, "friction": 0.8, "buoyancy": 0.6, "drag": 0.9,
                        "foundation_height": 0.0, "damage_resistance": 0.4,
-                       "footprint_radius": 1.2},
+                       "footprint_radius": 1.2, "root_strength": 15000.0},
     ObjectType.BOX:   {"mass": 50.0, "friction": 0.5, "buoyancy": 0.8, "drag": 0.6,
                        "foundation_height": 0.0, "damage_resistance": 0.5,
-                       "footprint_radius": 0.7},
+                       "footprint_radius": 0.7, "root_strength": 0.0},
     ObjectType.DEBRIS: {"mass": 10.0, "friction": 0.4, "buoyancy": 0.9, "drag": 0.4,
                         "foundation_height": 0.0, "damage_resistance": 0.2,
-                        "footprint_radius": 0.7},
+                        "footprint_radius": 0.7, "root_strength": 0.0},
 }
 
 
 def default_properties(obj_type: str) -> Dict[str, float]:
     base = {"mass": 100.0, "friction": 0.5, "buoyancy": 0.5, "drag": 0.5,
-            "foundation_height": 0.0, "damage_resistance": 0.5, "footprint_radius": 1.0}
+            "foundation_height": 0.0, "damage_resistance": 0.5, "footprint_radius": 1.0,
+            "root_strength": 0.0}
     base.update(OBJECT_DEFAULTS.get(ObjectType.register(obj_type), {}))
     return base
 
@@ -252,7 +263,8 @@ class WorldState:
             metadata={"foundation_height": props["foundation_height"],
                       "damage_resistance": props["damage_resistance"],
                       "drag": props["drag"],
-                      "footprint_radius": props["footprint_radius"]},
+                      "footprint_radius": props["footprint_radius"],
+                      "root_strength": props["root_strength"]},
         )
         self.objects[obj.id] = obj
         return obj
