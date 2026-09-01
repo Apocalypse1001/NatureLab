@@ -31,10 +31,17 @@ class RigidStateBuffer:
     footprint_radii: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
     root_strengths: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
     rooted: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
+    shade_radii: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    shade_coolings: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
 
     @staticmethod
     def _footprint_radius(obj: WorldObject) -> float:
         base = float(obj.metadata.get("footprint_radius", 1.0))
+        return base * max(float(obj.scale[0]), float(obj.scale[2]))
+
+    @staticmethod
+    def _shade_radius(obj: WorldObject) -> float:
+        base = float(obj.metadata.get("shade_radius", 0.0))
         return base * max(float(obj.scale[0]), float(obj.scale[2]))
 
     def register(self, obj: WorldObject) -> int:
@@ -61,6 +68,9 @@ class RigidStateBuffer:
         # registration -- update() below must NOT reset an already-broken
         # anchor back to rooted just because the object was edited.
         self.rooted = np.append(self.rooted, root_strength > 0.0)
+        self.shade_radii = np.append(self.shade_radii, np.float32(self._shade_radius(obj)))
+        self.shade_coolings = np.append(
+            self.shade_coolings, np.float32(obj.metadata.get("shade_cooling", 0.0)))
         return idx
 
     def update(self, obj: WorldObject) -> None:
@@ -77,6 +87,8 @@ class RigidStateBuffer:
         self.foundation_heights[idx] = obj.metadata.get("foundation_height", self.foundation_heights[idx])
         self.footprint_radii[idx] = self._footprint_radius(obj)
         self.root_strengths[idx] = obj.metadata.get("root_strength", self.root_strengths[idx])
+        self.shade_radii[idx] = self._shade_radius(obj)
+        self.shade_coolings[idx] = obj.metadata.get("shade_cooling", self.shade_coolings[idx])
 
     def unregister(self, object_id: str) -> None:
         idx = self.index.pop(object_id, None)
@@ -90,7 +102,8 @@ class RigidStateBuffer:
             for array in (self.positions, self.velocities, self.rotations,
                           self.masses, self.buoyancies, self.states,
                           self.frictions, self.drags, self.foundation_heights,
-                          self.footprint_radii, self.root_strengths, self.rooted):
+                          self.footprint_radii, self.root_strengths, self.rooted,
+                          self.shade_radii, self.shade_coolings):
                 array[idx] = array[last]
         self.ids.pop()
         self.positions = self.positions[:-1]
@@ -105,6 +118,8 @@ class RigidStateBuffer:
         self.footprint_radii = self.footprint_radii[:-1]
         self.root_strengths = self.root_strengths[:-1]
         self.rooted = self.rooted[:-1]
+        self.shade_radii = self.shade_radii[:-1]
+        self.shade_coolings = self.shade_coolings[:-1]
 
 
 class RigidBodySystem:
@@ -113,6 +128,7 @@ class RigidBodySystem:
     def update_body(self, obj: WorldObject) -> None: ...
     def unregister_body(self, object_id: str) -> None: ...
     def obstacle_snapshot(self) -> dict: ...
+    def shade_snapshot(self) -> dict: ...
     def step(self, dt: float, sim_time: float, fluid_samples=None) -> List[str]: ...
     def reset(self) -> None: ...
     def get_transforms(self) -> List[Tuple[str, List[float]]]: ...
@@ -149,6 +165,17 @@ class _ArrayRigidBodySystem(RigidBodySystem):
             "rotations": self.buffer.rotations.copy(),
             "masses": self.buffer.masses.copy(),
             "radii": self.buffer.footprint_radii.copy(),
+        }
+
+    def shade_snapshot(self) -> dict:
+        """Positions/radii/strength of shade-casting bodies (TREE canopy),
+        for ShallowWaterFluidSolver._update_temperature_factor. Only bodies
+        with shade_cooling > 0 are included -- most types cast none."""
+        casting = self.buffer.shade_coolings > 0.0
+        return {
+            "positions": self.buffer.positions[casting].copy(),
+            "radii": self.buffer.shade_radii[casting].copy(),
+            "cooling": self.buffer.shade_coolings[casting].copy(),
         }
 
     def reset(self) -> None:

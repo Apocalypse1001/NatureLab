@@ -47,6 +47,22 @@ SEDIMENT_ERODE_RATE = 0.3       # fraction of the capacity gap eroded per second
 SEDIMENT_DEPOSIT_RATE = 0.3     # fraction of the excess deposited per second
 TERRAIN_RESYNC_INTERVAL_S = 1.0  # how often erosion-driven terrain changes are re-broadcast
 
+# Water temperature (v0.4 RiverLab, Schauberger hypothesis -- docs/04_TZ_v0.3_roadmap.md
+# v0.4 and docs/01_vision.md "Viktor Schauberger Lab"; NOT asserted as physically
+# correct, only implemented as a testable, comparable effect per that section's own
+# HYPOTHESIS->BUILD->SIMULATE->MEASURE->COMPARE stance). Deliberately NOT a persistent
+# diffusing field -- ShallowWaterFluidSolver recomputes a per-cell multiplier from
+# tree shade_snapshot() each tick (see _update_temperature_factor). Calibrated
+# (approximately, not rigorously) from a real historical reference: Schauberger's
+# Neuberg log flume moved a block 2km in 29 min at ~9.5C vs 40 min at ~14C -- about
+# a 38% speed change over ~4.5C, i.e. roughly TEMP_EFFECT_PER_DEGREE_C below.
+# Positive local cooling (shade below environment.temperature) increases both flow
+# gain and sediment carrying capacity; warming decreases them; the factor is clamped
+# so extreme temperatures can't destabilise the solver.
+TEMP_EFFECT_PER_DEGREE_C = 0.075   # multiplicative change per +-1C vs environment.temperature
+TEMP_FACTOR_MIN = 0.5
+TEMP_FACTOR_MAX = 2.0
+
 # Rigid body force model (v0.3): gravity + buoyancy + hydrodynamic drag +
 # ground friction. See backend/app/rigid_body.py:ForceRigidBodySystem and
 # docs/04_TZ_v0.3_roadmap.md.

@@ -232,6 +232,30 @@ Terrain теперь **стримится во время RUNNING** (не тол
 - Слайдер Water Level во время RUNNING не влияет на `ShallowWaterFluidSolver` — тот читает
   `world.water.level` только один раз при `initialize()`.
 
+## v0.4 RiverLab: температура воды и тень от деревьев (гипотеза Шаубергера)
+
+После разбора первоисточников (Living Water, Living Energies/Callum Coats — см. обсуждение
+2026-09-01) и явного решения пользователя **не** делать полноценное температурное поле сейчас:
+
+- `RigidStateBuffer` получил `shade_radii`/`shade_coolings`; TREE — единственный тип с ненулевым
+  `shade_cooling` по умолчанию (метаданные, generic-механизм, как `drag`/`root_strength`).
+- `ShallowWaterFluidSolver.set_environment(base_temperature, shade)` пересчитывает
+  `_temperature_factor` **заново каждый tick** из текущих позиций деревьев — намеренно **не**
+  персистентное/диффундирующее поле (осознанный выбор объёма работы, не забыто).
+- Множитель применяется к `FLUID_FLOW_GAIN` (скорость потока) и `SEDIMENT_CAPACITY_SCALE`
+  (сколько/какого размера осадка несёт поток) — обе claim Шаубергера сразу, без отдельного solver'а.
+  Калибровка (`config.TEMP_EFFECT_PER_DEGREE_C ≈ 0.075`, т.е. ~7.5%/°C) — по реальному
+  историческому ориентиру, лесосплавной жёлоб Neuberg (29 мин при ~9.5°C vs 40 мин при ~14°C на
+  одной дистанции), не строгий физический закон — используется как гипотеза для сравнения, не
+  как утверждённая истина (сам `01_vision.md` требует именно такого подхода).
+- Базовая температура (`environment.temperature`) — теперь реально управляется: UI-слайдер
+  "Water temperature" + backend op `environment_temperature`. Раньше поле существовало в данных,
+  но нигде физически не использовалось и не было выведено в UI — тот же класс проблемы, что был
+  с `foundation_height` до его подключения к rigid body в v0.3.
+- Приёмочный тест в формате Schauberger Lab уже есть:
+  `test_shade_changes_downstream_flow_and_sediment_river_a_vs_b` — тот же канал, отличается
+  только наличие тени, сравниваются depth-поле и суммарный sediment.
+
 ## Placeholder (намеренно)
 
 - `OBJECT_TRANSFORMS`, `EVENTS` (бинарный) bulk frame kinds подготовлены как типизированный

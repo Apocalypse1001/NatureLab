@@ -14,6 +14,7 @@ export interface UICallbacks {
   removeSelected(): void;
   updateObject(id: string, patch: Partial<ObjectData>): void;
   setWaterLevel(v: number): void;
+  setTemperature(v: number): void;
   setTool(tool: 'select' | 'raise' | 'lower'): void;
   setBrush(radius: number, strength: number): void;
   getObjects(): ObjectData[];
@@ -123,6 +124,21 @@ export class UI {
     };
     water.append(slider);
     panel.append(water);
+
+    // v0.4 RiverLab (Schauberger hypothesis): baseline water temperature.
+    // Tree shade cools it locally/automatically -- this is only the manual
+    // global baseline, see docs/04_TZ_v0.3_roadmap.md v0.4.
+    const temp = el('div', 'slider-row');
+    temp.innerHTML = '<label>Water temperature <output id="temp-out">15</output> °C</label>';
+    const tempSlider = el('input', '') as HTMLInputElement;
+    tempSlider.type = 'range'; tempSlider.min = '0'; tempSlider.max = '30'; tempSlider.step = '0.5';
+    tempSlider.value = '15';
+    tempSlider.oninput = () => {
+      this.root.querySelector<HTMLSpanElement>('#temp-out')!.textContent = tempSlider.value;
+      this.cb.setTemperature(parseFloat(tempSlider.value));
+    };
+    temp.append(tempSlider);
+    panel.append(temp);
 
     panel.append(el('h3', '', 'Terrain'));
     const tools = el('div', 'palette');

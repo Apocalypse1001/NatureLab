@@ -89,19 +89,28 @@ class ObjectState(str, enum.Enum):
 OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
     ObjectType.HOUSE: {"mass": 20000.0, "friction": 0.7, "buoyancy": 0.1, "drag": 0.2,
                        "foundation_height": 0.3, "damage_resistance": 0.8,
-                       "footprint_radius": 2.4, "root_strength": 0.0},
+                       "footprint_radius": 2.4, "root_strength": 0.0,
+                       "shade_radius": 0.0, "shade_cooling": 0.0},
     ObjectType.CAR:   {"mass": 1500.0, "friction": 0.6, "buoyancy": 0.55, "drag": 1.5,
                        "foundation_height": 0.0, "damage_resistance": 0.3,
-                       "footprint_radius": 2.2, "root_strength": 0.0},
+                       "footprint_radius": 2.2, "root_strength": 0.0,
+                       "shade_radius": 0.0, "shade_cooling": 0.0},
+    # shade_radius/shade_cooling (RiverLab, Schauberger): a tree canopy casts
+    # shade well beyond its own footprint_radius (trunk) -- see
+    # docs/04_TZ_v0.3_roadmap.md v0.4 and world_state note near
+    # ShallowWaterFluidSolver._update_temperature_factor for how this is used.
     ObjectType.TREE:  {"mass": 800.0, "friction": 0.8, "buoyancy": 0.6, "drag": 0.9,
                        "foundation_height": 0.0, "damage_resistance": 0.4,
-                       "footprint_radius": 1.2, "root_strength": 15000.0},
+                       "footprint_radius": 1.2, "root_strength": 15000.0,
+                       "shade_radius": 4.0, "shade_cooling": 3.0},
     ObjectType.BOX:   {"mass": 50.0, "friction": 0.5, "buoyancy": 0.8, "drag": 0.6,
                        "foundation_height": 0.0, "damage_resistance": 0.5,
-                       "footprint_radius": 0.7, "root_strength": 0.0},
+                       "footprint_radius": 0.7, "root_strength": 0.0,
+                       "shade_radius": 0.0, "shade_cooling": 0.0},
     ObjectType.DEBRIS: {"mass": 10.0, "friction": 0.4, "buoyancy": 0.9, "drag": 0.4,
                         "foundation_height": 0.0, "damage_resistance": 0.2,
-                        "footprint_radius": 0.7, "root_strength": 0.0},
+                        "footprint_radius": 0.7, "root_strength": 0.0,
+                        "shade_radius": 0.0, "shade_cooling": 0.0},
     # Riverbed rock (RiverLab, docs/04_TZ_v0.3_roadmap.md v0.4): not a Schauberger
     # special case, just root_strength turned up so high it's permanently
     # immovable by anything this sim can produce -- reuses 100% of the existing
@@ -110,14 +119,15 @@ OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
     # out for free instead of needing a new property.
     ObjectType.ROCK: {"mass": 2000.0, "friction": 0.9, "buoyancy": 0.0, "drag": 0.1,
                       "foundation_height": 0.0, "damage_resistance": 1.0,
-                      "footprint_radius": 1.0, "root_strength": 1e8},
+                      "footprint_radius": 1.0, "root_strength": 1e8,
+                      "shade_radius": 0.0, "shade_cooling": 0.0},
 }
 
 
 def default_properties(obj_type: str) -> Dict[str, float]:
     base = {"mass": 100.0, "friction": 0.5, "buoyancy": 0.5, "drag": 0.5,
             "foundation_height": 0.0, "damage_resistance": 0.5, "footprint_radius": 1.0,
-            "root_strength": 0.0}
+            "root_strength": 0.0, "shade_radius": 0.0, "shade_cooling": 0.0}
     base.update(OBJECT_DEFAULTS.get(ObjectType.register(obj_type), {}))
     return base
 
@@ -274,7 +284,9 @@ class WorldState:
                       "damage_resistance": props["damage_resistance"],
                       "drag": props["drag"],
                       "footprint_radius": props["footprint_radius"],
-                      "root_strength": props["root_strength"]},
+                      "root_strength": props["root_strength"],
+                      "shade_radius": props["shade_radius"],
+                      "shade_cooling": props["shade_cooling"]},
         )
         self.objects[obj.id] = obj
         return obj

@@ -14,7 +14,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from app import protocol  # noqa: E402
+from app import config, protocol  # noqa: E402
 from app.events import EventLog  # noqa: E402
 from app.fluid_solver import ShallowWaterFluidSolver  # noqa: E402
 from app.rigid_body import ForceRigidBodySystem  # noqa: E402
@@ -287,6 +287,79 @@ class SedimentErosionTests(unittest.TestCase):
         without_rock = run(with_rock=False)
         with_rock = run(with_rock=True)
         self.assertFalse(np.allclose(without_rock, with_rock))
+
+
+class TemperatureShadeTests(unittest.TestCase):
+    """v0.4 RiverLab, Schauberger hypothesis (docs/04_TZ_v0.3_roadmap.md v0.4,
+    docs/01_vision.md 'Viktor Schauberger Lab'): tree shade locally cools
+    water, which we treat as increasing flow energy and sediment carrying
+    capacity. Implemented as a stateless per-tick multiplier recomputed from
+    tree positions -- NOT a persistent/diffusing field (deferred by the
+    user's own choice, 2026-09-01). These tests check the mechanism is
+    real and comparable (River A vs River B), not that Schauberger was
+    "right" -- see the causal- vs engineering-realism note in the roadmap."""
+
+    @staticmethod
+    def _make_channel(slope: float, depth: float = 0.5) -> tuple[WorldState, ShallowWaterFluidSolver]:
+        world = WorldState()
+        w, h = world.terrain.width, world.terrain.height
+        xs = np.linspace(0.0, slope, w + 1, dtype=np.float32)
+        world.terrain.heights[:, :] = np.tile(xs, (h + 1, 1))
+        solver = ShallowWaterFluidSolver()
+        solver.initialize(world)
+        solver._depth[:, :] = depth
+        return world, solver
+
+    def test_no_shade_sources_keeps_factor_at_one(self) -> None:
+        world, solver = self._make_channel(slope=1.0)
+        solver.set_boundaries(world.terrain, {})
+        solver.set_environment(15.0, {"positions": [], "radii": [], "cooling": []})
+        np.testing.assert_array_equal(solver._temperature_factor, np.ones_like(solver._temperature_factor))
+
+    def test_shade_raises_local_temperature_factor_above_one(self) -> None:
+        world, solver = self._make_channel(slope=1.0)
+        solver.set_boundaries(world.terrain, {})
+        shade = {"positions": [[0.0, 0.0, 0.0]], "radii": [4.0], "cooling": [3.0]}
+        solver.set_environment(15.0, shade)
+        center = solver._temperature_factor.shape[0] // 2
+        self.assertGreater(float(solver._temperature_factor[center, center]), 1.0)
+        # far from the tree, no effect
+        self.assertEqual(float(solver._temperature_factor[5, 5]), 1.0)
+
+    def test_temperature_factor_is_clamped(self) -> None:
+        world, solver = self._make_channel(slope=1.0)
+        solver.set_boundaries(world.terrain, {})
+        shade = {"positions": [[0.0, 0.0, 0.0]], "radii": [10.0], "cooling": [500.0]}
+        solver.set_environment(15.0, shade)
+        self.assertLessEqual(float(solver._temperature_factor.max()), config.TEMP_FACTOR_MAX)
+
+    def test_shade_changes_downstream_flow_and_sediment_river_a_vs_b(self) -> None:
+        """The actual A/B comparison the project's own methodology calls
+        for: same channel, same starting conditions, only shade differs."""
+        def run(with_shade: bool) -> tuple[np.ndarray, float]:
+            world, solver = self._make_channel(slope=3.0)
+            shade = ({"positions": [[-10.0, 0.0, 0.0]], "radii": [4.0], "cooling": [3.0]}
+                     if with_shade else {"positions": [], "radii": [], "cooling": []})
+            for _ in range(300):
+                solver.set_boundaries(world.terrain, {})
+                solver.set_environment(15.0, shade)
+                solver.advance(1 / 60, 8, 1 / 120)
+            return solver._depth.copy(), float(solver.get_sediment_grid().sum())
+
+        depth_a, sediment_a = run(with_shade=False)
+        depth_b, sediment_b = run(with_shade=True)
+        self.assertFalse(np.allclose(depth_a, depth_b))
+        self.assertNotEqual(sediment_a, sediment_b)
+
+    def test_shade_snapshot_only_includes_shade_casting_bodies(self) -> None:
+        world = WorldState()
+        world.add_object("BOX", [0.0, 0.0, 0.0])
+        world.add_object("TREE", [5.0, 0.0, 0.0])
+        rigid = ForceRigidBodySystem()
+        rigid.initialize(world, fluid=None, events=EventLog())
+        shade = rigid.shade_snapshot()
+        self.assertEqual(len(shade["positions"]), 1)
+        self.assertAlmostEqual(float(shade["positions"][0][0]), 5.0)
 
 
 class ForceRigidBodyTests(unittest.TestCase):

@@ -122,6 +122,9 @@ async def _dispatch(ws: WebSocket, msg: dict) -> dict | None:
         if op == "water_level":
             manager.apply_water_level(msg["level"])
             return {"type": "ack", "op": op}
+        if op == "environment_temperature":
+            manager.apply_environment_temperature(msg["temperature"])
+            return {"type": "ack", "op": op}
         if op == "start":
             manager.start()
             return {"type": "ack", "op": op, "status": manager.status}

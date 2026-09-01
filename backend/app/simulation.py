@@ -129,6 +129,16 @@ class SimulationManager:
     def apply_water_level(self, level: float) -> None:
         self.world.water.level = finite_number(level, "water.level")
 
+    def apply_environment_temperature(self, value: float) -> None:
+        """Baseline water temperature (v0.4 RiverLab, Schauberger hypothesis).
+
+        Read live each tick by ShallowWaterFluidSolver.set_environment() --
+        no re-init needed, unlike water_level which only takes effect at
+        start()/reset() (see docs/04_TZ_v0.3_roadmap.md v0.4 "честные
+        нюансы" for that separate, still-open gap).
+        """
+        self.world.environment.temperature = finite_number(value, "environment.temperature")
+
     # ------------------------------------------------------------------ clock control
     def start(self) -> None:
         if self.status == self.RUNNING:
@@ -201,6 +211,7 @@ class SimulationManager:
         dt = config.FIXED_DT
         self.engine.step_particles(dt)
         self.fluid.set_boundaries(self.world.terrain, self.rigid.obstacle_snapshot())
+        self.fluid.set_environment(self.world.environment.temperature, self.rigid.shade_snapshot())
         self.fluid.advance(dt, config.FLUID_MAX_SUBSTEPS, config.FLUID_STABILITY_DT)
         samples = self.fluid.sample_for_bodies(self.rigid.buffer.positions,
                                                self.rigid.buffer.footprint_radii)

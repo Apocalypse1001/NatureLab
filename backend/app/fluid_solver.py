@@ -12,6 +12,7 @@ from . import config
 class FluidSolver:
     def initialize(self, world) -> None: ...
     def set_boundaries(self, terrain, obstacles: dict) -> None: ...
+    def set_environment(self, base_temperature: float, shade: dict) -> None: ...
     def advance(self, global_dt: float, max_substeps: int, stability_dt: float) -> int: ...
     def sample_for_bodies(self, positions: np.ndarray, radii: Optional[np.ndarray] = None) -> dict: ...
     def reset(self) -> None: ...
@@ -138,6 +139,13 @@ class ShallowWaterFluidSolver(FluidSolver):
         self._flow_z: np.ndarray = np.zeros((1, 1), dtype=np.float32)
         self._sediment: np.ndarray = np.zeros((1, 1), dtype=np.float32)
         self._obstacle_mask: np.ndarray = np.zeros((1, 1), dtype=bool)
+        # per-cell multiplier on flow gain / sediment capacity from local
+        # shade cooling (v0.4, Schauberger hypothesis) -- recomputed each
+        # tick from current tree positions in _update_temperature_factor,
+        # deliberately NOT a persistent/diffusing field. Stays 1.0 (no
+        # effect) wherever nothing casts shade; broadcasts safely against
+        # the real grid shape even before set_environment() is ever called.
+        self._temperature_factor: np.ndarray = np.ones((1, 1), dtype=np.float32)
         self._time = 0.0
         self.last_substeps = 0
 
@@ -152,6 +160,7 @@ class ShallowWaterFluidSolver(FluidSolver):
         self._flow_z = np.zeros(shape, dtype=np.float32)
         self._sediment = np.zeros(shape, dtype=np.float32)
         self._obstacle_mask = np.zeros(shape, dtype=bool)
+        self._temperature_factor = np.ones(shape, dtype=np.float32)
         self._time = 0.0
 
     def set_boundaries(self, terrain, obstacles: dict) -> None:
@@ -160,8 +169,48 @@ class ShallowWaterFluidSolver(FluidSolver):
             # terrain resized (e.g. loaded world) -> reinitialise the field flat
             self._depth = np.zeros(terrain.heights.shape, dtype=np.float32)
             self._sediment = np.zeros(terrain.heights.shape, dtype=np.float32)
+            self._temperature_factor = np.ones(terrain.heights.shape, dtype=np.float32)
         self._obstacle_mask = self._rasterize_obstacles(terrain, obstacles)
         self._depth[self._obstacle_mask] = 0.0
+
+    def set_environment(self, base_temperature: float, shade: dict) -> None:
+        """Recompute the per-cell flow/capacity multiplier from tree shade.
+
+        v0.4 RiverLab, Schauberger hypothesis (docs/04_TZ_v0.3_roadmap.md
+        v0.4): shade cools water locally, which we treat as increasing both
+        flow energy and sediment carrying capacity -- see
+        docs/01_vision.md "Viktor Schauberger Lab": implemented as a
+        testable, comparable effect, not asserted as physically correct.
+        Stateless by design (see __init__ note) -- recomputed fresh from
+        `shade` (RigidBodySystem.shade_snapshot()) every call, no memory of
+        previous ticks.
+        """
+        if self._terrain is None:
+            return
+        shape = self._terrain.heights.shape
+        positions = shade.get("positions") if shade else None
+        if positions is None or len(positions) == 0:
+            self._temperature_factor = np.ones(shape, dtype=np.float32)
+            return
+        radii = shade.get("radii", [])
+        coolings = shade.get("cooling", [])
+        cell = self._terrain.cell_size
+        ny, nx = shape
+        yy, xx = np.mgrid[0:ny, 0:nx]
+        local_cooling = np.zeros(shape, dtype=np.float32)
+        for pos, radius, strength in zip(positions, radii, coolings):
+            if radius <= 0.0 or strength <= 0.0:
+                continue
+            gx = float(pos[0]) / cell + self._terrain.width / 2
+            gz = float(pos[2]) / cell + self._terrain.height / 2
+            r_cells = max(1.0, float(radius) / cell)
+            dist = np.sqrt((xx - gx) ** 2 + (yy - gz) ** 2)
+            # full cooling strength at the trunk, fading to 0 at the canopy edge
+            falloff = np.clip(1.0 - dist / r_cells, 0.0, 1.0)
+            local_cooling = np.maximum(local_cooling, float(strength) * falloff)
+        factor = 1.0 + config.TEMP_EFFECT_PER_DEGREE_C * local_cooling
+        self._temperature_factor = np.clip(
+            factor, config.TEMP_FACTOR_MIN, config.TEMP_FACTOR_MAX).astype(np.float32)
 
     def _rasterize_obstacles(self, terrain, obstacles: dict) -> np.ndarray:
         mask = np.zeros(terrain.heights.shape, dtype=bool)
@@ -203,7 +252,9 @@ class ShallowWaterFluidSolver(FluidSolver):
         h_down = padded[2:, 1:-1]
         h_up = padded[:-2, 1:-1]
 
-        gain = config.FLUID_FLOW_GAIN
+        # per-cell temperature multiplier (v0.4, Schauberger shade hypothesis
+        # -- see set_environment); stays 1.0 (no effect) with no shade nearby
+        gain = config.FLUID_FLOW_GAIN * self._temperature_factor
         flow_right = np.maximum(0.0, total - h_right) * gain
         flow_left = np.maximum(0.0, total - h_left) * gain
         flow_down = np.maximum(0.0, total - h_down) * gain
@@ -249,7 +300,9 @@ class ShallowWaterFluidSolver(FluidSolver):
         flood event -- see the config module docstring for why.
         """
         speed = np.sqrt((flow_right - flow_left) ** 2 + (flow_down - flow_up) ** 2)
-        capacity = config.SEDIMENT_CAPACITY_SCALE * speed * old_depth
+        # colder water (shade) carries more/heavier sediment per Schauberger
+        # -- same self._temperature_factor as the flow gain above
+        capacity = config.SEDIMENT_CAPACITY_SCALE * self._temperature_factor * speed * old_depth
         sediment = self._sediment
         diff = capacity - sediment
 

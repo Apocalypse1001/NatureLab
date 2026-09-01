@@ -79,6 +79,7 @@ const ui = new UI(uiHost, {
     sceneManager.setWater(v, store.waterVisible);
     net.send({ op: 'water_level', level: v });
   },
+  setTemperature: (v) => net.send({ op: 'environment_temperature', temperature: v }),
   setTool: (tool) => editor.setTool(tool),
   setBrush: (radius, strength) => {
     editor.brushRadius = radius;

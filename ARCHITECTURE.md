@@ -93,6 +93,17 @@ v0.4: `terrain.heights` может также меняться физическ�
 одного паводка; должна быть заметна на длинных RiverLab-сравнениях (River A vs River B), не
 искажать короткие FloodLab-сценарии.
 
+## Water temperature / shade (RiverLab, v0.4, Schauberger hypothesis)
+
+`ShallowWaterFluidSolver.set_environment(base_temperature, shade)` пересчитывает
+`_temperature_factor` **каждый tick заново** из `RigidBodySystem.shade_snapshot()` (позиции тел
+с `shade_cooling > 0`, по умолчанию только TREE) — намеренно **не** персистентное/диффундирующее
+поле (решение пользователя 2026-09-01, после разбора первоисточников Шаубергера про тень/русло —
+см. `docs/04_TZ_v0.3_roadmap.md` v0.4). Множитель применяется и к `FLUID_FLOW_GAIN`, и к
+`SEDIMENT_CAPACITY_SCALE`, clamp `[TEMP_FACTOR_MIN, TEMP_FACTOR_MAX]`. `environment.temperature`
+— ручная база (UI-слайдер + op `environment_temperature`), тень — модулирует её локально
+автоматически из позиций деревьев, без ручной покраски.
+
 ## Bulk protocol v2
 
 Header (16 bytes): `NL | version:u8 | kind:u8 | count:u32 | time_ms:u64`.
