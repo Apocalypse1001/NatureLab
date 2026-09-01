@@ -28,3 +28,9 @@ PARTICLE_COUNT = 100_000
 VISUALIZATION_PARTICLE_LIMIT = 25_000
 FLUID_MAX_SUBSTEPS = 8
 FLUID_STABILITY_DT = 1.0 / 120.0
+
+# Shallow-water solver (v0.3): outflow-limited height-field method (Mei/Decaudin/Hu
+# "virtual pipes" style). See docs/04_TZ_v0.3_roadmap.md, milestone v0.3.
+FLUID_FLOW_GAIN = 1.6          # outflow rate per meter of height difference (1/s)
+FLUID_OBSTACLE_RADIUS_M = 1.2  # placeholder footprint until object scale is wired in
+FLUID_MIN_DEPTH = 1e-4         # below this, a cell is treated as dry

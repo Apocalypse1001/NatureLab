@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from app import protocol  # noqa: E402
+from app.fluid_solver import ShallowWaterFluidSolver  # noqa: E402
 from app.simulation import SimulationManager  # noqa: E402
 from app.world_state import WorldState  # noqa: E402
 
@@ -92,6 +93,79 @@ class Foundation02Tests(unittest.IsolatedAsyncioTestCase):
         corrupt[3] = 255
         with self.assertRaises(ValueError):
             protocol.decode_frame(bytes(corrupt))
+
+
+class ShallowWaterSolverTests(unittest.TestCase):
+    """v0.3: real FluidSolver replacing the flat-level placeholder.
+
+    See docs/04_TZ_v0.3_roadmap.md milestone v0.3. These assert the causal
+    quality bar from docs/01_vision.md ("Главный критерий качества"): moving
+    an obstacle must change where the water goes, water must not appear from
+    nowhere, and it must not exist inside solid objects.
+    """
+
+    @staticmethod
+    def _make_world(slope: float) -> WorldState:
+        world = WorldState()
+        w, h = world.terrain.width, world.terrain.height
+        xs = np.linspace(0.0, slope, w + 1, dtype=np.float32)
+        world.terrain.heights[:, :] = np.tile(xs, (h + 1, 1))
+        world.water.level = 1.0
+        return world
+
+    def test_conservation_no_water_from_nowhere(self) -> None:
+        world = self._make_world(slope=2.0)
+        solver = ShallowWaterFluidSolver()
+        solver.initialize(world)
+        solver.set_boundaries(world.terrain, {})
+        start_volume = solver.total_volume()
+        for _ in range(30):
+            solver.advance(1 / 60, 8, 1 / 120)
+        self.assertAlmostEqual(solver.total_volume(), start_volume,
+                                delta=max(1e-6, start_volume * 1e-3))
+
+    def test_no_negative_and_no_phantom_water_in_obstacle(self) -> None:
+        world = self._make_world(slope=3.0)
+        solver = ShallowWaterFluidSolver()
+        solver.initialize(world)
+        obstacle = {"positions": [[0.0, 0.0, 0.0]]}
+        for _ in range(40):
+            solver.set_boundaries(world.terrain, obstacle)
+            solver.advance(1 / 60, 8, 1 / 120)
+            self.assertGreaterEqual(float(solver._depth.min()), 0.0)
+            self.assertTrue(bool((solver._depth[solver._obstacle_mask] == 0).all()))
+
+    def test_moving_obstacle_changes_flow(self) -> None:
+        def run(obstacle_positions: list) -> np.ndarray:
+            world = self._make_world(slope=2.5)
+            solver = ShallowWaterFluidSolver()
+            solver.initialize(world)
+            for _ in range(50):
+                solver.set_boundaries(world.terrain,
+                                      {"positions": obstacle_positions} if obstacle_positions else {})
+                solver.advance(1 / 60, 8, 1 / 120)
+            return solver._depth.copy()
+
+        # Obstacle positions must sit in terrain that is actually wet at t=0
+        # (terrain height < water level) or a short run never reaches them.
+        depth_no_obstacle = run([])
+        depth_with_obstacle = run([[-30.0, 0.0, 0.0]])
+        depth_moved_obstacle = run([[-45.0, 0.0, 0.0]])
+
+        self.assertFalse(np.allclose(depth_no_obstacle, depth_with_obstacle))
+        self.assertFalse(np.allclose(depth_with_obstacle, depth_moved_obstacle))
+
+    def test_body_senses_water_around_its_own_footprint(self) -> None:
+        """A registered body carves a dry hole at its own position (no phantom
+        water inside a solid). sample_for_bodies must not sample exactly that
+        hole, or a body could never sense water depth to float."""
+        world = self._make_world(slope=0.0)  # flat terrain, uniform depth
+        solver = ShallowWaterFluidSolver()
+        solver.initialize(world)
+        position = np.array([[0.0, 0.0, 0.0]])
+        solver.set_boundaries(world.terrain, {"positions": position})
+        samples = solver.sample_for_bodies(position)
+        self.assertGreater(float(samples["depths"][0]), 0.5)
 
 
 if __name__ == "__main__":

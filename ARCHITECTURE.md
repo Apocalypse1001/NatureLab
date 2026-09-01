@@ -39,7 +39,10 @@ Placeholder использует batched masks; будущий Warp solver см�
 4. Fluid batch-sample возвращает depths, velocities и forces для body positions.
 5. Rigid применяет samples к плотным массивам.
 
-Это только контракт; FloodSolver намеренно не реализован.
+v0.3: `ShallowWaterFluidSolver` реализует этот контракт (height field на сетке terrain,
+outflow-limited обмен, obstacle mask из `obstacle_snapshot()`). Полноценный
+CFD/Navier-Stokes-уровень намеренно не реализован — см. `docs/04_TZ_v0.3_roadmap.md`, раздел 3
+(причинный реализм — цель, инженерный CFD-реализм — не цель проекта).
 
 ## Terrain consistency
 

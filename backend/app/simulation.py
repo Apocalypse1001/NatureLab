@@ -13,7 +13,7 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional
 from . import config, protocol
 from .compute_engine import ComputeEngine, create_engine
 from .events import EventLog, EventType
-from .fluid_solver import FluidSolver, PlaceholderFluidSolver
+from .fluid_solver import FluidSolver, ShallowWaterFluidSolver
 from .persistence import load_world, save_world
 from .rigid_body import PlaceholderRigidBodySystem, RigidBodySystem
 from .world_state import WorldState, finite_number, vector3
@@ -29,7 +29,7 @@ class SimulationManager:
         self.world = WorldState()
         self.initial: Optional[WorldState] = None
         self.engine: ComputeEngine = create_engine()
-        self.fluid: FluidSolver = PlaceholderFluidSolver()
+        self.fluid: FluidSolver = ShallowWaterFluidSolver()
         self.rigid: RigidBodySystem = PlaceholderRigidBodySystem()
         self.events = EventLog()
         self.status = self.IDLE

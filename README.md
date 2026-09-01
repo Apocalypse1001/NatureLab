@@ -111,9 +111,25 @@ NatureLab/
 На тестовой машине CUDA-драйвер отсутствует, поэтому настоящий Warp kernel выполнялся
 на устройстве `cpu`. На RTX 5090 автоматически выбирается `cuda:0`.
 
+## v0.3: реальный FluidSolver
+
+`ShallowWaterFluidSolver` (`backend/app/fluid_solver.py`) заменил плоский water-level
+placeholder: height-field воды на сетке terrain, outflow-limited обмен с соседями (conservation
+гарантирован клампингом, а не допущением), препятствия реально исключают воду из своих клеток и
+меняют направление потока. Регрессионные тесты — `tests/test_backend.py::ShallowWaterSolverTests`:
+conservation, отсутствие phantom water внутри объектов, обязательное изменение потока при
+перемещении препятствия (причинный критерий из `docs/01_vision.md`).
+
+Важно: этот solver работает на NumPy/CPU **всегда**, независимо от того, выбран `cuda:0` или
+`cpu` в `ComputeEngine` (тот отвечает только за визуализационные частицы). GPU/Warp-порт этого
+же алгоритма для больших сеток — отдельный будущий пункт (`REQUIRES GPU VERIFICATION` для
+производительности на RTX 5090), не сделан в этом коммите.
+
 ## Placeholder (намеренно)
 
-- Вода — плоский уровень, не FloodSolver/CFD.
-- Rigid body — batched deterministic placeholder, не полноценная динамика.
-- Bulk frame kinds кроме particles подготовлены как типизированный контракт.
-- Shallow-water, эрозия, разрушение, вулканы и replay не реализованы.
+- Rigid body — batched deterministic placeholder (buoyancy threshold), не полноценная динамика
+  сил (gravity/drag/friction по отдельности) — следующий пункт v0.3, см. `docs/04_TZ_v0.3_roadmap.md`.
+- Obstacle footprint в FluidSolver — фиксированный радиус `config.FLUID_OBSTACLE_RADIUS_M`, а не
+  реальный `scale` объекта (в `RigidStateBuffer` пока нет scale).
+- Bulk frame kinds кроме particles подготовлены как типизированный контракт, но не стримятся.
+- RiverLab, VolcanoLab, эрозия, разрушение и replay не реализованы.
