@@ -59,6 +59,7 @@ class SimulationManager:
         self.obstacle_revision = 0
         self._obstacle_snapshot: Optional[dict] = None
         self._last_terrain_resync = 0.0
+        self._flooded_decks: set = set()
         self._gauges: Dict[str, GaugeRuntime] = {}
         self.selftest_result: Dict[str, Any] = {}
         try:
@@ -336,9 +337,39 @@ class SimulationManager:
         self.rigid.step(dt, self.sim_time, samples)
         self.sim_time += dt
         self._update_gauges(self.sim_time)
+        self._check_bridge_decks(self.sim_time)
         self._steps_in_window += 1
 
+    def _check_bridge_decks(self, sample_time: float) -> None:
+        """Report the moment water rises to a bridge's deck.
+
+        A bridge's piers obstruct the flow but its deck does not -- water passes
+        underneath it, which is what a bridge is for. The deck becomes relevant
+        exactly once: when the river reaches it. That is a real, observable
+        cause-and-effect moment ("the bridge went under at 41 s") and it is the
+        kind of thing docs/01_vision.md wants recorded, so it is an event rather
+        than a silently changed number.
+
+        Fires once per bridge per run, like the GAUGE arrival event, so a river
+        lapping at the deck does not spam the log.
+        """
+        for oid, obj in self.world.objects.items():
+            if obj.type != "BRIDGE" or oid in self._flooded_decks:
+                continue
+            sample = self.rigid.latest_fluid_samples.get(oid)
+            if sample is None:
+                continue
+            deck = float(obj.metadata.get("deck_height", 0.0)) * float(obj.scale[1])
+            surface = float(sample.get("surface", 0.0))
+            if deck > 0.0 and surface >= obj.position[1] + deck:
+                self._flooded_decks.add(oid)
+                self.events.record(sample_time, EventType.BRIDGE_DECK_FLOODED,
+                                   object_id=oid, cause="water_reached_deck",
+                                   deck_height_m=round(deck, 3),
+                                   water_surface_m=round(surface, 3))
+
     def _reset_gauges(self) -> None:
+        self._flooded_decks = set()
         self._gauges = {oid: GaugeRuntime()
                         for oid, obj in self.world.objects.items()
                         if obj.type == "GAUGE"}

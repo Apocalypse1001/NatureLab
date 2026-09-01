@@ -1,4 +1,4 @@
-# NatureLab 0.8.0 - Architecture
+# NatureLab 0.9.0 - Architecture
 
 Проектная документация, которая объясняет *почему* архитектура такая, живёт в `docs/`:
 [`01_vision.md`](docs/01_vision.md) (цели и критерий качества),
@@ -99,6 +99,25 @@ Whether a body is a wall or a riverbed is decided from data, not from a type nam
 everything in `SOLID_OBSTACLE_TYPES` as wall. `SimulationManager._affects_fluid_boundary()`
 uses the same rule to decide when adding, moving, scaling or deleting an object must
 bump `obstacle_revision`.
+
+## What is solid to the flow
+
+Three different answers, chosen from data rather than from a type name:
+
+```text
+HOUSE     full yaw-oriented OBB rasterized solid          -- a wall
+BRIDGE    piers only, as discs along the span             -- water passes under
+ROCK      not solid at all; raises the effective bed      -- water passes over
+```
+
+`_is_solid()` excludes anything carrying a positive `bed_height` regardless of type,
+and `SimulationManager._affects_fluid_boundary()` uses the same rule to decide when a
+world edit must bump `obstacle_revision`. Adding a fourth kind means adding a branch in
+`_build_obstacle_mask` and nothing else.
+
+A bridge's `deck_height` is deliberately NOT part of the mask. It exists only to answer
+"has the river reached the deck yet", which is reported once per run as a
+`BRIDGE_DECK_FLOODED` event.
 
 ## Water sources, sinks and boundaries (v0.8.0)
 

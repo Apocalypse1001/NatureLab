@@ -1024,5 +1024,159 @@ class WaterControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.manager.world.water.outflow_enabled)
 
 
+class BridgeAndPeopleTests(unittest.IsolatedAsyncioTestCase):
+    """v0.9.0: a bridge whose piers obstruct but whose deck does not, and people
+    light enough that moving water actually carries them off."""
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+        self.manager.attach(self._text, self._binary)
+        self.text_frames: list[str] = []
+        self.binary_frames: list[bytes] = []
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    async def _text(self, value: str) -> None:
+        self.text_frames.append(value)
+
+    async def _binary(self, value: bytes) -> None:
+        self.binary_frames.append(value)
+
+    def _run(self, steps: int) -> None:
+        for _ in range(steps):
+            self.manager._step_once()
+
+    def _field(self, name: str) -> np.ndarray:
+        array = getattr(self.manager.fluid, name)
+        return np.asarray(array.numpy(), dtype=np.float32).reshape(N, N)
+
+    # --------------------------------------------------------------- bridge
+    async def test_water_flows_under_a_bridge_but_around_its_piers(self) -> None:
+        """The single design decision this whole feature rests on: a bridge is
+        not a wall. Rasterizing the deck would dam the river the bridge spans,
+        which is the opposite of what a bridge does."""
+        self.manager.apply_object_add({"type": "BRIDGE", "position": [x_at(40), 0.0, 0.0]})
+        self.manager.apply_water_level(1.5)
+        self.manager.start()
+        self._run(1500)
+        solid = self.manager.fluid._obstacle_host.reshape(N, N)
+        depth = self._field("_h")
+        pier_rows = sorted(set(np.nonzero(solid)[0].tolist()))
+        self.assertTrue(pier_rows, "the bridge produced no piers at all")
+        # three separate pier clusters across the span, not one solid block
+        clusters = 1 + sum(1 for a, b in zip(pier_rows, pier_rows[1:]) if b - a > 1)
+        self.assertEqual(clusters, 3, f"expected 3 piers, found {clusters}")
+        centre = col(0.0)
+        self.assertEqual(float(depth[centre, 40]), 0.0, "the centre pier is not solid")
+        self.assertGreater(float(depth[centre - 6, 40]), 0.1,
+                           "water did not pass between the piers")
+
+    async def test_bridge_piers_speed_the_flow_up_between_them(self) -> None:
+        """The educational payoff: a constriction accelerates the water. Same
+        rows, with and without the bridge."""
+        def speed(with_bridge: bool) -> float:
+            manager = SimulationManager()
+            if with_bridge:
+                manager.apply_object_add({"type": "BRIDGE", "position": [x_at(40), 0.0, 0.0]})
+            manager.apply_water_level(1.5)
+            manager.start()
+            for _ in range(1500):
+                manager._step_once()
+            u = np.asarray(manager.fluid._u.numpy(), dtype=np.float32).reshape(N, N)
+            centre = col(0.0)
+            out = float(np.abs(u[centre - 8:centre - 3, 40]).mean())
+            manager.stop()
+            return out
+        self.assertGreater(speed(True), speed(False) * 1.2,
+                           "the piers did not constrict the channel")
+
+    async def test_a_flooded_deck_is_reported_once_and_only_when_reached(self) -> None:
+        """A deck matters exactly once -- when the river reaches it. That is a
+        real cause-and-effect moment, so it is an event, not a silent number."""
+        def events_for(deck_height: float) -> list:
+            manager = SimulationManager()
+            bridge = manager.apply_object_add(
+                {"type": "BRIDGE", "position": [x_at(40), 0.0, 0.0]})
+            manager.apply_object_update(bridge["id"],
+                                        {"metadata": {"deck_height": deck_height}})
+            manager.apply_water_level(2.5)
+            manager.start()
+            found = []
+            for _ in range(1800):
+                manager._step_once()
+                found += [e for e in manager.events.take_pending()
+                          if e["type"] == "BRIDGE_DECK_FLOODED"]
+            manager.stop()
+            return found
+
+        low = events_for(0.6)
+        high = events_for(6.0)
+        self.assertEqual(len(low), 1, f"expected exactly one flooding event, got {len(low)}")
+        self.assertGreater(low[0]["parameters"]["water_surface_m"], 0.6)
+        self.assertEqual(high, [], "a deck well above the water was reported flooded")
+
+    # --------------------------------------------------------------- people
+    async def test_moving_water_carries_a_person_away(self) -> None:
+        """Light, tall for its footprint and draggy -- which is why a river moves
+        a person so easily. That is the lesson, and it has to be physics."""
+        person = self.manager.apply_object_add(
+            {"type": "PERSON", "position": [x_at(20), 0.0, 3.0]})
+        self.manager.apply_water_level(1.5)
+        self.manager.start()
+        start_x = self.manager.world.objects[person["id"]].position[0]
+        self._run(1200)
+        moved = self.manager.world.objects[person["id"]]
+        self.assertGreater(moved.position[0], start_x + 2.0,
+                           "the person was not carried downstream")
+        self.assertIn(moved.state, {"MOVING", "FLOATING", "SETTLED"})
+
+    async def test_a_person_moves_before_a_car_does(self) -> None:
+        """Causal ordering by mass and drag: identical water, the light body
+        goes first. Same shape of test as the existing BOX-before-CAR one."""
+        self.manager.apply_object_add({"type": "PERSON", "position": [x_at(20), 0.0, 6.0]})
+        self.manager.apply_object_add({"type": "CAR", "position": [x_at(20), 0.0, -6.0]})
+        self.manager.apply_water_level(1.2)
+        self.manager.start()
+        person = next(o for o in self.manager.world.objects.values() if o.type == "PERSON")
+        car = next(o for o in self.manager.world.objects.values() if o.type == "CAR")
+        person_start, car_start = person.position[0], car.position[0]
+        person_moved_at = car_moved_at = None
+        for _ in range(1800):
+            self.manager._step_once()
+            if person_moved_at is None and person.position[0] > person_start + 0.5:
+                person_moved_at = self.manager.sim_time
+            if car_moved_at is None and car.position[0] > car_start + 0.5:
+                car_moved_at = self.manager.sim_time
+        self.assertIsNotNone(person_moved_at, "the person never moved at all")
+        if car_moved_at is not None:
+            self.assertLess(person_moved_at, car_moved_at,
+                            "the car moved before the person")
+
+    async def test_a_person_on_dry_ground_stays_put(self) -> None:
+        """The control: no water, no motion. Without this, "the person moved"
+        proves nothing about the water."""
+        person = self.manager.apply_object_add(
+            {"type": "PERSON", "position": [x_at(180), 0.0, 0.0]})
+        self.manager.apply_water_level(0.0)
+        self.manager.start()
+        self._run(900)
+        moved = self.manager.world.objects[person["id"]]
+        self.assertEqual(moved.state, "INTACT")
+        self.assertAlmostEqual(moved.position[0], x_at(180), places=3)
+
+    async def test_bridge_and_person_survive_a_save_load_round_trip(self) -> None:
+        self.manager.apply_object_add({"type": "BRIDGE", "position": [x_at(60), 0.0, 0.0]})
+        self.manager.apply_object_add({"type": "PERSON", "position": [x_at(70), 0.0, 2.0]})
+        self.manager.save("bridgetest")
+        self.manager.load("bridgetest")
+        bridge = next(o for o in self.manager.world.objects.values() if o.type == "BRIDGE")
+        person = next(o for o in self.manager.world.objects.values() if o.type == "PERSON")
+        self.assertGreater(float(bridge.metadata["pier_count"]), 0.0)
+        self.assertGreater(float(bridge.metadata["deck_height"]), 0.0)
+        self.assertAlmostEqual(person.mass, 70.0, places=1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -607,12 +607,24 @@ if WARP_IMPORTED:
 # Body types that act as solid walls for the flow. A body carrying a positive
 # `bed_height` is riverbed instead and is excluded regardless of this set --
 # see WarpShallowWaterSolver._is_solid.
-SOLID_OBSTACLE_TYPES = frozenset({"HOUSE"})
+SOLID_OBSTACLE_TYPES = frozenset({"HOUSE", "BRIDGE"})
+
+# A BRIDGE is not a wall: water flows UNDER it. Only its piers obstruct, and
+# only up to the deck. The deck itself is drawn and is what the water is
+# compared against for the flooded-deck event, but it never enters the mask --
+# a bridge rasterized as a solid block would dam the river it spans, which is
+# the opposite of what a bridge does.
+BRIDGE_PIER_TYPES = frozenset({"BRIDGE"})
 
 # A ROCK of scale 1 raises the bed over this radius, in metres. Matches the
 # radius of the ROCK mesh in frontend/src/world/ObjectFactory.ts so what the
 # user sees is what the water feels.
 ROCK_BASE_RADIUS_M = 1.5
+
+# Length of a BRIDGE of scale 1, across the channel. Matches the deck mesh in
+# frontend/src/world/ObjectFactory.ts so the piers the water feels line up with
+# the piers the user sees.
+BRIDGE_SPAN_M = 24.0
 
 
 class FluidSolver:
@@ -793,12 +805,20 @@ class WarpShallowWaterSolver(FluidSolver):
         scales = obstacles.get("scales", [])
         types = obstacles.get("types", [])
         bed_heights = obstacles.get("bed_heights", [])
+        piers = obstacles.get("pier_counts", [])
+        pier_radii = obstacles.get("pier_radii", [])
         for n, position in enumerate(positions):
             if n >= len(types) or not self._is_solid(types[n], bed_heights, n):
                 continue
             scale = scales[n] if n < len(scales) else [1.0, 1.0, 1.0]
             yaw = float(rotations[n][1]) if n < len(rotations) else 0.0
             cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+            if types[n] in BRIDGE_PIER_TYPES:
+                self._rasterize_piers(mask, terrain, position, scale,
+                                      cos_yaw, sin_yaw,
+                                      piers[n] if n < len(piers) else 0.0,
+                                      pier_radii[n] if n < len(pier_radii) else 0.0)
+                continue
             half_x = 2.0 * float(scale[0])
             half_z = 2.0 * float(scale[2])
             bound_x = abs(cos_yaw) * half_x + abs(sin_yaw) * half_z
@@ -878,6 +898,41 @@ class WarpShallowWaterSolver(FluidSolver):
         wp.launch(_combine_bed, dim=self._count,
                   inputs=[self._bed_terrain, self._bed_offset, self._bed],
                   device=self.device)
+
+    def _rasterize_piers(self, mask: np.ndarray, terrain, position, scale,
+                         cos_yaw: float, sin_yaw: float,
+                         pier_count: float, pier_radius: float) -> None:
+        """Solid discs for a bridge's piers, spaced evenly across its span.
+
+        Only the piers obstruct. The deck is not rasterized at all, so water
+        passes under the bridge, which is the entire point of building one --
+        and it gives the real educational payoff: the piers constrict the
+        channel, the flow speeds up between them, and debris piles against them.
+        """
+        count = int(round(pier_count))
+        radius = float(pier_radius) * float(scale[0])
+        if count <= 0 or radius <= 0.0:
+            return
+        span = BRIDGE_SPAN_M * float(scale[2])
+        centre_x, centre_z = float(position[0]), float(position[2])
+        cell = terrain.cell_size
+        for index in range(count):
+            # evenly spaced along the bridge's local z axis, ends included
+            t = 0.5 if count == 1 else index / float(count - 1)
+            offset = (t - 0.5) * span
+            px = centre_x + sin_yaw * offset
+            pz = centre_z + cos_yaw * offset
+            gx = px / cell + terrain.width / 2
+            gz = pz / cell + terrain.height / 2
+            r_cells = max(1.0, radius / cell)
+            lo_i = max(1, int(math.floor(gx - r_cells)))
+            hi_i = min(self._width - 2, int(math.ceil(gx + r_cells)))
+            lo_j = max(1, int(math.floor(gz - r_cells)))
+            hi_j = min(self._height - 2, int(math.ceil(gz + r_cells)))
+            for row in range(lo_j, hi_j + 1):
+                for column in range(lo_i, hi_i + 1):
+                    if (column - gx) ** 2 + (row - gz) ** 2 <= r_cells ** 2:
+                        mask[row * self._width + column] = 1
 
     def _remap_obstacles(self, new_mask: np.ndarray) -> None:
         h, u, v = self._host_fields()

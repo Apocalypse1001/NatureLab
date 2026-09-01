@@ -44,6 +44,8 @@ class ObjectType(str, enum.Enum):
     BOX = "BOX"
     DEBRIS = "DEBRIS"
     ROCK = "ROCK"
+    BRIDGE = "BRIDGE"
+    PERSON = "PERSON"
     SOURCE = "SOURCE"
     DRAIN = "DRAIN"
     GAUGE = "GAUGE"
@@ -108,6 +110,23 @@ OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
                        "ground_contact_area": 3.0, "cross_sectional_area": 1.5,
                        "is_static": True, "bed_height": 0.8,
                        "foundation_height": 0.0, "damage_resistance": 1.0},
+    # Piers obstruct, deck does not: water flows under a bridge until it rises
+    # to `deck_height`, at which point the deck is reported as flooded. Heavy and
+    # static -- a bridge is not swept away in this version, it is an obstacle
+    # whose piers constrict the channel.
+    ObjectType.BRIDGE: {"mass": 60000.0, "friction": 0.9, "buoyancy": 0.0,
+                        "volume_m3": 40.0, "drag_coefficient": 1.4,
+                        "ground_contact_area": 24.0, "cross_sectional_area": 18.0,
+                        "is_static": True, "pier_count": 3.0, "pier_radius": 0.9,
+                        "deck_height": 3.2,
+                        "foundation_height": 0.0, "damage_resistance": 0.9},
+    # A person. Light, tall for its footprint and draggy -- which is exactly why
+    # flowing water moves one so easily, and that is the lesson.
+    ObjectType.PERSON: {"mass": 70.0, "friction": 0.5, "buoyancy": 1.0,
+                        "volume_m3": 0.07, "drag_coefficient": 1.1,
+                        "ground_contact_area": 0.06, "cross_sectional_area": 0.55,
+                        "is_static": False,
+                        "foundation_height": 0.0, "damage_resistance": 0.15},
     # Placeable inflow. Holds water at `inflow_level` inside `inflow_radius`,
     # using the same rule as the map-edge inflow (h = max(0, level - bed)), so a
     # source on a hillside fills to the height asked for instead of drowning the
@@ -152,6 +171,7 @@ def default_properties(obj_type: str) -> Dict[str, float]:
             "ground_contact_area": 0.5, "cross_sectional_area": 0.5,
             "is_static": False, "bed_height": 0.0,
             "inflow_level": 0.0, "inflow_radius": 0.0,
+            "pier_count": 0.0, "pier_radius": 0.0, "deck_height": 0.0,
             "drain_radius": 0.0, "drain_strength": 0.0,
             "foundation_height": 0.0, "damage_resistance": 0.5}
     base.update(OBJECT_DEFAULTS.get(ObjectType.register(obj_type), {}))

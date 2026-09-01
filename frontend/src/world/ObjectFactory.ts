@@ -82,6 +82,55 @@ const builders: Record<string, () => THREE.Group> = {
     g.add(rock);
     return g;
   },
+  BRIDGE: () => {
+    // Deck plus three piers, 24 m across -- the span and pier spacing match
+    // fluid_solver.BRIDGE_SPAN_M and the pier rasterization, so the piers the
+    // water is diverted by are the piers the user can see. Only the piers are
+    // solid to the flow; the deck is drawn but never rasterized, because a
+    // bridge that dams its own river is not a bridge.
+    const g = new THREE.Group();
+    const stone = new THREE.MeshStandardMaterial({
+      color: OBJECT_COLORS.BRIDGE, roughness: 0.9,
+    });
+    const deck = new THREE.Mesh(new THREE.BoxGeometry(5, 0.5, 24), stone);
+    deck.position.y = 3.2;
+    g.add(deck);
+    for (const rail of [-2.2, 2.2]) {
+      const bar = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.9, 24), stone);
+      bar.position.set(rail, 3.9, 0);
+      g.add(bar);
+    }
+    for (const z of [-12, 0, 12]) {
+      const pier = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.9, 1.1, 3.2, 12), stone);
+      pier.position.set(0, 1.6, z);
+      g.add(pier);
+    }
+    return g;
+  },
+  PERSON: () => {
+    // A blocky, Lego-style figure at human scale (about 1.7 m). Light, tall for
+    // its footprint and draggy, which is exactly why moving water carries one
+    // off so readily -- that is the lesson, not the model.
+    const g = new THREE.Group();
+    const body = new THREE.MeshStandardMaterial({ color: OBJECT_COLORS.PERSON });
+    const skin = new THREE.MeshStandardMaterial({ color: 0xf6c177 });
+    const legs = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.75, 0.28), body);
+    legs.position.y = 0.38;
+    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.6, 0.32), body);
+    torso.position.y = 1.05;
+    const head = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 0.3, 12), skin);
+    head.position.y = 1.5;
+    const stud = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.08, 10), skin);
+    stud.position.y = 1.69;
+    for (const x of [-0.38, 0.38]) {
+      const arm = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.55, 0.2), body);
+      arm.position.set(x, 1.05, 0);
+      g.add(arm);
+    }
+    g.add(legs, torso, head, stud);
+    return g;
+  },
   SOURCE: () => {
     // Where the water comes from. Drawn as an open ring with an arrow pointing
     // downstream, at the radius the solver actually uses for the inflow disc --
@@ -162,5 +211,5 @@ export function applyTransform(group: THREE.Group, obj: ObjectData): void {
 /** Approximate half-heights for placing objects on the selected tool. */
 export function objectHalfSize(type: string): number {
   return { HOUSE: 0, CAR: 0, TREE: 0, BOX: 0, DEBRIS: 0, ROCK: 0,
-           SOURCE: 0, DRAIN: 0, GAUGE: 0 }[type] ?? 0;
+           BRIDGE: 0, PERSON: 0, SOURCE: 0, DRAIN: 0, GAUGE: 0 }[type] ?? 0;
 }

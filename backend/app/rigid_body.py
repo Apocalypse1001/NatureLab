@@ -213,6 +213,10 @@ class PlaceholderRigidBodySystem(RigidBodySystem):
                 "types": [obj.type for obj in objects],
                 "bed_heights": [float(obj.metadata.get("bed_height", 0.0))
                                 for obj in objects],
+                "pier_counts": [float(obj.metadata.get("pier_count", 0.0))
+                                for obj in objects],
+                "pier_radii": [float(obj.metadata.get("pier_radius", 0.0))
+                               for obj in objects],
                  "scales": self.buffer.scales.copy()}
 
     def _resolve_collisions(self, dynamic: np.ndarray) -> None:
