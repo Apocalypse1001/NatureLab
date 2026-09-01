@@ -19,3 +19,6 @@ data/*.json
 # os
 .DS_Store
 Thumbs.db
+
+# agent driver screenshots (run artifacts, see .claude/skills/run-naturelab/)
+.claude/skills/run-naturelab/shots/
