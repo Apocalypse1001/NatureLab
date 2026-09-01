@@ -9,7 +9,7 @@ from pathlib import Path
 # running build always says which version it is -- the donor 0.5.0 tree carried
 # no version string anywhere, which made "which build am I looking at?"
 # answerable only by file timestamps.
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_DIR = BACKEND_DIR.parent
@@ -89,5 +89,20 @@ TERRAIN_RESYNC_INTERVAL_S = 1.0  # how often eroded terrain is re-broadcast whil
 # The dome lives in a separate array from the erodible bed, so erosion can mutate
 # the terrain under a rock while the dome itself is recomputed from live positions
 # every tick -- a rock that is moved or deleted therefore leaves no crater.
+# --------------------------------------------------- Water controls (v0.8.0)
+# Transmissive outlet on the east edge, in cells. Before this every outer face
+# was no-flux, so water that entered could never leave and the map filled
+# forever (measured: 2290 -> 3484 -> 4311 m3, never decreasing). A river running
+# off the edge of the domain is exactly this boundary condition.
+FLUID_OUTFLOW_COLUMNS = 2
+
+# A placed DRAIN removes water through a smooth radial sink and spins the flow
+# around it. The spin is NOT a constant: it comes from the ambient circulation
+# the drain measures in the annulus just outside itself, amplified as 1/r by
+# convergence -- conservation of angular momentum. A perfectly symmetric
+# approach therefore produces no rotation, which is physically right: in a
+# depth-averaged model a purely radial sink cannot manufacture spin.
+DRAIN_SWIRL_GAIN = 0.35      # how strongly measured circulation is fed back as spin
+
 BED_DOME_EXPONENT = 0.5      # 0.5 = hemispherical profile; 1.0 would be a cone
 BED_EROSION_SHIELD = 0.05    # bed offset (m) above which the terrain under a rock is unerodible

@@ -94,6 +94,24 @@ class SimulationManager:
             "fluid": self.fluid.diagnostics(),
         }
 
+    def _source_snapshot(self) -> list:
+        """(centre, radius, level) for every SOURCE currently in the world."""
+        return [(list(obj.position),
+                 float(obj.metadata.get("inflow_radius", 0.0)) * float(obj.scale[0]),
+                 float(obj.metadata.get("inflow_level", 0.0)))
+                for obj in self.world.objects.values() if obj.type == "SOURCE"]
+
+    def _drain_snapshot(self) -> list:
+        """(centre, radius, strength) for every DRAIN currently in the world."""
+        return [(list(obj.position),
+                 float(obj.metadata.get("drain_radius", 0.0)) * float(obj.scale[0]),
+                 float(obj.metadata.get("drain_strength", 0.0)))
+                for obj in self.world.objects.values() if obj.type == "DRAIN"]
+
+    def apply_water_outflow(self, enabled: bool) -> None:
+        """Open/close the downstream map edge. Read live each tick."""
+        self.world.water.outflow_enabled = bool(enabled)
+
     @staticmethod
     def _affects_fluid_boundary(obj) -> bool:
         """Does this object change what the fluid solver sees as a boundary?
@@ -296,6 +314,15 @@ class SimulationManager:
         if hasattr(self.fluid, "set_erosion"):
             # read live, so the RiverLab toggle takes effect while RUNNING
             self.fluid.set_erosion(self.world.water.erosion_enabled)
+        if hasattr(self.fluid, "set_outflow"):
+            self.fluid.set_outflow(config.FLUID_OUTFLOW_COLUMNS
+                                   if self.world.water.outflow_enabled else 0)
+        if hasattr(self.fluid, "set_water_features"):
+            # Positions are read live every tick rather than snapshotted, so a
+            # SOURCE or DRAIN can be dragged while RUNNING and the water reacts
+            # at once -- the reason they are objects and not settings.
+            self.fluid.set_water_features(self._source_snapshot(),
+                                          self._drain_snapshot())
         if self._obstacle_snapshot is None:
             self._obstacle_snapshot = self.rigid.obstacle_snapshot()
         self.fluid.set_boundaries(self.world.terrain, self._obstacle_snapshot,

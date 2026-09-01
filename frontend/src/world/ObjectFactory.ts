@@ -82,6 +82,49 @@ const builders: Record<string, () => THREE.Group> = {
     g.add(rock);
     return g;
   },
+  SOURCE: () => {
+    // Where the water comes from. Drawn as an open ring with an arrow pointing
+    // downstream, at the radius the solver actually uses for the inflow disc --
+    // the request was literally "an indication of where the water flows from",
+    // so the marker has to be the real footprint, not a decorative icon.
+    const g = new THREE.Group();
+    const material = new THREE.MeshStandardMaterial({
+      color: OBJECT_COLORS.SOURCE, emissive: 0x0f5c3c, emissiveIntensity: 0.9,
+    });
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(4, 0.28, 10, 40), material);
+    ring.rotation.x = Math.PI / 2;
+    ring.position.y = 0.35;
+    const arrow = new THREE.Mesh(new THREE.ConeGeometry(0.9, 2.6, 12), material);
+    arrow.rotation.z = -Math.PI / 2;   // points along +x, the flow direction
+    arrow.position.set(2.2, 1.4, 0);
+    const post = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.12, 0.12, 3.0, 8), material);
+    post.position.y = 1.5;
+    g.add(ring, arrow, post);
+    return g;
+  },
+  DRAIN: () => {
+    // Where the water goes. A recessed grate ring at the solver's drain radius,
+    // plus a funnel that reads as "down" from any camera angle.
+    const g = new THREE.Group();
+    const material = new THREE.MeshStandardMaterial({
+      color: OBJECT_COLORS.DRAIN, emissive: 0x5c1f13, emissiveIntensity: 0.8,
+      metalness: 0.3, roughness: 0.6,
+    });
+    const rim = new THREE.Mesh(new THREE.TorusGeometry(5, 0.3, 10, 44), material);
+    rim.rotation.x = Math.PI / 2;
+    rim.position.y = 0.2;
+    const funnel = new THREE.Mesh(
+      new THREE.ConeGeometry(4.4, 2.4, 24, 1, true), material);
+    funnel.position.y = -1.0;
+    for (let i = 0; i < 4; i++) {
+      const bar = new THREE.Mesh(new THREE.BoxGeometry(9.4, 0.12, 0.3), material);
+      bar.position.set(0, 0.2, -3 + i * 2);
+      g.add(bar);
+    }
+    g.add(rim, funnel);
+    return g;
+  },
   GAUGE: () => {
     const g = new THREE.Group();
     const material = new THREE.MeshStandardMaterial({
@@ -118,5 +161,6 @@ export function applyTransform(group: THREE.Group, obj: ObjectData): void {
 
 /** Approximate half-heights for placing objects on the selected tool. */
 export function objectHalfSize(type: string): number {
-  return { HOUSE: 0, CAR: 0, TREE: 0, BOX: 0, DEBRIS: 0, ROCK: 0, GAUGE: 0 }[type] ?? 0;
+  return { HOUSE: 0, CAR: 0, TREE: 0, BOX: 0, DEBRIS: 0, ROCK: 0,
+           SOURCE: 0, DRAIN: 0, GAUGE: 0 }[type] ?? 0;
 }

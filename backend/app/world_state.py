@@ -44,6 +44,8 @@ class ObjectType(str, enum.Enum):
     BOX = "BOX"
     DEBRIS = "DEBRIS"
     ROCK = "ROCK"
+    SOURCE = "SOURCE"
+    DRAIN = "DRAIN"
     GAUGE = "GAUGE"
 
     @classmethod
@@ -106,6 +108,26 @@ OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
                        "ground_contact_area": 3.0, "cross_sectional_area": 1.5,
                        "is_static": True, "bed_height": 0.8,
                        "foundation_height": 0.0, "damage_resistance": 1.0},
+    # Placeable inflow. Holds water at `inflow_level` inside `inflow_radius`,
+    # using the same rule as the map-edge inflow (h = max(0, level - bed)), so a
+    # source on a hillside fills to the height asked for instead of drowning the
+    # hill. Not a rigid body, not an obstacle: it is a boundary condition the
+    # user can pick up and move.
+    ObjectType.SOURCE: {"mass": 1.0, "friction": 0.0, "buoyancy": 0.0,
+                        "volume_m3": 1.0, "drag_coefficient": 1.0,
+                        "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
+                        "is_static": True, "inflow_level": 1.5,
+                        "inflow_radius": 4.0,
+                        "foundation_height": 0.0, "damage_resistance": 1.0},
+    # Placeable outlet. Removes water through a smooth radial sink and spins the
+    # flow around it from the circulation it measures -- see config.py's
+    # DRAIN_SWIRL_GAIN for why the rotation cannot be a constant.
+    ObjectType.DRAIN:  {"mass": 1.0, "friction": 0.0, "buoyancy": 0.0,
+                        "volume_m3": 1.0, "drag_coefficient": 1.0,
+                        "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
+                        "is_static": True, "drain_radius": 5.0,
+                        "drain_strength": 1.2,
+                        "foundation_height": 0.0, "damage_resistance": 1.0},
     ObjectType.GAUGE: {"mass": 1.0, "friction": 0.0, "buoyancy": 0.0,
                        "volume_m3": 1.0, "drag_coefficient": 1.0,
                        "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
@@ -129,6 +151,8 @@ def default_properties(obj_type: str) -> Dict[str, float]:
             "volume_m3": 0.1, "drag_coefficient": 1.0,
             "ground_contact_area": 0.5, "cross_sectional_area": 0.5,
             "is_static": False, "bed_height": 0.0,
+            "inflow_level": 0.0, "inflow_radius": 0.0,
+            "drain_radius": 0.0, "drain_strength": 0.0,
             "foundation_height": 0.0, "damage_resistance": 0.5}
     base.update(OBJECT_DEFAULTS.get(ObjectType.register(obj_type), {}))
     return base
@@ -278,10 +302,15 @@ class WaterState:
     # so an existing FloodLab experiment behaves exactly as it did in 0.5.1 and
     # the terrain the user built stays the terrain they built.
     erosion_enabled: bool = False
+    # v0.8.0: let water leave through the east edge. On by default -- a river
+    # that cannot run off the map just fills it, which is what the closed
+    # boundary did for every version up to 0.7.0.
+    outflow_enabled: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return {"level": self.level, "visible": self.visible,
-                "erosion_enabled": self.erosion_enabled}
+                "erosion_enabled": self.erosion_enabled,
+                "outflow_enabled": self.outflow_enabled}
 
 
 @dataclass

@@ -1,4 +1,4 @@
-# NatureLab 0.7.0 - Architecture
+# NatureLab 0.8.0 - Architecture
 
 Проектная документация, которая объясняет *почему* архитектура такая, живёт в `docs/`:
 [`01_vision.md`](docs/01_vision.md) (цели и критерий качества),
@@ -99,6 +99,29 @@ Whether a body is a wall or a riverbed is decided from data, not from a type nam
 everything in `SOLID_OBSTACLE_TYPES` as wall. `SimulationManager._affects_fluid_boundary()`
 uses the same rule to decide when adding, moving, scaling or deleting an object must
 bump `obstacle_revision`.
+
+## Water sources, sinks and boundaries (v0.8.0)
+
+Three separate mechanisms, deliberately not merged:
+
+```text
+edge inflow      west columns, h = max(0, level - bed)   -- default, config-driven
+SOURCE object    disc, same rule, live position          -- overrides the edge inflow
+DRAIN object     radial sink + measured swirl            -- removes water anywhere
+open outlet      east columns, q = u*h leaves the map    -- toggleable, on by default
+```
+
+A world with no `SOURCE` behaves exactly as 0.7.0 did, which is what keeps the older
+suite valid. A world with one turns the edge inflow off entirely, so "where does the
+water come from" always has a single answer.
+
+Two invariants worth keeping when this area is touched again:
+
+- The outlet copies only OUTWARD velocity. Allowing the inward component would turn
+  the boundary into a second, unintended source.
+- A drain's radial velocity is derived from its removal rate by continuity, never set
+  independently. When the two were separate knobs the convergence out-ran the sink and
+  the drain cell ended up deeper than the same spot with no drain at all.
 
 ## World size
 

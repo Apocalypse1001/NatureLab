@@ -154,6 +154,9 @@ class Physics04Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_closed_edge_slug_conserves_volume(self) -> None:
         self.manager.apply_water_level(0.5)
+        # "closed edge" is the point of this test: v0.8.0 opens the downstream
+        # edge by default, and an open outlet legitimately loses volume
+        self.manager.apply_water_outflow(False)
         self.manager.start()
         self.manager.fluid._source_enabled = False
         self.manager.fluid._measure()
@@ -740,6 +743,285 @@ class RiverLabTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(
             float(legacy.objects["Rock_009"].metadata["bed_height"]), 0.0,
             "a pre-v0.6.0 ROCK came back with no bed height")
+
+
+class WaterControlTests(unittest.IsolatedAsyncioTestCase):
+    """v0.8.0: an open downstream edge, a placeable SOURCE, and a DRAIN whose
+    vortex comes from measured circulation rather than a chosen direction."""
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+        self.manager.attach(self._text, self._binary)
+        self.text_frames: list[str] = []
+        self.binary_frames: list[bytes] = []
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    async def _text(self, value: str) -> None:
+        self.text_frames.append(value)
+
+    async def _binary(self, value: bytes) -> None:
+        self.binary_frames.append(value)
+
+    def _depth(self) -> np.ndarray:
+        return np.asarray(self.manager.fluid._h.numpy(), dtype=np.float32).reshape(N, N)
+
+    def _volume(self) -> float:
+        self.manager.fluid._measure()
+        return float(self.manager.fluid.diagnostics()["volume_m3"])
+
+    @staticmethod
+    def _sloped_world(manager, grade: float = 0.02) -> None:
+        """A bed that falls west to east, so water actually runs downhill."""
+        xs = np.arange(N, dtype=np.float32)
+        manager.world.terrain.heights = np.tile(grade * (N - 1 - xs), (N, 1)).astype(np.float32)
+
+    # -------------------------------------------------------------- outflow
+    async def test_water_leaves_through_the_open_edge_and_not_through_a_closed_one(self) -> None:
+        """The defect this fixes: every outer face was no-flux, so water that
+        entered could never leave and the map filled forever. Measured before
+        the fix: 2290 -> 3484 -> 4311 m3, never decreasing."""
+        results = {}
+        for enabled in (False, True):
+            manager = SimulationManager()
+            self._sloped_world(manager)
+            manager.apply_water_outflow(enabled)
+            manager.start()
+            manager.fluid._source_enabled = False
+            manager.fluid._h.assign(np.full(manager.fluid._count, 1.0, dtype=np.float32))
+            manager.fluid._measure()
+            before = float(manager.fluid.diagnostics()["volume_m3"])
+            for _ in range(1200):
+                manager._step_once()
+            manager.fluid._measure()
+            results[enabled] = (before, float(manager.fluid.diagnostics()["volume_m3"]))
+            manager.stop()
+        closed_before, closed_after = results[False]
+        open_before, open_after = results[True]
+        self.assertAlmostEqual(closed_after / closed_before, 1.0, places=3,
+                               msg="a closed domain must conserve volume exactly")
+        self.assertLess(open_after, open_before * 0.999,
+                        "water did not leave through the open edge")
+
+    async def test_the_open_edge_never_pushes_water_back_in(self) -> None:
+        """A transmissive outlet that copied inward velocity too would act as a
+        second, accidental source. Only outward flow is allowed out."""
+        self.manager.apply_water_outflow(True)
+        self.manager.start()
+        for _ in range(600):
+            self.manager._step_once()
+        edge_u = np.asarray(self.manager.fluid._u.numpy()).reshape(N, N)[:, -1]
+        self.assertGreaterEqual(float(edge_u.min()), 0.0,
+                                "the outlet developed inward velocity")
+
+    # --------------------------------------------------------------- source
+    async def test_a_placed_source_feeds_the_map_and_replaces_the_edge_inflow(self) -> None:
+        """The user asked to be able to say where the water comes from. A SOURCE
+        object is that answer, and it takes over from the edge entirely --
+        otherwise the map has two sources and the question has two answers."""
+        self.manager.apply_object_add({"type": "SOURCE", "position": [x_at(60), 0.0, 0.0]})
+        self.manager.start()
+        for _ in range(900):
+            self.manager._step_once()
+        depth = self._depth()
+        self.assertEqual(self.manager.fluid.diagnostics()["sources"], 1)
+        self.assertGreater(float(depth[col(0.0), 60]), 1.0, "the source did not fill")
+
+        # The west edge must no longer be HELD at water.level. Water can still
+        # reach it -- the source spreads in every direction, including back
+        # upstream, which is correct physics -- so the honest check is against a
+        # control run where the edge inflow really is doing the feeding.
+        control = SimulationManager()
+        control.apply_water_level(0.5)
+        control.start()
+        for _ in range(900):
+            control._step_once()
+        control_edge = float(np.asarray(control.fluid._h.numpy(),
+                                        dtype=np.float32).reshape(N, N)[:, 0].max())
+        control.stop()
+        self.assertAlmostEqual(control_edge, 0.5, places=3,
+                               msg="the control run was not edge-fed after all")
+        self.assertLess(float(depth[:, 0].max()), control_edge * 0.5,
+                        "the west edge kept feeding water despite a placed SOURCE")
+
+    async def test_a_source_can_be_dragged_while_running(self) -> None:
+        """Positions are read live every tick, which is the whole reason SOURCE
+        is an object rather than a setting."""
+        source = self.manager.apply_object_add(
+            {"type": "SOURCE", "position": [x_at(60), 0.0, 0.0]})
+        self.manager.start()
+        for _ in range(600):
+            self.manager._step_once()
+        self.assertGreater(float(self._depth()[col(0.0), 60]), 1.0)
+        self.manager.apply_object_update(source["id"],
+                                         {"position": [x_at(60), 0.0, x_at(140)]})
+        for _ in range(600):
+            self.manager._step_once()
+        self.assertGreater(float(self._depth()[140, 60]), 1.0,
+                           "the source did not start feeding its new position")
+
+    async def test_a_source_respects_terrain_and_does_not_drown_a_hill(self) -> None:
+        """Same rule as the edge inflow: h = max(0, level - bed). A source on a
+        slope fills to the height asked for instead of pouring over high ground."""
+        self.manager.world.terrain.heights[col(0.0) - 3:col(0.0) + 4, 58:64] = 6.0
+        source = self.manager.apply_object_add(
+            {"type": "SOURCE", "position": [x_at(60), 0.0, 0.0]})
+        self.manager.apply_object_update(source["id"],
+                                         {"metadata": {"inflow_level": 1.5}})
+        self.manager.start()
+        for _ in range(300):
+            self.manager._step_once()
+        self.assertEqual(float(self._depth()[col(0.0), 60]), 0.0,
+                         "the source flooded ground taller than its own level")
+
+    # ---------------------------------------------------------------- drain
+    async def test_a_drain_removes_water(self) -> None:
+        """A drain removes water where it sits. It is not infinitely strong:
+        against a continuous edge inflow it digs a depression rather than a dry
+        hole, which is why this compares against the same world without one
+        instead of asserting an absolute depth."""
+        def field(with_drain: bool) -> np.ndarray:
+            manager = SimulationManager()
+            if with_drain:
+                manager.apply_object_add({"type": "DRAIN", "position": [x_at(40), 0.0, 0.0]})
+            manager.apply_water_level(2.0)
+            manager.start()
+            for _ in range(900):
+                manager._step_once()
+            out = np.asarray(manager.fluid._h.numpy(), dtype=np.float32).reshape(N, N).copy()
+            drains = manager.fluid.diagnostics()["drains"]
+            manager.stop()
+            return out, drains
+
+        plain, _ = field(False)
+        drained, count = field(True)
+        self.assertEqual(count, 1)
+        self.assertLess(float(drained[col(0.0), 40]), float(plain[col(0.0), 40]) * 0.7,
+                        "the drain did not lower the water where it sits")
+        self.assertGreater(float(drained[col(0.0), 25]), 0.2,
+                           "water upstream of the drain vanished too")
+        self.assertLess(float(drained.sum()), float(plain.sum()),
+                        "the drain removed no water overall")
+
+    async def test_a_drain_has_no_effect_outside_its_radius(self) -> None:
+        """A localized sink must be localized: identical worlds, one with a
+        drain far away, must agree where the drain cannot reach."""
+        def field(with_drain: bool) -> np.ndarray:
+            manager = SimulationManager()
+            if with_drain:
+                manager.apply_object_add({"type": "DRAIN", "position": [x_at(40), 0.0, x_at(180)]})
+            manager.apply_water_level(1.5)
+            manager.start()
+            for _ in range(600):
+                manager._step_once()
+            out = np.asarray(manager.fluid._h.numpy(), dtype=np.float32).reshape(N, N).copy()
+            manager.stop()
+            return out
+        plain, drained = field(False), field(True)
+        # a wide band on the far side of the map, well outside the 5 m radius
+        np.testing.assert_allclose(plain[:60, :], drained[:60, :], atol=1e-5)
+
+    async def test_the_drain_vortex_follows_the_ambient_circulation(self) -> None:
+        """The headline DRAIN acceptance test, and the reason the vortex is
+        physics rather than decoration.
+
+        In a depth-averaged model a purely radial sink produces purely radial
+        convergence and NO rotation -- spin has to come from angular momentum
+        already present, amplified by convergence. So the assertion is that the
+        rotation SIGN FOLLOWS the seeded circulation, and that a symmetric
+        approach produces no rotation at all. A test that checked for a fixed
+        direction would pass just as happily against a hard-coded swirl, which
+        CONTINUATION.md explicitly asks not to build.
+        """
+        yy, xx = np.mgrid[0:N, 0:N]
+        centre = col(0.0)
+        dxc = (xx - centre).astype(np.float32)
+        dzc = (yy - centre).astype(np.float32)
+        radius = np.maximum(np.sqrt(dxc ** 2 + dzc ** 2), 1.0)
+        ring = (radius > 2.0) & (radius < 4.0)
+
+        def tangential_after(seed: float) -> float:
+            manager = SimulationManager()
+            manager.apply_object_add({"type": "DRAIN", "position": [0.0, 0.0, 0.0]})
+            manager.apply_water_level(1.5)
+            manager.start()
+            manager.fluid._source_enabled = False
+            manager.fluid._h.assign(np.full(manager.fluid._count, 1.5, dtype=np.float32))
+            manager.fluid._u.assign((seed * -dzc / radius).astype(np.float32).ravel())
+            manager.fluid._v.assign((seed * dxc / radius).astype(np.float32).ravel())
+            for _ in range(180):
+                manager._step_once()
+            u = np.asarray(manager.fluid._u.numpy()).reshape(N, N)
+            v = np.asarray(manager.fluid._v.numpy()).reshape(N, N)
+            manager.stop()
+            return float(((-dzc / radius) * u + (dxc / radius) * v)[ring].mean())
+
+        clockwise = tangential_after(-0.8)
+        still = tangential_after(0.0)
+        counter = tangential_after(+0.8)
+        self.assertGreater(counter, 0.2, "seeded counter-clockwise flow did not spin up")
+        self.assertLess(clockwise, -0.2, "seeded clockwise flow did not spin up")
+        self.assertAlmostEqual(still, 0.0, places=3,
+                               msg="the drain invented rotation from a symmetric approach")
+        self.assertAlmostEqual(counter, -clockwise, places=3,
+                               msg="the vortex is not symmetric in the two directions")
+
+    async def test_the_drain_pulls_water_inward_even_without_any_rotation(self) -> None:
+        """Convergence is the sink's own behaviour and must not depend on spin:
+        with zero ambient circulation there is still inflow, just no swirl."""
+        yy, xx = np.mgrid[0:N, 0:N]
+        centre = col(0.0)
+        dxc = (xx - centre).astype(np.float32)
+        dzc = (yy - centre).astype(np.float32)
+        radius = np.maximum(np.sqrt(dxc ** 2 + dzc ** 2), 1.0)
+        ring = (radius > 2.0) & (radius < 4.0)
+        self.manager.apply_object_add({"type": "DRAIN", "position": [0.0, 0.0, 0.0]})
+        self.manager.apply_water_level(1.5)
+        self.manager.start()
+        self.manager.fluid._source_enabled = False
+        self.manager.fluid._h.assign(np.full(self.manager.fluid._count, 1.5, dtype=np.float32))
+        for _ in range(180):
+            self.manager._step_once()
+        u = np.asarray(self.manager.fluid._u.numpy()).reshape(N, N)
+        v = np.asarray(self.manager.fluid._v.numpy()).reshape(N, N)
+        radial = float(((dxc / radius) * u + (dzc / radius) * v)[ring].mean())
+        self.assertLess(radial, -0.2, "the drain did not pull water toward itself")
+
+    async def test_a_stronger_drain_removes_more_water(self) -> None:
+        """drain_strength is a real discharge control, not a label."""
+        removed = []
+        for strength in (0.4, 2.0):
+            manager = SimulationManager()
+            drain = manager.apply_object_add({"type": "DRAIN", "position": [0.0, 0.0, 0.0]})
+            manager.apply_object_update(drain["id"],
+                                        {"metadata": {"drain_strength": strength}})
+            manager.apply_water_level(1.5)
+            manager.start()
+            manager.fluid._source_enabled = False
+            manager.apply_water_outflow(False)
+            manager.fluid._h.assign(np.full(manager.fluid._count, 1.5, dtype=np.float32))
+            manager.fluid._measure()
+            before = float(manager.fluid.diagnostics()["volume_m3"])
+            for _ in range(300):
+                manager._step_once()
+            manager.fluid._measure()
+            removed.append(before - float(manager.fluid.diagnostics()["volume_m3"]))
+            manager.stop()
+        self.assertGreater(removed[1], removed[0] * 1.5,
+                           f"drain strength did not scale the discharge: {removed}")
+
+    async def test_source_and_drain_survive_a_save_load_round_trip(self) -> None:
+        self.manager.apply_object_add({"type": "SOURCE", "position": [x_at(50), 0.0, 0.0]})
+        self.manager.apply_object_add({"type": "DRAIN", "position": [x_at(150), 0.0, 0.0]})
+        self.manager.save("watertest")
+        self.manager.load("watertest")
+        source = next(o for o in self.manager.world.objects.values() if o.type == "SOURCE")
+        drain = next(o for o in self.manager.world.objects.values() if o.type == "DRAIN")
+        self.assertGreater(float(source.metadata["inflow_radius"]), 0.0)
+        self.assertGreater(float(drain.metadata["drain_strength"]), 0.0)
+        self.assertTrue(self.manager.world.water.outflow_enabled)
 
 
 if __name__ == "__main__":

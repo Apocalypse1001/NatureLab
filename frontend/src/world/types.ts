@@ -1,6 +1,7 @@
 /** Shared data model — mirrors backend/app/world_state.py. */
 
-export type ObjectType = 'HOUSE' | 'CAR' | 'TREE' | 'BOX' | 'DEBRIS' | 'ROCK' | 'GAUGE';
+export type ObjectType = 'HOUSE' | 'CAR' | 'TREE' | 'BOX' | 'DEBRIS' | 'ROCK'
+  | 'SOURCE' | 'DRAIN' | 'GAUGE';
 
 export type ObjectState =
   | 'INTACT' | 'MOVING' | 'FLOATING' | 'COLLIDING'
@@ -35,7 +36,8 @@ export interface TerrainData {
 export interface WorldData {
   version: number;
   terrain: TerrainData;
-  water: { level: number; visible: boolean; erosion_enabled?: boolean };
+  water: { level: number; visible: boolean; erosion_enabled?: boolean;
+           outflow_enabled?: boolean };
   environment: { gravity: number; wind: number[]; temperature: number };
   objects: ObjectData[];
 }
@@ -90,7 +92,8 @@ export interface SimEvent {
 }
 
 /** Add new object types here (+ backend defaults) without touching the core. */
-export const OBJECT_TYPES: ObjectType[] = ['HOUSE', 'CAR', 'TREE', 'BOX', 'DEBRIS', 'ROCK', 'GAUGE'];
+export const OBJECT_TYPES: ObjectType[] = ['HOUSE', 'CAR', 'TREE', 'BOX', 'DEBRIS',
+  'ROCK', 'SOURCE', 'DRAIN', 'GAUGE'];
 
 export const OBJECT_COLORS: Record<string, number> = {
   HOUSE: 0xc9a27a,
@@ -99,5 +102,7 @@ export const OBJECT_COLORS: Record<string, number> = {
   BOX: 0xb08050,
   DEBRIS: 0x808080,
   ROCK: 0x8d8577,
+  SOURCE: 0x4fd8a0,
+  DRAIN: 0xd85f4f,
   GAUGE: 0x62e6ff,
 };
