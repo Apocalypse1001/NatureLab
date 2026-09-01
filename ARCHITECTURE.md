@@ -26,23 +26,42 @@ ids[], index{id→slot}, positions[N,3], velocities[N,3], rotations[N,3],
 masses[N], buoyancies[N], states[N]
 ```
 
+```text
++ frictions[N], drags[N], foundation_heights[N], footprint_radii[N]
+```
+
 ADD регистрирует slot, UPDATE синхронизирует массивы, REMOVE делает swap-delete.
-Placeholder использует batched masks; будущий Warp solver сможет загрузить эти массивы.
+v0.3: `ForceRigidBodySystem` считает gravity/buoyancy/drag/friction векторно по всем телам
+разом (см. `docs/04_TZ_v0.3_roadmap.md`); будущий Warp solver сможет загрузить эти же массивы
+без изменения контракта.
 
 ## Fluid ↔ Rigid contract
 
 На каждом global fixed tick:
 
-1. Rigid предоставляет object obstacle snapshot.
-2. Fluid получает terrain + obstacle boundaries.
+1. Rigid предоставляет object obstacle snapshot (positions, rotations, masses, **radii**).
+2. Fluid получает terrain + obstacle boundaries; каждый obstacle вырезает дыру радиусом
+   `radii[i]` (не единый фиксированный радиус — дом и коробка вытесняют разный объём).
 3. `FluidSolver.advance(global_dt, max_substeps, stability_dt)` выбирает внутренние substeps.
-4. Fluid batch-sample возвращает depths, velocities и forces для body positions.
-5. Rigid применяет samples к плотным массивам.
+4. Fluid batch-sample возвращает depths, velocities и forces для body positions — усреднением
+   по всем открытым (не-obstacle) клеткам в окрестности каждого тела, а не по фиксированному
+   направленному кольцу (направленное кольцо ловило дыру *соседнего* объекта в multi-object
+   сценах — см. `ShallowWaterFluidSolver.sample_for_bodies` docstring).
+5. Rigid применяет samples к плотным массивам через явную модель сил (gravity/buoyancy/drag/
+   friction), не через порог.
 
 v0.3: `ShallowWaterFluidSolver` реализует этот контракт (height field на сетке terrain,
 outflow-limited обмен, obstacle mask из `obstacle_snapshot()`). Полноценный
 CFD/Navier-Stokes-уровень намеренно не реализован — см. `docs/04_TZ_v0.3_roadmap.md`, раздел 3
 (причинный реализм — цель, инженерный CFD-реализм — не цель проекта).
+
+## Water rendering (frontend)
+
+`SimulationManager._stream()` шлёт `WATER_HEIGHT` bulk-фрейм (полное поле depth) каждый tick
+пока RUNNING/PAUSED. `SceneManager.waterMesh` имеет ту же сетку вершин, что и terrain;
+`updateWaterField()` деформирует её по клеткам (`y = terrain_height + depth`), так что вода
+физически дренирует до уровня terrain там, где depth≈0 — включая внутри/вокруг препятствий.
+До первого `START` — плоский editor-preview на уровне слайдера (`setWater()`).
 
 ## Terrain consistency
 

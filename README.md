@@ -125,11 +125,44 @@ conservation, отсутствие phantom water внутри объектов, 
 же алгоритма для больших сеток — отдельный будущий пункт (`REQUIRES GPU VERIFICATION` для
 производительности на RTX 5090), не сделан в этом коммите.
 
+## v0.3: реальная физика rigid body
+
+`ForceRigidBodySystem` (`backend/app/rigid_body.py`) заменил бинарный buoyancy-порог на честную
+интеграцию сил: gravity, buoyancy (растёт с глубиной, capped только собственным весом — не
+искусственным потолком), hydrodynamic drag, Coulomb ground friction (уменьшается вместе с
+buoyancy). `metadata.foundation_height` — ранее сохранялось, но нигде не использовалось — теперь
+реально влияет на исход (Experiment A/B из `docs/01_vision.md`: высота фундамента дома меняет,
+затопит ли его). У каждого типа объекта теперь есть `drag` и `footprint_radius` (совпадает по
+масштабу с примитивами в `frontend/src/world/ObjectFactory.ts`), поэтому дом и коробка вытесняют
+разный объём воды, а не один и тот же фиксированный радиус.
+
+## v0.3: вода реально стримится и рендерится по клеткам
+
+Раньше backend вычислял честное поле глубины, но никуда его не отправлял — а frontend рисовал
+воду как плоскость на уровне `Water Level` слайдера, никак не связанную с реальной физикой. Это
+означало, что вода **визуально** проходила сквозь препятствия, даже когда backend уже корректно
+исключал их из потока. Исправлено:
+
+- backend: `SimulationManager._stream()` отправляет `WATER_HEIGHT` bulk-фрейм (`FrameKind.WATER_HEIGHT`,
+  протокол уже был зарезервирован под это в 0.2) с полным полем глубины каждый tick, пока RUNNING/PAUSED.
+- frontend: `BackendClient` диспатчит эти фреймы (`waterHeightHandler`), `SceneManager.waterMesh`
+  теперь имеет ту же сетку вершин, что и terrain (не плоскость 1×1), и `updateWaterField()`
+  деформирует её по клеткам: `y = terrain_height + depth`. До первого `START` (IDLE, редактор)
+  показывается плоский preview на уровне слайдера — `setWater()`, как раньше.
+
+Проверено реальным headless-браузером в этой сессии (Chrome for Testing + puppeteer-core,
+скачан отдельно, не входит в архив): вода видимо дренирует до уровня terrain ровно в точке
+объекта (глубина 0.000 м) и остаётся на реальной глубине (1.2 м) в стороне от него — то есть
+вода реально огибает/исключает объект, а не течёт сквозь него. Этот прогон не автоматизирован
+в `tests/run_all.bat` (требует Chrome/Chromium и скачивание), но сама логика (`updateWaterField`,
+`waterHeightHandler`) покрыта TypeScript-компиляцией (`npm run build` зелёный).
+
 ## Placeholder (намеренно)
 
-- Rigid body — batched deterministic placeholder (buoyancy threshold), не полноценная динамика
-  сил (gravity/drag/friction по отдельности) — следующий пункт v0.3, см. `docs/04_TZ_v0.3_roadmap.md`.
-- Obstacle footprint в FluidSolver — фиксированный радиус `config.FLUID_OBSTACLE_RADIUS_M`, а не
-  реальный `scale` объекта (в `RigidStateBuffer` пока нет scale).
-- Bulk frame kinds кроме particles подготовлены как типизированный контракт, но не стримятся.
+- Object-object collision не реализовано: два плавающих объекта могут пересекаться, это не
+  проверяется и не разрешается.
+- Дерево не умеет ломаться (DAMAGED/BROKEN, break_strength) и становиться новым препятствием —
+  отдельный будущий пункт, требует своей физики разрушения, не часть v0.3 force model.
+- `OBJECT_TRANSFORMS`, `TERRAIN_PATCH` (потоковый), `EVENTS` (бинарный) bulk frame kinds
+  подготовлены как типизированный контракт, но ещё не стримятся (PARTICLES и WATER_HEIGHT — стримятся).
 - RiverLab, VolcanoLab, эрозия, разрушение и replay не реализованы.

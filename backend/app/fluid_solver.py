@@ -17,6 +17,15 @@ class FluidSolver:
     def reset(self) -> None: ...
     def get_water_height(self, x: float = 0.0, z: float = 0.0) -> float: ...
     def get_velocity_field(self) -> Optional[np.ndarray]: ...
+    def get_depth_grid(self) -> Optional[np.ndarray]:
+        """Full per-cell depth field, indexed exactly like TerrainGrid.heights.
+
+        Used to stream a WATER_HEIGHT bulk frame so the frontend can deform
+        the water mesh per-cell instead of showing a flat plane -- see
+        SimulationManager._stream() and
+        frontend/src/scene/SceneManager.ts:updateWaterField.
+        """
+        return None
 
 
 class PlaceholderFluidSolver(FluidSolver):
@@ -280,6 +289,9 @@ class ShallowWaterFluidSolver(FluidSolver):
 
     def get_velocity_field(self) -> Optional[np.ndarray]:
         return np.dstack([self._flow_x, np.zeros_like(self._flow_x), self._flow_z])
+
+    def get_depth_grid(self) -> Optional[np.ndarray]:
+        return self._depth
 
     def total_volume(self) -> float:
         """Sum of water depth over all cells; used by conservation tests."""

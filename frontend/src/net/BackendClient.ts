@@ -114,12 +114,14 @@ export class BackendClient {
     const count = view.getUint32(4, true);
     const components = [3, 1, 3, 10, 3, 1][kind];
     if (!components || buffer.byteLength !== 16 + count * components * 4) return;
-    if (kind !== 0) return; // scaffolding kinds are dispatched here as implemented
-    const floats = new Float32Array(buffer, 16, count * 3);
-    this.particleHandler?.(floats, count);
+    const floats = new Float32Array(buffer, 16, count * components);
+    if (kind === 0) this.particleHandler?.(floats, count);
+    else if (kind === 1) this.waterHeightHandler?.(floats, count);
+    // remaining scaffolding kinds are dispatched here as they get implemented
   }
 
   particleHandler: ((positions: Float32Array, count: number) => void) | null = null;
+  waterHeightHandler: ((depths: Float32Array, count: number) => void) | null = null;
 
   send(op: Record<string, unknown>): boolean {
     if (this.ws?.readyState === WebSocket.OPEN) {

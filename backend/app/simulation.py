@@ -241,6 +241,13 @@ class SimulationManager:
                     await self._send_bytes(protocol.encode_particles(positions, self.sim_time))
                 except Exception:
                     return  # client disconnected; the loop must survive
+            depth_grid = self.fluid.get_depth_grid()
+            if depth_grid is not None:
+                try:
+                    await self._send_bytes(protocol.encode_float_frame(
+                        protocol.FrameKind.WATER_HEIGHT, depth_grid, self.sim_time))
+                except Exception:
+                    return
         moved = [(oid, obj.position, obj.state)
                  for oid, obj in self.world.objects.items()
                  if obj.state != "INTACT"]

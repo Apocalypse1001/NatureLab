@@ -55,6 +55,7 @@ const net = new BackendClient(wsUrl, {
 });
 
 net.particleHandler = (positions, count) => sceneManager.setParticles(positions, count);
+net.waterHeightHandler = (depths) => sceneManager.updateWaterField(depths);
 
 // ---------------------------------------------------------------------- ui
 const ui = new UI(uiHost, {

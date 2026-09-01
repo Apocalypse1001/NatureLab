@@ -54,13 +54,17 @@ export class SceneManager {
     grid.position.y = 0.05;
     this.scene.add(grid);
 
-    // water placeholder: semi-transparent plane at adjustable height
-    this.waterMesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(this.terrain.sizeM * 1.2, this.terrain.sizeM * 1.2),
-      new THREE.MeshStandardMaterial({
-        color: 0x2f7fd0, transparent: true, opacity: 0.45,
-        roughness: 0.2, metalness: 0.1, depthWrite: false, side: THREE.DoubleSide,
-      }));
+    // Water surface: same vertex grid as terrain (not a flat plane) so it
+    // can be deformed per-cell from the backend's real water-height field
+    // once the simulation is RUNNING -- see updateWaterField(). Before that
+    // (editor/IDLE), setFlatWater() shows a flat preview at the slider
+    // level, matching the original placeholder behaviour.
+    const waterGeo = new THREE.PlaneGeometry(
+      this.terrain.sizeM, this.terrain.sizeM, this.terrain.width, this.terrain.height);
+    this.waterMesh = new THREE.Mesh(waterGeo, new THREE.MeshStandardMaterial({
+      color: 0x2f7fd0, transparent: true, opacity: 0.55,
+      roughness: 0.15, metalness: 0.1, depthWrite: false, side: THREE.DoubleSide,
+    }));
     this.waterMesh.rotation.x = -Math.PI / 2;
     this.scene.add(this.waterMesh);
 
@@ -105,9 +109,38 @@ export class SceneManager {
     geo.computeVertexNormals();
   }
 
+  /** Flat editor-preview water (IDLE, before the sim owns the surface). */
   setWater(level: number, visible: boolean): void {
-    this.waterMesh.position.y = level;
+    const geo = this.waterMesh.geometry as THREE.PlaneGeometry;
+    const pos = geo.attributes.position;
+    for (let idx = 0; idx < pos.count; idx++) pos.setZ(idx, level);
+    pos.needsUpdate = true;
+    geo.computeVertexNormals();
     this.waterMesh.visible = visible;
+  }
+
+  /**
+   * Deform the water mesh per-cell from the backend's real depth field
+   * (WATER_HEIGHT bulk frames), so the surface actually dips to terrain
+   * level wherever depth is ~0 -- around/inside obstacles included. This
+   * is what makes water visibly go around an object instead of a flat
+   * plane implying it flows straight through. `depths` is indexed exactly
+   * like the terrain grid (see rebuildTerrain).
+   */
+  updateWaterField(depths: Float32Array): void {
+    const geo = this.waterMesh.geometry as THREE.PlaneGeometry;
+    const pos = geo.attributes.position;
+    const terrainPos = (this.terrainMesh.geometry as THREE.PlaneGeometry).attributes.position;
+    const count = Math.min(pos.count, depths.length);
+    let anyWet = false;
+    for (let idx = 0; idx < count; idx++) {
+      const depth = Math.max(0, depths[idx]);
+      if (depth > 0.01) anyWet = true;
+      pos.setZ(idx, terrainPos.getZ(idx) + depth);
+    }
+    pos.needsUpdate = true;
+    geo.computeVertexNormals();
+    this.waterMesh.visible = anyWet;
   }
 
   setParticles(buffer: Float32Array, count: number): void {
