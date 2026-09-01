@@ -121,6 +121,182 @@ if WARP_IMPORTED:
 
 
     @wp.kernel
+    def _apply_outflow(h: wp.array(dtype=float), u: wp.array(dtype=float),
+                       v: wp.array(dtype=float), solid: wp.array(dtype=wp.int32),
+                       width: int, height: int, columns: int):
+        """Zero-gradient (transmissive) outlet on the east edge.
+
+        Without it every outer face is no-flux, so water that enters can never
+        leave and the map fills forever -- measured before this existed: volume
+        climbing 2290 -> 3484 -> 4311 m3 with no outflow at all. A river that
+        runs off the edge of the domain is exactly this boundary condition: copy
+        the interior state outward and let the flux carry water out.
+
+        Only positive (outward) velocity is copied, so the outlet can never suck
+        water back in and become a second, accidental source.
+        """
+        idx = wp.tid()
+        i = idx % width
+        j = idx // width
+        if i < width - columns or solid[idx] != 0:
+            return
+        inner = j * width + (width - columns - 1)
+        if solid[inner] != 0:
+            return
+        h[idx] = h[inner]
+        u[idx] = wp.max(0.0, u[inner])
+        v[idx] = 0.0
+
+
+    @wp.kernel
+    def _apply_point_sources(h: wp.array(dtype=float), bed: wp.array(dtype=float),
+                             solid: wp.array(dtype=wp.int32),
+                             centres: wp.array(dtype=wp.vec3),
+                             radii: wp.array(dtype=float),
+                             levels: wp.array(dtype=float),
+                             count: int, width: int, height: int, dx: float):
+        """Placeable inflow: hold water at `level` inside a disc of `radius`.
+
+        Same rule as the edge inflow (`h = max(0, level - bed)`), so a source
+        dropped on high ground fills only to the height the user asked for and a
+        hill inside its radius stays proud of the water rather than being
+        flooded from above. Everything downstream of the disc is ordinary flux
+        physics -- the source sets a boundary, it does not paint a river.
+        """
+        idx = wp.tid()
+        if solid[idx] != 0:
+            return
+        i = idx % width
+        j = idx // width
+        x = (float(i) - float(width - 1) * 0.5) * dx
+        z = (float(j) - float(height - 1) * 0.5) * dx
+        for n in range(count):
+            centre = centres[n]
+            radius = radii[n]
+            if radius <= 0.0:
+                continue
+            dxc = x - centre[0]
+            dzc = z - centre[2]
+            if dxc * dxc + dzc * dzc <= radius * radius:
+                h[idx] = wp.max(h[idx], wp.max(0.0, levels[n] - bed[idx]))
+
+
+    @wp.kernel
+    def _measure_drain_circulation(u: wp.array(dtype=float), v: wp.array(dtype=float),
+                                   h: wp.array(dtype=float),
+                                   solid: wp.array(dtype=wp.int32),
+                                   centres: wp.array(dtype=wp.vec3),
+                                   radii: wp.array(dtype=float),
+                                   circulation: wp.array(dtype=float),
+                                   count: int, width: int, height: int,
+                                   dx: float, dry: float):
+        """Sum the tangential velocity in the annulus around each drain.
+
+        This is the whole reason the vortex is physics and not decoration. In a
+        depth-averaged shallow-water field a purely radial sink produces purely
+        radial convergence and NO rotation -- spin has to come from angular
+        momentum that is already present, which converging flow then amplifies.
+        So the drain measures the ambient circulation it actually finds and
+        conserves it; it never imposes a direction of its own. A perfectly
+        symmetric approach flow therefore yields a drain that does not spin,
+        which is correct, and the acceptance test asserts that the rotation sign
+        FOLLOWS the seeded circulation rather than matching a chosen constant.
+        """
+        idx = wp.tid()
+        if solid[idx] != 0 or h[idx] <= dry:
+            return
+        i = idx % width
+        j = idx // width
+        x = (float(i) - float(width - 1) * 0.5) * dx
+        z = (float(j) - float(height - 1) * 0.5) * dx
+        for n in range(count):
+            radius = radii[n]
+            if radius <= 0.0:
+                continue
+            centre = centres[n]
+            dxc = x - centre[0]
+            dzc = z - centre[2]
+            r = wp.sqrt(dxc * dxc + dzc * dzc)
+            # an annulus just outside the sink itself: inside it the flow is
+            # dominated by the sink we are about to apply, which would make the
+            # measurement circular in the bad sense
+            if r < radius or r > radius * 2.0:
+                continue
+            # tangential unit vector (counter-clockwise positive about +y)
+            tx = -dzc / r
+            tz = dxc / r
+            wp.atomic_add(circulation, n, (u[idx] * tx + v[idx] * tz) * h[idx])
+
+
+    @wp.kernel
+    def _apply_drains(h: wp.array(dtype=float), u: wp.array(dtype=float),
+                      v: wp.array(dtype=float), solid: wp.array(dtype=wp.int32),
+                      centres: wp.array(dtype=wp.vec3), radii: wp.array(dtype=float),
+                      strengths: wp.array(dtype=float),
+                      circulation: wp.array(dtype=float),
+                      count: int, width: int, height: int, dx: float, dt: float,
+                      dry: float, swirl_gain: float, max_velocity: float):
+        """Remove water through a localized sink and spin up the flow around it.
+
+        Removal uses a smooth radial profile and is capped by the water actually
+        present, so a drain can never pull a cell below zero or invent negative
+        depth. The velocity it imposes has two parts:
+
+        - radial, toward the centre: this is the sink's own convergence;
+        - tangential, scaled as 1/r from the measured ambient circulation: this
+          is conservation of angular momentum, which is what makes a real
+          bathtub vortex. Sign and magnitude both come from
+          `_measure_drain_circulation`, never from a constant.
+
+        Honest scope boundary: a depth-averaged model cannot represent the
+        vertical core of a vortex or the true free-surface funnel -- the vertical
+        coordinate is integrated out. What it does give is a rotating, converging
+        surface depression whose direction, strength and dependence on discharge
+        and radius are all real. That is the "causal realism, not engineering
+        realism" bar this project set for itself.
+        """
+        idx = wp.tid()
+        if solid[idx] != 0:
+            return
+        i = idx % width
+        j = idx // width
+        x = (float(i) - float(width - 1) * 0.5) * dx
+        z = (float(j) - float(height - 1) * 0.5) * dx
+        for n in range(count):
+            radius = radii[n]
+            if radius <= 0.0 or strengths[n] <= 0.0:
+                continue
+            centre = centres[n]
+            dxc = x - centre[0]
+            dzc = z - centre[2]
+            r = wp.sqrt(dxc * dxc + dzc * dzc)
+            if r > radius:
+                continue
+            # smooth bell so the sink has no hard rim to ring against
+            falloff = 1.0 - (r / radius) * (r / radius)
+            removed = wp.min(h[idx], strengths[n] * falloff * dt)
+            h[idx] = h[idx] - removed
+            if h[idx] <= dry:
+                h[idx] = 0.0
+                u[idx] = 0.0
+                v[idx] = 0.0
+                continue
+            r_safe = wp.max(r, dx * 0.5)
+            nx = dxc / r_safe
+            nz = dzc / r_safe
+            tx = -nz
+            tz = nx
+            # angular momentum: u_theta * r stays constant as fluid converges,
+            # so tangential speed grows as 1/r toward the centre
+            spin = swirl_gain * circulation[n] / r_safe
+            radial = -strengths[n] * falloff
+            u[idx] = wp.clamp(u[idx] + (nx * radial + tx * spin) * dt,
+                              -max_velocity, max_velocity)
+            v[idx] = wp.clamp(v[idx] + (nz * radial + tz * spin) * dt,
+                              -max_velocity, max_velocity)
+
+
+    @wp.kernel
     def _combine_bed(bed_terrain: wp.array(dtype=float),
                      bed_offset: wp.array(dtype=float),
                      bed: wp.array(dtype=float)):
@@ -487,6 +663,16 @@ class WarpShallowWaterSolver(FluidSolver):
         self._bed_offset_host = np.zeros(0, dtype=np.float32)
         self._bed_host = np.zeros(0, dtype=np.float32)
         self._erosion_enabled = True
+        # v0.8.0: placeable inflow / outlet. Empty arrays mean "no placed
+        # SOURCE", in which case the edge columns keep feeding the map exactly
+        # as they did in 0.7.0 -- a world with no SOURCE object behaves
+        # identically, which is what keeps the whole 0.7.0 suite valid.
+        self._outflow_columns = 0
+        self._source_count = 0
+        self._drain_count = 0
+        self._src_centres = self._src_radii = self._src_levels = None
+        self._drain_centres = self._drain_radii = None
+        self._drain_strengths = self._drain_circulation = None
         self._level = 0.5
         self._source_enabled = True
         self._seen_terrain_revision = -1
@@ -718,6 +904,50 @@ class WarpShallowWaterSolver(FluidSolver):
             self._recombine_bed()
             self._measure()
 
+    def set_outflow(self, columns: int) -> None:
+        """Width, in cells, of the transmissive outlet on the east edge.
+
+        Zero restores the fully closed domain of 0.7.0 -- which is what the
+        volume-conservation test wants, and it says so in its own name.
+        """
+        self._outflow_columns = max(0, int(columns))
+
+    def set_water_features(self, sources: list, drains: list) -> None:
+        """Upload placeable SOURCE and DRAIN objects, in world coordinates.
+
+        Called every tick from SimulationManager with live positions, so either
+        can be dragged while the simulation is RUNNING and the water responds
+        immediately -- that is the point of making them objects rather than
+        settings. Arrays are reallocated only when the count changes, so
+        dragging one does not churn GPU memory.
+        """
+        self._source_count = len(sources)
+        self._drain_count = len(drains)
+        if sources:
+            self._src_centres = wp.array(
+                np.array([item[0] for item in sources], dtype=np.float32),
+                dtype=wp.vec3, device=self.device)
+            self._src_radii = wp.array(
+                np.array([item[1] for item in sources], dtype=np.float32),
+                dtype=float, device=self.device)
+            self._src_levels = wp.array(
+                np.array([item[2] for item in sources], dtype=np.float32),
+                dtype=float, device=self.device)
+        if drains:
+            self._drain_centres = wp.array(
+                np.array([item[0] for item in drains], dtype=np.float32),
+                dtype=wp.vec3, device=self.device)
+            self._drain_radii = wp.array(
+                np.array([item[1] for item in drains], dtype=np.float32),
+                dtype=float, device=self.device)
+            self._drain_strengths = wp.array(
+                np.array([item[2] for item in drains], dtype=np.float32),
+                dtype=float, device=self.device)
+            if (self._drain_circulation is None
+                    or len(self._drain_circulation) != len(drains)):
+                self._drain_circulation = wp.zeros(len(drains), dtype=float,
+                                                   device=self.device)
+
     def set_erosion(self, enabled: bool) -> None:
         """RiverLab erosion on/off, read live each tick by SimulationManager.
 
@@ -783,11 +1013,44 @@ class WarpShallowWaterSolver(FluidSolver):
                       self._width, self._height, float(self._terrain.cell_size), dt],
                       device=self.device)
             self._h, self._next_h = self._next_h, self._h
-            if self._source_enabled:
+            if self._source_enabled and not self._source_count:
+                # a placed SOURCE takes over from the edge inflow entirely --
+                # otherwise the map has two sources and "where does the water
+                # come from" stops having a single answer
                 wp.launch(_apply_source, dim=self._count, inputs=[self._h,
                           self._bed, self._obstacles, self._width,
                           self._height, config.FLUID_SOURCE_COLUMNS,
                           self._level], device=self.device)
+            if self._source_count:
+                wp.launch(_apply_point_sources, dim=self._count,
+                          inputs=[self._h, self._bed, self._obstacles,
+                                  self._src_centres, self._src_radii,
+                                  self._src_levels, self._source_count,
+                                  self._width, self._height,
+                                  float(self._terrain.cell_size)],
+                          device=self.device)
+            if self._drain_count:
+                self._drain_circulation.zero_()
+                wp.launch(_measure_drain_circulation, dim=self._count,
+                          inputs=[self._u, self._v, self._h, self._obstacles,
+                                  self._drain_centres, self._drain_radii,
+                                  self._drain_circulation, self._drain_count,
+                                  self._width, self._height,
+                                  float(self._terrain.cell_size),
+                                  config.FLUID_DRY_DEPTH], device=self.device)
+                wp.launch(_apply_drains, dim=self._count,
+                          inputs=[self._h, self._u, self._v, self._obstacles,
+                                  self._drain_centres, self._drain_radii,
+                                  self._drain_strengths, self._drain_circulation,
+                                  self._drain_count, self._width, self._height,
+                                  float(self._terrain.cell_size), dt,
+                                  config.FLUID_DRY_DEPTH, config.DRAIN_SWIRL_GAIN,
+                                  config.FLUID_MAX_VELOCITY], device=self.device)
+            if self._outflow_columns:
+                wp.launch(_apply_outflow, dim=self._count,
+                          inputs=[self._h, self._u, self._v, self._obstacles,
+                                  self._width, self._height,
+                                  self._outflow_columns], device=self.device)
             if self._erosion_enabled:
                 # RiverLab (v0.6.0): pick material up where the flow is fast and
                 # deep, drop it where it slows, then carry the suspended load
@@ -935,6 +1198,12 @@ class WarpShallowWaterSolver(FluidSolver):
                      if self._sediment is not None else 0.0)
         return {"solver": "warp_shallow_water", "device": self.device,
                 "erosion": self._erosion_enabled,
+                "outflow_columns": self._outflow_columns,
+                "sources": self._source_count,
+                "drains": self._drain_count,
+                "drain_circulation": (
+                    [float(x) for x in self._drain_circulation.numpy()]
+                    if self._drain_count else []),
                 "suspended_sediment": suspended,
                 "grid": [self._width, self._height], "substeps": self.last_substeps,
                 "terrain_gpu_uploads": self.terrain_gpu_uploads,
