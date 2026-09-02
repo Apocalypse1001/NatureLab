@@ -44,8 +44,17 @@ export class EditorController {
       if (id) {
         const group = scene.objectsRoot.getObjectByName(id);
         if (group) this.transform.attach(group);
+        // SOURCE and DRAIN are ground fixtures: they belong on the terrain, and
+        // dragging one up into the air would silently change what the solver
+        // does (a source above its own water level fills nothing, a drain above
+        // the surface drains nothing) with no visible reason. So the vertical
+        // gizmo handle is switched off for them and their Y is pinned to the
+        // ground in pushSelectedTransform -- they move on the plane only.
+        const type = store.objects.get(id)?.type;
+        this.transform.showY = !EditorController.GROUND_FIXTURES.has(type ?? '');
       } else {
         this.transform.detach();
+        this.transform.showY = true;
       }
       scene.highlight(id);
     });
@@ -138,10 +147,18 @@ export class EditorController {
     }
   }
 
+  /** Types that live on the ground and may only be moved in the XZ plane. */
+  private static readonly GROUND_FIXTURES = new Set(['SOURCE', 'DRAIN']);
+
   private pushSelectedTransform(): void {
     const id = this.store.selectedId;
     const group = this.transform.object as THREE.Object3D | undefined;
     if (!id || !group) return;
+    // Ground fixtures stay on the terrain however the gizmo was dragged: the
+    // vertical handle is hidden, but a rotate/scale drag can still nudge Y.
+    if (EditorController.GROUND_FIXTURES.has(this.store.objects.get(id)?.type ?? '')) {
+      group.position.y = this.store.terrain.heightAt(group.position.x, group.position.z);
+    }
     this.store.updateObject(id, {
       position: [group.position.x, group.position.y, group.position.z],
       rotation: [group.rotation.x, group.rotation.y, group.rotation.z],

@@ -9,7 +9,7 @@ from pathlib import Path
 # running build always says which version it is -- the donor 0.5.0 tree carried
 # no version string anywhere, which made "which build am I looking at?"
 # answerable only by file timestamps.
-VERSION = "0.10.0"
+VERSION = "0.10.1"
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_DIR = BACKEND_DIR.parent

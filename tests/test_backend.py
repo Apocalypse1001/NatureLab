@@ -1012,6 +1012,40 @@ class WaterControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(removed[1], removed[0] * 1.5,
                            f"drain strength did not scale the discharge: {removed}")
 
+    async def test_the_drain_draws_bodies_toward_itself_by_mass_and_drag(self) -> None:
+        """The fifth check CONTINUATION.md asks of the drain: objects entering
+        its region must be advected toward it, subject to drag, buoyancy and
+        mass -- not teleported and not flung.
+
+        Two bodies at the same distance, differing only in mass and drag: the
+        light one must converge faster. Also asserts nobody is launched, because
+        the drain ASSIGNS velocity inside its disc and the quadratic drag law
+        would turn an unbounded assignment into a catapult.
+        """
+        self.manager.apply_object_add({"type": "DRAIN", "position": [0.0, 0.0, 0.0]})
+        box = self.manager.apply_object_add({"type": "BOX", "position": [8.0, 0.0, 0.0]})
+        person = self.manager.apply_object_add({"type": "PERSON", "position": [0.0, 0.0, 8.0]})
+        self.manager.apply_water_level(1.5)
+        self.manager.start()
+        self.manager.fluid._h.assign(
+            np.full(self.manager.fluid._count, 1.5, dtype=np.float32))
+
+        peak = 0.0
+        for _ in range(600):
+            self.manager._step_once()
+            peak = max(peak, float(np.abs(self.manager.rigid.buffer.velocities).max()))
+        moved_box = self.manager.world.objects[box["id"]]
+        moved_person = self.manager.world.objects[person["id"]]
+        box_r = math.hypot(moved_box.position[0], moved_box.position[2])
+        person_r = math.hypot(moved_person.position[0], moved_person.position[2])
+
+        self.assertLess(box_r, 8.0 - 0.3, "the box was not drawn toward the drain")
+        self.assertLess(person_r, 8.0 - 1.0, "the person was not drawn toward the drain")
+        self.assertLess(person_r, box_r,
+                        "the light, draggy body did not converge faster than the heavy one")
+        self.assertLess(peak, 5.0,
+                        f"a body was flung rather than drawn in (peak {peak:.2f} m/s)")
+
     async def test_source_and_drain_survive_a_save_load_round_trip(self) -> None:
         self.manager.apply_object_add({"type": "SOURCE", "position": [x_at(50), 0.0, 0.0]})
         self.manager.apply_object_add({"type": "DRAIN", "position": [x_at(150), 0.0, 0.0]})
