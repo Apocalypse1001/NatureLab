@@ -1098,9 +1098,23 @@ class WarpShallowWaterSolver(FluidSolver):
             self.set_river_inlet(True, float(water.inlet_centre_z),
                                  float(water.inlet_width_m),
                                  float(water.inlet_discharge_m3s))
-        if water is not None and float(getattr(water, "outlet_width_m", 0.0)) > 0.0:
-            self.set_outflow(self._outflow_columns, float(water.outlet_centre_z),
-                             float(water.outlet_width_m))
+        if water is not None:
+            # Erosion and the open edge are part of the world too, and for the
+            # same reason as the inlet above they are restored here rather than
+            # left to the first tick's live sync. They used to be left: the
+            # solver's own defaults (erosion ON, outlet CLOSED) are the opposite
+            # of a fresh WaterState's, and `_apply_water_settings` only runs
+            # inside `step()`. Nothing moved at IDLE so nothing behaved wrongly,
+            # but `diagnostics()` reported those defaults and the UI faithfully
+            # drew both checkboxes inverted until the user pressed PLAY --
+            # telling them a loaded scenario would erode its bed when it would
+            # not, and that its river could not leave the map when it could.
+            self.set_erosion(bool(getattr(water, "erosion_enabled", False)))
+            self.set_outflow(
+                config.FLUID_OUTFLOW_COLUMNS
+                if bool(getattr(water, "outflow_enabled", True)) else 0,
+                float(getattr(water, "outlet_centre_z", 0.0)),
+                float(getattr(water, "outlet_width_m", 0.0)))
         self._recombine_bed()
         self._measure()
         self._volume_at_start = float(self._diag["volume_m3"])

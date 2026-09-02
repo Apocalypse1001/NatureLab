@@ -406,6 +406,38 @@ const builders: Record<string, Builder> = {
     return g;
   },
 
+  ROAD: (obj) => {
+    // One 12 x 7 m slab of street, laid along its local X. Roads are built from
+    // several of these rather than one long one so each segment can sit at the
+    // elevation of the ground under it: the floodplain falls 0.002, and a 70 m
+    // slab at a single height would be buried at one end and floating at the
+    // other.
+    //
+    // The water passes straight over it, and that is right, not a shortcut --
+    // see the ROAD note in world_state.OBJECT_DEFAULTS.
+    const g = new THREE.Group();
+    const asphalt = new THREE.MeshStandardMaterial({
+      color: tinted(OBJECT_COLORS.ROAD, 0.06, variant(obj.id)), roughness: 0.95,
+    });
+    const kerb = new THREE.MeshStandardMaterial({ color: 0x9c9689, roughness: 0.9 });
+    const paint = new THREE.MeshStandardMaterial({ color: 0xe8e2cf, roughness: 0.8 });
+    const deck = new THREE.Mesh(new THREE.BoxGeometry(12, 0.12, 7), asphalt);
+    deck.position.y = 0.06;
+    g.add(deck);
+    for (const z of [-3.36, 3.36]) {
+      const edge = new THREE.Mesh(new THREE.BoxGeometry(12, 0.2, 0.28), kerb);
+      edge.position.set(0, 0.1, z);
+      g.add(edge);
+    }
+    // centre line, dashed, so the direction of the street is legible from above
+    for (const x of [-4.5, -1.5, 1.5, 4.5]) {
+      const dash = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.02, 0.18), paint);
+      dash.position.set(x, 0.13, 0);
+      g.add(dash);
+    }
+    return g;
+  },
+
   SOURCE: () => {
     // Where the water comes from. Drawn as an open ring with an arrow pointing
     // downstream, at the radius the solver actually uses for the inflow disc --

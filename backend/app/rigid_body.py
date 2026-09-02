@@ -177,7 +177,8 @@ class RigidStateBuffer:
 
 def footprint_half_extents(obj: WorldObject) -> np.ndarray:
     base = {"HOUSE": (2.0, 2.0), "CAR": (2.2, 1.0), "TREE": (0.25, 0.25),
-            "BOX": (0.6, 0.6), "DEBRIS": (0.6, 0.6), "GAUGE": (0.0, 0.0)}
+            "BOX": (0.6, 0.6), "DEBRIS": (0.6, 0.6), "GAUGE": (0.0, 0.0),
+            "ROAD": (6.0, 3.5)}
     hx, hz = base.get(obj.type, (0.5, 0.5))
     return np.asarray((hx * obj.scale[0], hz * obj.scale[2]), dtype=np.float32)
 

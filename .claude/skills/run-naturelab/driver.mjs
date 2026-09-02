@@ -261,11 +261,16 @@ async function handle(line) {
       return JSON.stringify(await page.evaluate(() => {
         const store = globalThis.__NL.store;
         const out = [];
-        for (const o of Object.values(store.objects ?? {})) {
-          if (o.type === 'GAUGE') out.push({ id: o.id, position: o.position,
-                                             reading: o.metadata ?? null });
+        // store.objects is a Map -- Object.values() on it returns [], which is
+        // why this reported "no gauges" on a world that had two.
+        for (const o of store.objects.values()) {
+          if (o.type !== 'GAUGE') continue;
+          const state = store.gauges.get(o.id) ?? null;
+          out.push({ id: o.id, position: o.position,
+                     arrival_s: state?.arrival_time_s ?? null,
+                     latest: state?.latest ?? null });
         }
-        return { gauges: out, history: (store.gaugeHistory ?? null) };
+        return { gauges: out };
       }));
     case 'tracers': {
       const n = parseInt(arg, 10) || 0;

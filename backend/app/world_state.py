@@ -46,6 +46,7 @@ class ObjectType(str, enum.Enum):
     ROCK = "ROCK"
     BRIDGE = "BRIDGE"
     PERSON = "PERSON"
+    ROAD = "ROAD"
     SOURCE = "SOURCE"
     DRAIN = "DRAIN"
     GAUGE = "GAUGE"
@@ -127,6 +128,17 @@ OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
                         "ground_contact_area": 0.06, "cross_sectional_area": 0.55,
                         "is_static": False,
                         "foundation_height": 0.0, "damage_resistance": 0.15},
+    # A street. Static, and deliberately NOT an obstacle and NOT a raised bed:
+    # flat asphalt laid on a floodplain changes the roughness the flow feels, not
+    # the elevation of the bed, so water running straight across it is the
+    # correct answer rather than a shortcut. The place that will eventually make
+    # a road hydraulically real is `FLUID_MANNING_N` in `_velocity_step`, which
+    # is a scalar today and which the volcano plan already needs as an array.
+    ObjectType.ROAD:   {"mass": 30000.0, "friction": 0.9, "buoyancy": 0.0,
+                        "volume_m3": 10.0, "drag_coefficient": 1.0,
+                        "ground_contact_area": 84.0, "cross_sectional_area": 0.9,
+                        "is_static": True,
+                        "foundation_height": 0.0, "damage_resistance": 0.9},
     # Placeable inflow. Holds water at `inflow_level` inside `inflow_radius`,
     # using the same rule as the map-edge inflow (h = max(0, level - bed)), so a
     # source on a hillside fills to the height asked for instead of drowning the

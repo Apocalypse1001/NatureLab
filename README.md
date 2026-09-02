@@ -1,401 +1,230 @@
-# NatureLab 0.12.1 - Educational FloodLab / RiverLab
+# NatureLab
 
-Стабилизированная физическая и GPU-архитектура FloodLab.
+*[Русская версия](README.ru.md) — including the full version-by-version history.*
 
-```text
-Three.js -> WebSocket -> FastAPI -> SimulationManager -> NVIDIA Warp/CUDA
-```
-
-> **Продолжение работы:** [`docs/08_volcano_plan.md`](docs/08_volcano_plan.md) — блок
-> «С ЧЕГО ПРОДОЛЖИТЬ» описывает v0.13.0 «Вулкан-1». Река и паводок отложены на v0.15.0,
-> их план и незакрытый дефект солвера — в [`docs/07_river_plan.md`](docs/07_river_plan.md).
-> `CONTINUATION.md` — исторический документ и описывает **другое** дерево.
-
-## Что нового в 0.12.1 — объекты: тени, свет и узнаваемые формы
-
-Физика в 0.12.0 уже считала больше, чем сцена показывала. Дом, машина и дерево были
-цветными коробками без теней: объект нельзя было отличить от наклейки на рельефе.
-
-- **Тени.** `shadowMap` включён (PCFSoft). Солнце и границы его теневой камеры выводятся
-  из `terrain.sizeM` и пересчитываются вместе с туманом и камерой в
-  `SceneManager.rebuildGridGeometry()`. Раньше позиция солнца была единственным числом в
-  конструкторе, не зависящим от размера мира: свету без тени всё равно, где он стоит, а
-  свету с тенью — нет, и на карте 200 м теневая камера по умолчанию обрезала бы всё
-  дальше нескольких метров от начала координат. Рельеф тени принимает, объекты бросают и
-  принимают, вода и облака точек (трассеры, брызги) в затенении не участвуют вовсе.
-- **Три источника света вместо двух.** Небесная подсветка поднимает то, куда не достаёт
-  солнце; солнце — единственный источник теней и даёт форму; слабый отражённый свет с
-  противоположной стороны не даёт затенённой стене стать чёрной, а это ровно та стена, в
-  которую бьёт вода.
-- **Геометрия объектов.** Дом получил цоколь (те же 0.3 м, что и
-  `metadata.foundation_height`), дверь со ступенькой, окна и трубу; машина — стёкла,
-  фары, бамперы и диски; дерево — ярусную крону; человек — кисти и ботинки; ящик —
-  дощатый каркас; мусор — россыпь обломков вместо одной гальки; мост — настил, стойки
-  перил и оголовки опор; камень — неровный валун вместо гладкого купола.
-- **GAUGE стал водомерной рейкой** с чередующимися полосами по 0.25 м: числа даёт
-  спарклайн, но глубину ребёнок читает по полосатой рейке, и эти полосы — настоящие метры.
-- **Габариты заморожены.** Ни один билдер не изменил размер, который читает солвер: дом
-  остаётся 2.0 x 2.0 полуразмера маски препятствий, машина 2.2 x 1.0, камень —
-  `ROCK_BASE_RADIUS_M = 1.5`, мост — `BRIDGE_SPAN_M = 24` с опорами по краям и в середине.
-  Вся детализация добавлена **внутрь** этих оболочек: то, что видит пользователь,
-  остаётся тем, что чувствует вода.
-- **Каждый объект чуть отличается от соседа** — оттенок, поворот, размер кроны, — но
-  отличается детерминированно, от `id`: лес, который перетасовывается при каждой
-  перезагрузке, был бы хуже клонированного.
-
-## Что нового в 0.12.0 — река: русло, вход по расходу, выход и баланс
-
-На плоской карте реки быть не может: открытый поток гонит **уклон дна**, а не давление на
-входе, а рельеф стартовал как `np.zeros`. Поэтому в 0.12.0 три вещи, и первая из них —
-предпосылка для остальных.
-
-- **Генератор долины** (`backend/app/terrain_gen.py`, кнопка «Generate river valley» в
-  панели Terrain, скрипт `tools/make_river_world.py` -> `data/river_valley.json`). Пойма с
-  продольным уклоном, трапецеидальное русло, берега поднимаются **сглаженной ступенькой**,
-  а не фаской: у фаски излом в подошве и в бровке, и ровно там встаёт стоячая волна.
-- **Вход по заданному расходу Q.** Река задаётся расходом; уровень — это ответ русла, а не
-  вторая ручка (задать оба — переопределить границу). Расход задаётся там, где живут
-  потоки, — в `_depth_step`; скорость на кромке это просто `q/h` с ограничением по Фруду.
-- **Локальный выход полосой строк** и **вынос взвеси через него**: раньше вода уходила, а
-  её осадок оставался, и восточная кромка обрастала косой из материала, который река уже
-  «вынесла в море».
-- **Счётчики объёма.** `added_m3`, `removed_m3`, `volume_error_m3`, измеренный
-  `inlet_discharge_m3s` — и `substeps` / `cfl_limited` в нижней строке HUD. Без них
-  граничное условие нечем доказать: «вода появляется на входе» и «на входе появляется
-  ровно столько воды, сколько заказано» выглядят на экране одинаково. Невязка баланса —
-  0.007 м3 на 3220 м3.
-
-Самое полезное, что дал этот релиз, нашлось не в тестах, а в **прогоне на 150 секунд**:
-все тесты жили на горизонте 20 с и не видели, что вход работал бесконечным резервуаром —
-запрошено 12 м3/с, доставлено 700. Разбор — в
-[`docs/07_river_plan.md`](docs/07_river_plan.md), раздел «Что показал длинный прогон».
-
-Подробности и числа: [`TEST_REPORT.md`](TEST_REPORT.md), раздел 13.
-
-## Что нового в 0.11.0 — трение дна, которое читает глубину
-
-Вода тормозилась множителем `decay = 1 - 0.15·dt` — одинаково на 1.5 м и на 5 см. Под
-таким законом русло и пойма текут с одной скоростью, а это ровно то, чего река делать не
-должна. Заменено законом Маннинга `g·n²·|u|·u / h^(4/3)`, применяемым неявно (делением на
-`1 + drag`: деление не может развернуть поток, а вычитание перехлёстывает как раз на
-тонком быстром фронте).
-
-Различающий замер — плоское дно, ровная глубина, ровный 1 м/с, градиента поверхности нет:
-глубина 1.0 м оставляет 0.958 м/с, глубина 0.0625 м — 0.360 м/с. Старый закон давал 0.4724
-на обеих. Новый закон **в 17 раз слабее** старого на метровой глубине и сильнее ниже
-перехода (~0.12 м при 1 м/с), то есть это не «больше трения», а трение, наконец
-зависящее от глубины.
-
-Побочно эта правка вскрыла дефект плавучести: погружение считалось от собственной высоты
-тела, а плавучее тело держится на `surface - draft` — то есть выталкивающая равнялась весу
-с запасом **0.000 %**, и с появлением настоящих волн машины замерцали (307 переходов
-состояния за 406 кадров). Теперь погружение меряется от опоры — дна или настила моста.
-
-Подробности и числа: [`TEST_REPORT.md`](TEST_REPORT.md), разделы 10–12.
-
-## Что нового в 0.10.0 — вода, ведомая настоящим течением
-
-Просьба была «анимация воды и брызг лучше, поищи лучшие решения для three.js».
-Решения нашлись, и **ни одно из них не подошло** — по причине, которую стоит назвать
-прямо: `THREE.Water`, FFT-океаны и рисованные flow maps все предполагают **плоскость с
-выдуманным движением**. Здесь ситуация обратная: есть деформируемый меш высот, который
-ведёт настоящее поле `u/v` из Warp-солвера. Правильный ответ — не подключить
-библиотеку, а вывести картинку из физики, которая уже посчитана.
-
-- **Поле скоростей наконец стримится.** `FrameKind.VELOCITY_FIELD = 2` лежал в
-  протоколе с самой первой версии и никогда не заполнялся. Теперь он идёт на фронтенд
-  (троттлинг раз в `VELOCITY_STREAM_EVERY = 3` кадра — flow map низкочастотен, а это
-  самый крупный оставшийся payload после трассеров) и приходит в шейдер как атрибут
-  `aFlow`.
-- **Рябь плывёт вдоль настоящего течения** с той скоростью, с какой реально движется
-  вода. Стоячая вода поэтому выглядит стоячей — бесплатно, без отдельного правила.
-- **Пена там, где вода реально быстрая и мелкая** — то есть там, где вода в реальности
-  и белеет: за валуном, между опорами моста, по кромке наступающего фронта. Не там, где
-  так нарисовали текстуру.
-- **Брызги** порождаются только из клеток, где скорость выше 1.4 м/с и глубина меньше
-  0.9 м. Широкий медленный разлив, каким бы большим он ни был, брызг не даёт — и это
-  правильно.
-- **Цвет от настоящей глубины**: мелкие края светлее и зеленее русла, поэтому форма
-  реки читается сверху.
-
-Следствие, которое стоит проговорить: **если физика неверна, это будет видно.** Так и
-задумано. Более красивый шейдер, прячущий физику, был бы ровно той декоративной водой,
-против которой прямо предостерегает `docs/01_vision.md`.
-
-Цена по времени кадра — около **1.2 мс** (37.0 → 38.2 мс медианы на программном
-рендерере в headless Chrome, то есть в худшем случае).
-
-Тестами закреплено, что стрим соответствует солверу побитово, что **знак** течения
-правильный (перевёрнутый знак анимировал бы реку задом наперёд, и все проверки величин
-это пропустили бы) и что троттлинг работает.
-
-## Что нового в 0.9.0 — мост и люди
-
-### `BRIDGE` — опоры перекрывают, настил нет
-
-Мост — не стена. Растеризовать его целиком означало бы перекрыть плотиной ту самую
-реку, которую он пересекает, — то есть ровно противоположное тому, что делает мост.
-Поэтому в маску препятствий попадают **только опоры** (три диска по пролёту 24 м,
-`pier_count` / `pier_radius`), а настил не попадает никогда: вода идёт под мостом.
-
-Отсюда бесплатно получается образовательный смысл: опоры сужают русло, и поток между
-ними разгоняется. Измерено — средняя скорость между опорами **1.674 м/с** против
-**1.165 м/с** в тех же рядах вдали от моста, то есть **+44 %**.
-
-Настил становится важен ровно один раз — когда река до него доходит. Это настоящий
-причинно-следственный момент, поэтому он оформлен событием `BRIDGE_DECK_FLOODED`
-(с высотой настила и отметкой воды), а не молча изменившимся числом. Событие
-срабатывает один раз за прогон. Проверено: настил 0.6 м уходит под воду на 9.683 с,
-настил 6.0 м не уходит вовсе.
-
-### `PERSON` — фигурки, которые уносит
-
-Лёгкие (70 кг), высокие для своей опорной площади и с большим сопротивлением — именно
-поэтому текущая вода уносит человека так легко. Это и есть урок, а не модель: в логе
-событий появляется `Person_003 OBJECT_STARTED_MOVING (gpu_drag_exceeds_friction)`,
-то есть причина названа.
-
-Причинный порядок проверен тестом: **человек трогается раньше машины** при одинаковой
-воде, а на сухой земле не двигается вообще (контроль — без него «фигурка поехала»
-ничего не доказывало бы про воду).
-
-Визуально — блочная фигурка в стиле лего человеческого роста (~1.7 м).
-
-## Что нового в 0.8.0 — управление водой
-
-Три вещи, которые вместе отвечают на «откуда вода течёт и куда девается».
-
-### Вода наконец уходит с карты
-
-До этой версии **все внешние границы были непроточными**: вода, вошедшая в мир, не
-могла из него выйти, и карта просто наполнялась. Замерено до фикса: объём рос
-2290 → 3484 → 4311 м³ и не убывал ни разу. Теперь восточная кромка — проточный
-выпуск: скорость на ней больше не обнуляется (но допускается только наружу, иначе
-кромка стала бы вторым, случайным источником), а расход, который прошёл бы через
-внешнюю грань, снимается явно, `q = u·h`. Чекбокс **Open downstream edge**, включён
-по умолчанию.
-
-Замерено: закрытая область сохраняет объём точно (−0.0 %), открытая теряет воду
-(−0.9 % за 30 с при уклоне 2 %).
-
-### `SOURCE` — перемещаемый исток
-
-Новый тип объекта: ставится мышкой, двигается по плоскости, держит воду на высоте
-`inflow_level` внутри `inflow_radius`. Правило то же, что у кромочного притока —
-`h = max(0, level − bed)`, — поэтому исток на склоне наливает ровно до заданной
-отметки, а не затапливает холм сверху. Позиции читаются **живьём каждый тик**, так
-что исток можно таскать прямо во время симуляции, и вода отвечает сразу; ради этого
-он и сделан объектом, а не настройкой. Пока в мире есть хоть один `SOURCE`, кромочный
-приток полностью отключается — иначе у карты было бы два источника и у вопроса
-«откуда течёт вода» не стало бы одного ответа.
-
-### `DRAIN` — слив с настоящим водоворотом
-
-Слива в проекте **не было**: он числился в `CONTINUATION.md` как pending request с
-эскизом дизайна. Теперь он есть, ставится и двигается как обычный объект, и вращение
-у него не нарисованное.
-
-Ключевой физический факт: **в depth-averaged модели чисто радиальный сток даёт чисто
-радиальное схождение и никакого вращения.** Вихрь в ванне — это сохранение момента
-импульса: сходящаяся жидкость раскручивает ту слабую циркуляцию, которая уже была.
-Поэтому слив **измеряет** циркуляцию в кольце вокруг себя и переносит её внутрь как
-`v_θ · r = const`; направление он не выбирает никогда. Симметричный подход воды даёт
-слив, который не крутится, — и это правильно.
-
-Приёмочный тест проверяет ровно это: **знак вращения следует знаку затравочной
-циркуляции**, а не совпадает с захардкоженной константой. Измерено: затравка
-+0.8 → +1.93 м/с по касательной, затравка −0.8 → −1.93 м/с, затравка 0 → ровно 0,
-при этом радиальное схождение −1.35 м/с во всех трёх случаях.
-
-Найденный по дороге дефект собственного дизайна: сначала скорость схождения и темп
-отбора воды были двумя независимыми ручками, и схождение обгоняло сток — клетка со
-сливом оказывалась **глубже** (1.254 м), чем то же место без слива (1.219 м). Теперь
-радиальная скорость выводится из расхода по неразрывности,
-`v_r = −Q(r) / (2πr·h)`, и разойтись они больше не могут. После фикса: 0.000 м против
-1.219 м.
-
-**Честная граница:** depth-averaged модель принципиально не даёт вертикального ядра
-вихря и настоящей воронки — вертикальная координата в ней проинтегрирована. Что она
-даёт — вращающуюся сходящуюся депрессию поверхности с правильным направлением,
-правильной зависимостью от расхода и радиуса и правильным увлечением тел. Это
-заявленный уровень «причинный реализм, не инженерный».
-
-## Что нового в 0.7.0 — карта 200×200 м
-
-Карта удвоена по просьбе пользователя: реке нужно место, чтобы меандрировать, а на
-100 м русло, которое хоть немного изгибается, упирается в край. Размер клетки
-намеренно оставлен 1 м, а не растянут, — детали русла, отдельные валуны и узкие
-протоки остаются такими же читаемыми. Цена — вчетверо больше клеток (40 401 вершина).
-
-- `WORLD_SIZE_M` 100 → 200, `TERRAIN_CELLS` 100 → 200.
-- **Трассеров стало 36 000 вместо 8 000.** Масштабировано по площади (×4) и поднято
-  сверх того: жалоба была «не всегда понятно, что вода течёт», а плотность трассеров —
-  именно то, что это сообщает. Это частицы, переносимые настоящим полем скоростей на
-  GPU, а не декоративные спрайты. Потолок слайдера поднят вместе с ними, иначе три
-  четверти трассеров были бы просто не видны.
-- **Найден и исправлен скрытый баг, который вскрыло увеличение карты.**
-  `SceneManager` строил геометрию из размера сетки по умолчанию и при `rebuildTerrain`
-  переписывал только высоты вершин, но не разрешение. До сих пор это работало лишь
-  потому, что дефолт фронтенда случайно совпадал с бэкендом. На 200 м бэкенд начал
-  слать 40 401 высоту в меш из 10 201 вершины, `setWaterHeights` отбраковывал каждый
-  кадр по проверке размера — и вода просто не появлялась. Теперь сцена перестраивает
-  геометрию, сетку-хелпер, камеру, туман и границы зума при смене разрешения.
-- **Камера, туман и пределы зума выводятся из размера мира**, а не заданы числами: на
-  удвоенной карте прежние значения оставляли половину мира за кадром и в тумане.
-- **Тесты больше не знают размер сетки наизусть.** И `tests/test_backend.py`, и
-  `tests/e2e.mjs` спрашивали `101`, `10201` и абсолютные координаты вроде `-45`.
-  Теперь всё выражено через `config.TERRAIN_CELLS` и через живой размер мира —
-  следующее изменение размера не потребует переписывать тесты.
-
-Замеренное время кадра (headless Chrome на **программном** SwiftShader — это худший
-случай, не то, что увидит пользователь на своей GPU):
+**An educational physics sandbox where nothing is animated.** You change the world; a GPU
+shallow-water solver works out what happens next. A house floods because the water got
+that deep, a car moves because the drag on it exceeded the friction holding it down, and a
+bridge's piers speed the flow between them because they are actually in the way.
 
 ```text
-100×100 м, 8 000 трассеров:   медиана 17.4 мс   p95 18.9 мс   47 326 треугольников
-200×200 м, 36 000 трассеров:  медиана 37.0 мс   p95 41.6 мс  158 622 треугольника
+Three.js  ->  WebSocket  ->  FastAPI  ->  SimulationManager  ->  NVIDIA Warp / CUDA
 ```
 
-Sim FPS при этом остаётся 58–59: физика на 5090 удвоения не заметила, весь рост —
-на главном потоке браузера. Если на реальной GPU этого окажется мало, следующий шаг —
-разбиение водного меша на чанки, а не уменьшение карты.
+The backend is authoritative. The frontend draws, edits and measures — it never invents
+motion. That distinction is the whole project: a prettier picture that hid the physics
+would defeat the point, so if the simulation is wrong, the screen shows it.
 
-## Что нового в 0.6.0 — RiverLab
+Version 0.12.2. Backend suite 87/87, browser E2E 19/19, on an RTX 5090.
 
-Река получила право менять собственное русло. Замкнутый контур из `01_vision.md`
-(поток → эрозия → перенос грунта → осаждение → изменение русла → изменение потока)
-теперь считается целиком на GPU.
+---
 
-- **Осадок и эрозия на Warp.** `capacity = k · |u| · h` от настоящей скорости (на старом
-  диффузионном солвере тут стоял flux-суррогат, см. `docs/05_audit_v0.4_water.md`, P1-1).
-  Клетка ниже ёмкости поднимает грунт со дна, выше — роняет; взвесь переносится тем же
-  полем скоростей полулагранжевой адвекцией.
-- **Дно стало собственностью солвера.** `_bed_terrain` меняется на GPU каждый тик, а
-  ревизионная загрузка с хоста осталась только для правок пользователя (кисть, загрузка,
-  RESET). Иначе эрозия перезаливала бы сетку 60 раз в секунду и затирала живое состояние
-  GPU устаревшей копией с хоста.
-- **Тип `ROCK` — часть русла, а не стена.** Валун намеренно не попадает в бинарную маску
-  препятствий (та — бесконечно высокая стена: верно для дома, неверно для камня), а
-  поднимает эффективное дно куполом `bed_height`. Из одного этого решения выходит всё:
-  поток обтекает камень, глубокая вода переливается через него, эффект масштабируется
-  размером (`Scale Y` — уже готовая ручка) и положением, а купол пересчитывается из живых
-  позиций и никогда не пишется в рельеф мира — передвинутый камень не оставляет кратера.
-- **Изменившийся рельеф стримится при RUNNING** (`terrain_patch`, троттлинг 1 с). Без
-  этого эрозия была бы физически реальной на бэкенде и невидимой на экране — ровно тот
-  класс бага, который проект уже ловил с самой водой.
-- **Чекбокс Erosion**, по умолчанию выключен: с ним включённым рельеф, который построил
-  пользователь, перестаёт быть тем рельефом, который он получит обратно.
+## What it is for
 
-Измерено (River A против River B, 20 с, отличие только в одном валуне): камень изменил
-дно более чем на 1 см в 90 клетках, максимум 0.31 м, и изменение локализовано у камня, а
-не размазано по карте.
+It is aimed at children learning by experiment, and the questions it exists to answer are
+the ones a child actually asks:
 
-## Что нового в 0.5.1
+- What happens if I put the house higher?
+- What if I park the car closer to the river?
+- What if I build a wall — where does the water go instead?
+- Why did that tree stay and this one wash away?
+- What if I narrow the channel? What if I make the slope steeper?
 
-Собственной физики эта версия не добавляет — она сводит воедино две ветки, которые
-разошлись: GPU-движок 0.5.0 и слой документации/истории этого репозитория. Разбор
-расхождения — [`docs/06_next_steps.md`](docs/06_next_steps.md).
+Nothing is scripted. There is no "at t = 3 s the car moves". There is a force, a mass, a
+drag coefficient and a friction coefficient, and the car moves when the numbers say so.
 
-- Движок 0.5.0 (Warp `h/u/v` shallow water, GAUGE, tracers, e2e) перенесён в
-  репозиторий под git; вся история и цепочка `docs/01…06` сохранены.
-- Прежний NumPy-солвер (диффузия высот) удалён; его аудит и причины замены —
-  [`docs/05_audit_v0.4_water.md`](docs/05_audit_v0.4_water.md). Состояние до замены
-  доступно по тегу `v0.4-numpy-riverlab`.
-- Появился единый источник истины для версии (`config.VERSION`) — она видна в
-  заголовке приложения и в `/api/status`.
-- `tools/make_release.py` собирает самодостаточный архив в `releases/`: распаковал
-  и запустил, без пересборки фронтенда.
-- Агентский драйвер `.claude/skills/run-naturelab/` приведён в соответствие с новым
-  протоколом (кадр `WATER_HEIGHT` теперь несёт абсолютную отметку поверхности, а не
-  глубину).
+---
 
-**Временно отсутствует относительно ветки v0.4:** эрозия, перенос осадка, тип `ROCK`
-с поднятием дна и температурная гипотеза Шаубергера. Переносятся на Warp-солвер
-следующей версией (v0.6.0) — см. `docs/06_next_steps.md`, раздел 2.
+## Scenarios
 
-## Physics Foundation
+Two prepared worlds ship with it, in the **Scenarios** panel. Both drop you into the same
+small town — ten houses, a street, figures, a wood and a rubbish dump — and both stay
+completely editable: brush the terrain, move objects, change the discharge, press PLAY.
 
-- Reflective/no-flux границы без frozen edge depth и поперечного drift.
-- Bed-aware face flux: вода не проходит через terrain выше free surface.
-- HOUSE footprint является solid, depth/u/v внутри solid всегда равны нулю.
-- Rotated HOUSE использует точный yaw-oriented footprint без solid AABB corners.
-- Dry и solid water triangles удаляются из frontend geometry.
-- MOVE/REMOVE HOUSE консервативно remap существующую воду без phantom volume.
-- Terrain и obstacle GPU buffers обновляются только по revision.
-- CFL timestep зависит от `max(|velocity| + sqrt(g*depth))`.
-- Fluid sampling по ориентированному 3x3 footprint, drag force и rigid integration выполняются Warp kernels на `cuda:0`.
-- Высота основания объекта учитывается при расчёте погружения.
-- Object motion использует mass, volume, drag, contact area и ground friction.
-- Поддерживаются реальные состояния INTACT, MOVING, FLOATING, SETTLED.
-- Edge inflow level задаёт высоту воды на левой границе `x=-100 м`.
-- При старте вся карта сухая, кроме двух крайних source columns; волна распространяется физически от края.
-- Terrain editing заблокирован во время RUNNING.
-- Старые demo particles заменены 8 000 tracers реального velocity field с UI-контролем.
+| | |
+|---|---|
+| **River** | The town on the bank of a running river, fed by a prescribed discharge of 12 m³/s, at which the channel runs about a metre deep and the town stays dry. At the discharge slider's maximum of 80 m³/s the channel goes bankfull at 2.1 m and about 13 cm of water stands in the street from roughly 200 s. |
+| **Dam** | The same town, below a dam holding a reservoir. At the discharge it ships with, the spillway carries the river and the dam holds. Push Q past about 60 m³/s and the crest is overtopped after roughly six minutes of simulated time — or cut the crest with the terrain brush and watch it go at once. |
 
-## Educational Measurements
+The dam is **terrain, not an object**, and that is a physics decision. Solid obstacles are
+rasterized as infinitely tall walls, so an object dam could never be overtopped — and
+overtopping is the entire lesson. A ridge written into the heightfield spills correctly
+and can be breached with the ordinary brush.
 
-- `GAUGE` является не влияющей на поток измерительной точкой.
-- Live measurements: water depth, absolute surface elevation и flow speed.
-- Wave arrival фиксируется один раз событием `WATER_ENTERED_AREA`.
-- История хранит 600 samples с шагом 0.1 s simulation time и отображается sparkline.
-- Runtime measurements очищаются при MOVE/RESET и не загрязняют сохранённый WorldState.
+Every number above is measured, not chosen. `docs/probe_dam_v0121.py` runs the real solver
+on the real generated terrain and prints the reservoir surface against the crest; the river
+figures come from the same headless path on the shipped world.
 
-## Запуск
+Both worlds are ordinary saved worlds, rebuilt with:
 
-Требуется Python 3.12:
+```bat
+python tools\make_scenarios.py
+```
+
+The rubbish dump sits **upstream** of the town on purpose. Everything in it is light and
+draggy, so when the water arrives the rubbish is what moves first — and it moves into the
+town. That is a causal chain, not scenery.
+
+---
+
+## Physics
+
+**Fluid.** A real shallow-water solver (`h`, `u`, `v`) in NVIDIA Warp on CUDA, with an
+adaptive CFL timestep driven by `max(|u| + sqrt(g·h))`. Reflective/no-flux boundaries with
+no frozen edge depth; bed-aware face fluxes, so water cannot pass through terrain standing
+above the free surface. The map starts dry — a wavefront has to physically travel across
+it.
+
+**Water sources.** Three, and only ever one at a time: an edge inflow held at a level, a
+placeable `SOURCE` disc, and a prescribed-discharge river inlet where Q is the control and
+the water level is the channel's answer. Prescribing both would over-determine the
+boundary.
+
+**Boundaries and bed.** A `DRAIN` removes water through a smooth radial sink and spins the
+flow from the circulation it measures — the vortex is the velocity field's, not an
+animation. Optional erosion lets the river cut and fill its own bed. Bed friction reads
+the local depth, so a thin sheet is slowed more than a deep channel.
+
+**Rigid bodies.** Mass, volume, drag coefficient, contact area and ground friction, with
+buoyancy from the sampled water column and collision correction on 2D footprints. Objects
+report real states — INTACT, MOVING, FLOATING, SETTLED. A `PERSON` is light, tall for its
+footprint and draggy, which is exactly why moving water carries one off so readily.
+
+**Obstacles.** A `HOUSE` is solid to the flow at its exact yaw-oriented footprint. A
+`BRIDGE` obstructs with its piers only — water flows under the deck, because a bridge that
+dams its own river is not a bridge — and reports the moment the deck goes under. A `ROCK`
+is riverbed rather than wall: it raises the bed by a dome of its own visible radius, so
+water passes over it. A `ROAD` changes neither, and that is correct: flat asphalt on a
+floodplain changes roughness, not bed elevation.
+
+**Measurement.** A `GAUGE` is a staff gauge that measures without disturbing what it
+measures — excluded from the obstacle mask, and asserted to be so by its own test. It
+reports depth, absolute surface elevation, flow speed and wave arrival time, keeps a
+bounded history, and fires `WATER_ENTERED_AREA` exactly once.
+
+**Volume ledger.** Every boundary reports what it added and removed, and the difference
+against the measured volume is displayed live. A boundary condition that cannot be audited
+is a boundary condition nobody should trust.
+
+---
+
+## Visuals
+
+What is drawn is what the solver uses. The water surface is the real height field, and the
+ripples travel along the real velocity field at the speed the water is really moving —
+still water is visibly still. Foam appears where the flow is genuinely fast and shallow,
+which is where white water actually breaks. Spray is emitted from the same fields.
+
+Objects are grounded with real shadows, whose sun position and shadow frustum are derived
+from the world size rather than fixed metres. Every builder is bound by one rule: it may
+not change a dimension the solver reads. A house keeps the 2.0 × 2.0 m half-extent its
+obstacle mask is stamped from; a rock keeps its dome radius; a bridge keeps its span and
+pier spacing. All detail is added inside those envelopes.
+
+---
+
+## Running it
+
+Python 3.12 and a Chromium-family browser.
 
 ```bat
 python -m pip install -r backend\requirements.txt
 start.bat
 ```
 
-`start.bat` поднимает backend и открывает браузер; `NatureLab.exe` делает то же самое,
-если он собран (`build_exe.bat`). Приложение доступно только на `http://127.0.0.1:8756/`.
+`start.bat` starts the backend and opens the browser at `http://127.0.0.1:8756/`. It binds
+to localhost only. `NatureLab.exe` does the same if it has been built (`build_exe.bat`).
 
-Из распакованного архива (`releases/NatureLab_v*.zip`) всё работает сразу: собранный
-фронтенд лежит внутри, `npm` для запуска не нужен.
+An unpacked release archive (`releases/NatureLab_v*.zip`) runs as-is — the built frontend
+is inside it, so npm is not needed to run.
 
-## Сборка релиза
+Building from source:
+
+```bat
+cd frontend && npm ci && npm run build && cd ..
+cd backend && python -m uvicorn app.main:app --host 127.0.0.1 --port 8756
+```
+
+---
+
+## Tests
+
+Node.js ≥ 22.12 and Chrome/Edge.
+
+```bat
+python tests\test_backend.py     # 87 CUDA/Warp physics and regression tests
+node tests\e2e.mjs               # 19 browser + WebSocket checks, own backend on 8756
+```
+
+The physics suite covers lake-at-rest, 1D symmetry, volume conservation, terrain barriers,
+static and moving obstacles, GPU upload revisions, adaptive CFL, heavy-vs-light response,
+zero flow, RESET, determinism, the generated channel's geometry, the discharge inlet's
+delivered Q, the drain's measured circulation, and the scenarios' layout rules.
+
+`tests\run_all.bat` additionally runs the launcher test and needs a built `NatureLab.exe`.
+
+---
+
+## Releases
 
 ```bat
 cd frontend && npm run build && cd ..
-python tools\make_release.py 0.12.1
+python tools\make_release.py 0.12.2
 ```
 
-Создаёт `releases\NatureLab_v0.12.1.zip` и записывает его SHA-256 в
-`releases\CHECKSUMS.txt`. Тот же номер проставляется в `config.VERSION`, поэтому
-запущенное приложение всегда сообщает, какая это версия.
+Writes `releases\NatureLab_v<version>.zip` and records its SHA-256 in
+`releases\CHECKSUMS.txt`. The same number is written into `config.VERSION`, so a running
+build always reports which one it is.
 
-## Тесты
+---
 
-Требования: Node.js >=22.12 и Chrome/Edge.
+## Documentation
 
-```bat
-python tests\test_backend.py
-node tests\e2e.mjs
-```
+| | |
+|---|---|
+| [`docs/01_vision.md`](docs/01_vision.md) | What the project is for, and what it refuses to be |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Data flow and coupling |
+| [`docs/07_river_plan.md`](docs/07_river_plan.md) | The river, its measurements, and one unresolved solver defect |
+| [`docs/08_volcano_plan.md`](docs/08_volcano_plan.md) | **Current entry point** — v0.13.0, lava that flows and solidifies |
+| [`docs/09_debris_flow_plan.md`](docs/09_debris_flow_plan.md) | Mountain debris flow: the same solver as the volcano, with concentration in place of temperature |
+| [`README.ru.md`](README.ru.md) | Russian, with the full per-version history |
 
-`tests\run_all.bat` дополнительно запускает launcher-тест и требует собранного
-`NatureLab.exe`.
+`CONTINUATION.md` is a historical document and describes a different source tree.
 
-Physics suite проверяет lake-at-rest, 1D symmetry, conservation, terrain barrier,
-static obstacle, obstacle move/remove, upload revisions, adaptive CFL, heavy-vs-light,
-zero flow, RESET и determinism.
+---
 
-## Tested versions
+## Roadmap
 
-- Python 3.12.7
-- NVIDIA Warp `1.17.0` (stable PyPI release)
-- NVIDIA GeForce RTX 5090 32 GB, driver 596.49
-- FastAPI `0.141.1`, Uvicorn `0.52.4`, NumPy `2.5.2`, websockets `17.1`
-- Three.js `0.169.0`, Vite `5.4.21`, TypeScript `5.9.3`
-- Puppeteer Core `25.9.0`, PyInstaller `6.22.2`
+- **v0.13.0 — Volcano I.** Lava that flows, cools, thickens and solidifies into terrain
+  the next flow runs over. The first task is a measurement, not code: the run-out length
+  before solidification has to land in a range that fits on the map.
+- **Debris flow.** A mountain valley, a cloudburst, and a mudflow that carries everything
+  away. It shares the volcano's shape exactly — a transported scalar that drives viscosity
+  and density, and a threshold at which the flow stops and becomes ground. Both need the
+  same single change: bed roughness as a field rather than a constant.
+- Angular dynamics for rigid bodies, damage, and a per-object waterline.
 
-## Ограничения
+---
 
-- Solver первого порядка предназначен для образовательных сценариев, не инженерных расчётов.
-- Rigid bodies имеют translational force model без angular dynamics.
-- Collision correction использует 2D footprint/radius, не полноценный rigid contact solver.
-- Evolved h/u/v field пока не сериализуется через SAVE.
-- Destruction, vegetation physics и replay не реализованы.
-- Единственный источник воды — приток с западной кромки карты. Дождя, точечного
-  притока и подъёма уровня во времени нет (осознанно отложено).
+## Limitations
+
+Stated plainly, because a teaching tool that overstates itself teaches the wrong thing.
+
+- First-order solver, sized for educational scenarios rather than engineering analysis.
+- Rigid bodies use a translational force model; there is no angular dynamics, so a car
+  carried by the flow does not yaw or tumble.
+- Collision correction uses 2D footprints and radii, not a full contact solver.
+- `damage` exists in the schema and is never computed yet.
+- The evolved `h/u/v` field is not serialized by SAVE — a saved world restores its
+  terrain, objects and boundary settings, not the water in flight.
+- No rain, no destruction, no vegetation physics, no replay.
+- Erosion is off by default: the long-run incision feedback is not calibrated yet, and
+  `docs/07_river_plan.md` records the measurement that has to come first.
+
+---
+
+## Tested with
+
+Python 3.12.7 · NVIDIA Warp 1.17.0 · RTX 5090 32 GB (driver 596.49) · FastAPI 0.141.1 ·
+Uvicorn 0.52.4 · NumPy 2.5.2 · websockets 17.1 · Three.js 0.169.0 · Vite 5.4.21 ·
+TypeScript 5.9.3 · Puppeteer Core 25.9.0 · PyInstaller 6.22.2

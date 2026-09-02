@@ -18,6 +18,7 @@ from app.simulation import SimulationManager  # noqa: E402
 from app.world_state import WorldState  # noqa: E402
 from app.compute_engine import create_engine  # noqa: E402
 from app.fluid_solver import create_fluid_solver  # noqa: E402
+from app.terrain_gen import dam_ridge, river_valley  # noqa: E402
 
 # Grid geometry is derived, never hard-coded: these tests used to spell out
 # "101" and column literals like [col(0.0), 8], which silently became wrong the first
@@ -1920,6 +1921,168 @@ class RiverBoundaryTests(unittest.IsolatedAsyncioTestCase):
         for bad in ({"width_m": -1.0}, {"centre_z": float("nan")}, {"nonsense": 1}):
             with self.assertRaises(ValueError, msg=f"accepted outlet {bad}"):
                 self.manager.apply_river_outlet(bad)
+
+
+class DamAndScenarioTests(unittest.IsolatedAsyncioTestCase):
+    """v0.12.1: the dam ridge, and the two prepared worlds built on it.
+
+    The dam is checked as *geometry that water can get over*, because that is
+    the only property that distinguishes it from an obstacle. The scenarios are
+    checked for the two layout rules that fail invisibly: an object written at
+    the wrong elevation is buried, not broken, and a screenshot of a buried
+    house looks exactly like a screenshot of a house that was never placed.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    async def test_the_dam_is_a_ridge_the_water_can_get_over(self) -> None:
+        """A dam has to be terrain, not an obstacle.
+
+        `fluid_solver._is_solid` rasterizes HOUSE and BRIDGE as infinitely tall
+        walls, so a dam built out of objects could never be overtopped -- and
+        overtopping is the entire lesson. This asserts the three properties that
+        make the ridge a dam rather than a wall: it stands above the channel it
+        crosses, its crest is a finite elevation reachable by water, and it has
+        a low point (the spillway) so the place the reservoir first spills is
+        physical rather than decided by floating-point noise.
+        """
+        world = WorldState()
+        effective = dam_ridge(world.terrain, None, None)
+        heights = world.terrain.heights
+        cell = world.terrain.cell_size
+        mid = world.terrain.height // 2
+        crest_column = int(round(effective["dam_x"] / cell))
+
+        self.assertGreater(effective["crest_elevation"],
+                           effective["channel_bed_at_dam"] + 2.0,
+                           "the ridge has to stand well clear of the channel bed")
+        # finite: a wall would be config.HEIGHT_MAX or an obstacle flag
+        self.assertLess(effective["crest_elevation"], config.HEIGHT_MAX)
+        # the crest is genuinely there, across the channel
+        self.assertAlmostEqual(float(heights[mid, crest_column]),
+                               effective["spill_elevation"], places=2)
+        # and it is a LOW point: the crest away from the notch is higher
+        shoulder = float(heights[mid + 20, crest_column])
+        self.assertGreater(shoulder, effective["spill_elevation"] + 0.3,
+                           "without a notch the spill station is arbitrary")
+        # upstream is a basin, downstream is not
+        upstream = float(heights[mid, crest_column - 25])
+        downstream = float(heights[mid, crest_column + 25])
+        self.assertLess(upstream, effective["spill_elevation"])
+        self.assertLess(downstream, effective["spill_elevation"])
+        self.assertGreater(effective["reservoir_volume_m3"], 100.0)
+
+    async def test_the_dam_merges_into_the_valley_instead_of_slotting_through_it(self) -> None:
+        """The ridge may only add material.
+
+        It is written with `maximum(valley, ridge)` so that where the valley
+        wall is already higher than the crest the dam blends into it. Written as
+        a plain assignment the same code would cut a slot through the hillside
+        and the reservoir would quietly drain around the end of the dam.
+        """
+        plain = WorldState()
+        river_valley(plain.terrain, None)
+        dammed = WorldState()
+        dam_ridge(dammed.terrain, None, None)
+        self.assertTrue(np.all(dammed.terrain.heights >= plain.terrain.heights - 1e-4),
+                        "the dam lowered the ground somewhere")
+
+    def _scenario(self, name: str) -> WorldState:
+        path = ROOT / "data" / f"{name}.json"
+        self.assertTrue(path.exists(), f"{name} is missing -- run tools/make_scenarios.py")
+        self.manager.load(name)
+        return self.manager.world
+
+    async def test_every_scenario_object_stands_on_the_ground(self) -> None:
+        """Seating, checked for both scenarios.
+
+        The floodplain sits near 2.5-2.9 m, so an object saved with y = 0 is
+        three metres underground. It does not raise, it does not log, and from
+        the camera it looks like an object that was never placed at all -- which
+        is why this is a test and not a comment.
+        """
+        for name in ("scenario_river", "scenario_dam"):
+            with self.subTest(scenario=name):
+                world = self._scenario(name)
+                self.assertGreaterEqual(len(world.objects), 60)
+                for obj in world.objects.values():
+                    ground = world.terrain.height_at(obj.position[0], obj.position[2])
+                    self.assertAlmostEqual(
+                        obj.position[1], ground, places=2,
+                        msg=f"{obj.id} is {obj.position[1] - ground:+.2f} m off the ground")
+
+    async def test_no_scenario_object_stands_in_the_channel(self) -> None:
+        """A house in the river is a dam nobody asked for.
+
+        The channel and its banks occupy |z| < bed_width/2 + bank_run. The two
+        GAUGEs are the deliberate exception: a gauge is an instrument, it is
+        excluded from the obstacle mask by its own test, and measuring the river
+        is the one reason to stand in it.
+        """
+        from app.terrain_gen import DEFAULTS
+        half_top = DEFAULTS["bed_width"] * 0.5 + DEFAULTS["bank_run"]
+        for name in ("scenario_river", "scenario_dam"):
+            with self.subTest(scenario=name):
+                world = self._scenario(name)
+                for obj in world.objects.values():
+                    if obj.type == "GAUGE":
+                        continue
+                    self.assertGreater(
+                        abs(obj.position[2]), half_top,
+                        msg=f"{obj.id} sits in the channel at z={obj.position[2]:.1f}")
+
+    async def test_a_loaded_scenario_puts_its_own_water_settings_on_the_solver(self) -> None:
+        """Erosion and the open edge belong to the world, like the inlet.
+
+        They used to be left to the first tick's live sync, so between LOAD and
+        PLAY the solver reported its own constructor defaults -- erosion ON,
+        outlet CLOSED, both the opposite of a fresh WaterState -- and the UI
+        drew the checkboxes from that report. Nothing moved, so nothing behaved
+        wrongly; the interface simply told the user the opposite of the truth
+        about a world they had just loaded.
+        """
+        world = self._scenario("scenario_dam")
+        self.assertFalse(world.water.erosion_enabled)
+        self.assertTrue(world.water.outflow_enabled)
+        self.assertTrue(world.water.inlet_enabled)
+        diagnostics = self.manager.fluid.diagnostics()
+        self.assertFalse(diagnostics["erosion"],
+                         "solver still reports erosion on after loading a world with it off")
+        self.assertGreater(diagnostics["outflow_columns"], 0,
+                           "solver still reports the outlet closed after loading it open")
+        self.assertTrue(diagnostics["inlet_enabled"])
+
+    async def test_a_road_is_drawn_but_not_felt(self) -> None:
+        """ROAD is static and must never reach the obstacle mask or the bed.
+
+        Flat asphalt on a floodplain changes the roughness the flow feels, not
+        the elevation of the bed, so water crossing a street unimpeded is the
+        correct answer. The day roughness becomes a field (`FLUID_MANNING_N` as
+        an array, which the volcano plan needs anyway) is the day this gets a
+        second half.
+        """
+        from app.fluid_solver import SOLID_OBSTACLE_TYPES
+        from app.world_state import default_properties
+        self.assertNotIn("ROAD", SOLID_OBSTACLE_TYPES)
+        self.assertEqual(default_properties("ROAD")["bed_height"], 0.0)
+        self.assertTrue(default_properties("ROAD")["is_static"])
+
+        world = self._scenario("scenario_river")
+        roads = [o for o in world.objects.values() if o.type == "ROAD"]
+        self.assertTrue(roads)
+        snapshot = self.manager.rigid.obstacle_snapshot()
+        before = self.manager.world.terrain.heights.copy()
+        self.manager.fluid.set_boundaries(self.manager.world.terrain, snapshot,
+                                          self.manager.terrain_revision + 1,
+                                          self.manager.obstacle_revision + 1)
+        np.testing.assert_allclose(self.manager.world.terrain.heights, before,
+                                   atol=1e-6,
+                                   err_msg="a road changed the bed")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,10 @@ __pycache__/
 *.err
 data/*.json
 !data/.gitkeep
+# ...except the prepared scenarios, which are product content rather than
+# somebody's saved experiment: without them in the repo a fresh clone has
+# Scenarios buttons that load nothing. Rebuilt by tools/make_scenarios.py.
+!data/scenario_*.json
 
 # os
 .DS_Store

@@ -81,6 +81,10 @@ const ui = new UI(uiHost, {
   reset: () => net.send({ op: 'reset' }),
   save: () => net.send({ op: 'save', name: 'default' }),
   load: () => net.send({ op: 'load', name: 'default' }),
+  // A scenario is just a saved world under data/, so it rides the existing
+  // `load` op and comes back as an ordinary `world` message -- the same path
+  // the LOAD button uses. See tools/make_scenarios.py.
+  loadScenario: (name) => net.send({ op: 'load', name }),
   setSpeed: (v) => net.send({ op: 'set_speed', value: v }),
   add: (type) => editor.addObject(type),
   select: (id) => store.select(id),
@@ -128,6 +132,8 @@ function applyWorld(world: WorldData, simStatus: string): void {
   ui.setReservoirLevel(store.waterLevel);
   ui.setErosionEnabled(store.erosionEnabled);
   ui.setOutflowEnabled(store.outflowEnabled);
+  // A scenario carries its own river boundary; the controls have to show it.
+  ui.setRiverControls(world.water);
   sceneManager.clearObjects();
   for (const obj of world.objects) sceneManager.setObject(obj);
   ui.refreshObjectList([...store.objects.values()], null);

@@ -1,7 +1,7 @@
 /** HUD: top bar, object palette, properties panel, terrain/water controls,
  *  debug strip. Pure DOM — no framework, easy to extend. */
 import { OBJECT_TYPES, type GaugeSample, type GaugeState, type ObjectData,
-  type ObjectType, type SimEvent } from '../world/types';
+  type ObjectType, type SimEvent, type WorldData } from '../world/types';
 
 export interface UICallbacks {
   play(): void;
@@ -25,8 +25,31 @@ export interface UICallbacks {
   setRiverInlet(fields: { enabled?: boolean; width_m?: number;
                           discharge_m3s?: number }): void;
   setRiverOutlet(fields: { width_m?: number }): void;
+  loadScenario(name: string): void;
   getObjects(): ObjectData[];
 }
+
+/**
+ * The prepared worlds offered by the Scenarios bookmark.
+ *
+ * A scenario is an ordinary saved world under `data/`, built by
+ * `tools/make_scenarios.py`, so this list is the only place the frontend knows
+ * they exist at all: pressing one sends exactly the `load` the LOAD button
+ * sends. Adding a scenario is adding a row here and a world file -- no new op,
+ * no new load path, and nothing in the existing controls has to move.
+ */
+const SCENARIOS: { name: string; label: string; hint: string }[] = [
+  { name: 'scenario_river', label: 'River',
+    hint: 'A town on the bank of a running river. At the discharge it ships '
+        + 'with, the channel runs about a metre deep and the town stays dry. '
+        + 'Take Q to the top of the slider and the channel goes bankfull -- '
+        + 'about 13 cm of water in the street after some three minutes' },
+  { name: 'scenario_dam', label: 'Dam',
+    hint: 'The same town below a dam. At the discharge it ships with, the '
+        + 'spillway carries the river and the dam holds. Push Q past about 60 '
+        + 'and the crest goes under in roughly six minutes of simulated time '
+        + '-- or cut the crest with the terrain brush and watch it go at once' },
+];
 
 export class UI {
   readonly root: HTMLElement;
@@ -104,6 +127,17 @@ export class UI {
 
   private buildLeft(): HTMLElement {
     const panel = el('div', 'panel left');
+    panel.append(el('h2', '', 'SCENARIOS'));
+    const scenarios = el('div', 'palette');
+    for (const scenario of SCENARIOS) {
+      const button = btn(scenario.label, () => this.cb.loadScenario(scenario.name));
+      button.title = scenario.hint;
+      scenarios.append(button);
+    }
+    panel.append(scenarios);
+    panel.append(el('p', 'hint',
+      'Loads a prepared world. Everything stays editable: brush the terrain, '
+      + 'move objects, change the discharge.'));
     panel.append(el('h2', '', 'OBJECTS'));
     const palette = el('div', 'palette');
     for (const t of OBJECT_TYPES) {
@@ -385,6 +419,33 @@ export class UI {
     const output = this.root.querySelector<HTMLOutputElement>('#water-out');
     if (slider) slider.value = String(level);
     if (output) output.textContent = String(level);
+  }
+
+  /**
+   * Put a loaded world's river boundary back on the controls.
+   *
+   * `setSimStats` keeps the erosion, outlet and inlet-enabled flags honest from
+   * the live stream, but Q, the inlet width and the outlet width are not
+   * streamed -- and they are part of the world. Without this a scenario saved
+   * at 30 m3/s loaded with the slider still reading its default 12 while the
+   * status bar showed the real 30: the control and the simulation disagreeing
+   * in plain sight, which is the one thing a teaching tool cannot do.
+   *
+   * Called from the `world` message only, never per frame, so dragging a slider
+   * is never fought by an incoming update.
+   */
+  setRiverControls(water: WorldData['water']): void {
+    const put = (id: string, outputId: string, value: number | undefined) => {
+      if (value === undefined) return;
+      const slider = this.root.querySelector<HTMLInputElement>(id);
+      const output = this.root.querySelector(outputId);
+      if (slider) slider.value = String(value);
+      if (output) output.textContent = String(value);
+    };
+    this.setRiverInletEnabled(water.inlet_enabled ?? false);
+    put('#river-discharge', '#river-q-out', water.inlet_discharge_m3s);
+    put('#river-inlet-width', '#river-inlet-w-out', water.inlet_width_m);
+    put('#river-outlet-width', '#river-outlet-w-out', water.outlet_width_m);
   }
 
   setFps(fps: number): void {
