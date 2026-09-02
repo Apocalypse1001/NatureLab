@@ -15,6 +15,7 @@ export class SceneManager {
   readonly waterMesh: THREE.Mesh;
   readonly objectsRoot = new THREE.Group();
   readonly points: THREE.Points;
+  readonly sun: THREE.DirectionalLight;
   readonly selectionBox: THREE.BoxHelper | null = null;
 
   private raycaster = new THREE.Raycaster();
@@ -40,6 +41,11 @@ export class SceneManager {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setClearColor(0x0e1420);
+    // Shadows are the one cheap thing that makes an object look like it is ON
+    // the terrain rather than floating in front of it. Nothing else in this
+    // pass changes what the user can read off the scene as much as this does.
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
     // Camera framing, fog and zoom limits are derived from the world size, not
     // fixed numbers: they were tuned for a 100 m map and left the 200 m map
@@ -54,10 +60,20 @@ export class SceneManager {
     this.controls.enableDamping = true;
     this.controls.maxDistance = span * 3;
 
-    this.scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x3a3226, 0.7));
-    const sun = new THREE.DirectionalLight(0xffffff, 1.2);
-    sun.position.set(60, 90, 30);
-    this.scene.add(sun);
+    // Three lights, and each one has a job. The sky fill lifts everything the
+    // sun cannot reach; the sun is the only caster and supplies the shape; a
+    // dim bounce from the opposite side keeps shadowed walls readable instead
+    // of black, which matters when a child is being asked to look at the wall
+    // the water is hitting.
+    this.scene.add(new THREE.HemisphereLight(0xcfe0ff, 0x4a4032, 0.85));
+    this.sun = new THREE.DirectionalLight(0xfff4e2, 2.1);
+    this.sun.castShadow = true;
+    this.scene.add(this.sun);
+    this.scene.add(this.sun.target);
+    this.configureSun();
+    const bounce = new THREE.DirectionalLight(0x9fb8d8, 0.35);
+    bounce.position.set(-span * 0.4, span * 0.25, -span * 0.5);
+    this.scene.add(bounce);
     this.scene.add(new THREE.AxesHelper(span * 0.1));
 
     // terrain mesh (geometry rebuilt from the logical grid)
@@ -65,9 +81,10 @@ export class SceneManager {
       this.terrain.sizeM, this.terrain.sizeM,
       this.terrain.width, this.terrain.height);
     this.terrainMesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
-      color: 0x5d7a4a, roughness: 1.0, metalness: 0,
+      color: 0x6f8c56, roughness: 1.0, metalness: 0,
     }));
     this.terrainMesh.rotation.x = -Math.PI / 2;
+    this.terrainMesh.receiveShadow = true;
     this.scene.add(this.terrainMesh);
 
     this.gridHelper = new THREE.GridHelper(
@@ -104,6 +121,43 @@ export class SceneManager {
 
     this.scene.add(this.objectsRoot);
     this.resize();
+  }
+
+  /**
+   * Place the sun and size its shadow frustum from the world, never from fixed
+   * metres.
+   *
+   * The old `sun.position.set(60, 90, 30)` was the one thing in the constructor
+   * that did NOT follow `terrain.sizeM`, and it survived only because a light
+   * with no shadow does not care where it is -- direction is all that matters.
+   * The moment it casts, position and frustum both matter: at the 200 m map a
+   * default ortho shadow camera clips everything past ~5 m from the origin, so
+   * the map would have come back with a rectangle of shadow in the middle and
+   * nothing outside it. That is the same class of bug the v0.7.0 comments in
+   * `rebuildGridGeometry` record, which is why this is a method called from
+   * both places rather than two copies of the numbers.
+   */
+  private configureSun(): void {
+    const span = this.terrain.sizeM;
+    this.sun.position.set(span * 0.45, span * 0.75, span * 0.30);
+    this.sun.target.position.set(0, 0, 0);
+    this.sun.target.updateMatrixWorld();
+    // Half-width covers the map diagonal (0.707 * span) with margin for tall
+    // objects leaning their shadows outward.
+    const half = span * 0.78;
+    const cam = this.sun.shadow.camera;
+    cam.left = -half; cam.right = half;
+    cam.top = half; cam.bottom = -half;
+    cam.near = span * 0.05;
+    cam.far = span * 2.5;
+    cam.updateProjectionMatrix();
+    // 4096 over a 312 m frustum is ~7.6 cm per texel on the 200 m map -- enough
+    // for a 4 m house to keep a recognisable shadow instead of a blob.
+    this.sun.shadow.mapSize.set(4096, 4096);
+    // normalBias, not bias: the terrain is a deformed height field, so slope
+    // acne has to be fixed along the surface normal or steep banks stripe.
+    this.sun.shadow.normalBias = 0.06;
+    this.sun.shadow.bias = -0.0004;
   }
 
   resize(): void {
@@ -264,7 +318,9 @@ export class SceneManager {
     this.gridHelper.position.y = 0.05;
     this.scene.add(this.gridHelper);
 
-    // camera framing and fog follow the world, see the constructor note
+    // camera framing, fog and the sun's shadow frustum follow the world, see
+    // the constructor note and configureSun()
+    this.configureSun();
     this.scene.fog = new THREE.Fog(0x0e1420, sizeM * 1.2, sizeM * 4);
     this.camera.far = sizeM * 6;
     this.camera.position.set(sizeM * 0.6, sizeM * 0.55, sizeM * 0.6);
