@@ -494,13 +494,39 @@ export class SceneManager {
 
   removeObject(id: string): void {
     const group = this.objectsRoot.getObjectByName(id);
-    if (group) this.objectsRoot.remove(group);
+    if (group) {
+      this.objectsRoot.remove(group);
+      SceneManager.disposeSubtree(group);
+    }
     this.clearSelection();
   }
 
   clearObjects(): void {
+    for (const child of this.objectsRoot.children) SceneManager.disposeSubtree(child);
     this.objectsRoot.clear();
     this.clearSelection();
+  }
+
+  /**
+   * Release the GPU resources of a discarded object subtree.
+   *
+   * Removing a group from its parent does not free anything, which cost nothing
+   * while every builder shared a handful of module-scope materials. Since
+   * v0.12.1 that is no longer true: builders allocate per-instance materials so
+   * each object can be tinted from its own id, and ROCK/DEBRIS allocate
+   * per-instance deformed geometry. `applyWorld()` calls `clearObjects()` and
+   * rebuilds the entire scene on every world replace -- every LOAD, every
+   * reconnect -- so without this each reload would strand the previous set.
+   */
+  private static disposeSubtree(root: THREE.Object3D): void {
+    root.traverse((node) => {
+      const mesh = node as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      mesh.geometry?.dispose();
+      const material = mesh.material;
+      if (Array.isArray(material)) material.forEach((m) => m.dispose());
+      else material?.dispose();
+    });
   }
 
   // ------------------------------------------------------------------ selection

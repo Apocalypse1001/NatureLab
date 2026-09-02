@@ -9,6 +9,7 @@
  *  thing the user sees stays the thing the water feels.
  */
 import * as THREE from 'three';
+import { mergeVertices } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { OBJECT_COLORS, type ObjectData } from './types';
 
 type Builder = (obj: ObjectData) => THREE.Group;
@@ -37,20 +38,29 @@ function variant(id: string, channel = 0): number {
  * The scale range must never exceed 1.0: for a ROCK the sphere it deforms is
  * exactly `fluid_solver.ROCK_BASE_RADIUS_M`, and a vertex pushed past that
  * would draw stone outside the raised-bed dome the water actually climbs.
+ *
+ * The `mergeVertices` call is load-bearing, not tidying. Three.js builds an
+ * icosahedron non-indexed: the same corner is generated once per face it
+ * touches, by independent arithmetic, so the three copies can differ in the
+ * last bits of the float. Hashing the position would then hand those copies
+ * different offsets -- and this hash runs the difference through
+ * `sin(x * 43758.5)`, which turns 1e-7 into a completely unrelated number --
+ * splitting the hull open along every facet. Indexing first makes each corner
+ * one vertex that can only move one way.
  */
 function roughened(geometry: THREE.BufferGeometry, seed: number,
                    low: number, high: number): THREE.BufferGeometry {
-  const position = geometry.attributes.position as THREE.BufferAttribute;
+  const merged = mergeVertices(geometry);
+  geometry.dispose();
+  const position = merged.attributes.position as THREE.BufferAttribute;
   for (let i = 0; i < position.count; i++) {
     const x = position.getX(i), y = position.getY(i), z = position.getZ(i);
-    // hash the vertex itself, so shared vertices move together and the hull
-    // stays closed
     const noise = Math.abs(Math.sin((x * 12.99 + y * 78.23 + z * 37.72 + seed) * 43758.5)) % 1;
     const scale = low + (high - low) * noise;
     position.setXYZ(i, x * scale, y * scale, z * scale);
   }
-  geometry.computeVertexNormals();
-  return geometry;
+  merged.computeVertexNormals();
+  return merged;
 }
 
 /** Nudge a base colour by a small hue/lightness offset, kept subtle. */
