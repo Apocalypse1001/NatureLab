@@ -1,4 +1,4 @@
-# NatureLab 0.10.0 - Architecture
+# NatureLab 0.11.0 - Architecture
 
 Проектная документация, которая объясняет *почему* архитектура такая, живёт в `docs/`:
 [`01_vision.md`](docs/01_vision.md) (цели и критерий качества),

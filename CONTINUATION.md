@@ -1,5 +1,14 @@
 # NatureLab Project Handoff
 
+> **ИСТОРИЧЕСКИЙ ДОКУМЕНТ, 2026-09-01. Не описывает этот репозиторий.**
+> «Working source directory» ниже указывает на дерево-донор
+> `D:\AI\Simulator Wartp\NatureLab_0.4\NatureLab_0.4` (версия 0.5.0, без git,
+> только для чтения). Его движок импортирован сюда в v0.5.1 и развит до v0.11.0;
+> перечисленные ниже «Implemented Features» и «Pending User Request» (DRAIN,
+> удвоение карты) давно закрыты. Актуальная точка продолжения —
+> [`docs/07_river_plan.md`](docs/07_river_plan.md).
+
+
 Last audited: 2026-09-01
 
 ## Current Project Location
