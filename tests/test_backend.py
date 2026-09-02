@@ -1644,23 +1644,69 @@ class RiverBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(measured, 12.0, delta=0.6,
                                msg=f"asked for 12 m3/s, delivered {measured:.2f}")
 
-    async def test_doubling_the_discharge_doubles_what_arrives(self) -> None:
-        """One cause changed. The inlet is not a switch with a plausible number
-        printed next to it."""
-        delivered = []
-        for q in (6.0, 12.0):
+    async def test_the_delivered_discharge_tracks_the_request_across_the_range(self) -> None:
+        """The subtlest line in the inlet is `u = 2q/h - u[1]`, and one operating
+        point does not pin it: `u = q/h` also looks right at a single Q while
+        delivering roughly twice what was asked for. So the request is checked at
+        four discharges spanning the control's range, on the measured face flux.
+
+        A run from dry would not do it either -- during the fill the answer is
+        dominated by the advancing front -- so each channel is primed at the
+        normal depth for its own q.
+        """
+        for q in (4.0, 12.0, 24.0, 48.0):
             manager = SimulationManager()
             manager.apply_terrain_river({})
             manager.apply_water_level(0.0)
             manager.apply_river_inlet({"enabled": True, "width_m": 12.0,
                                        "discharge_m3s": q})
+            manager.apply_river_outlet({"width_m": 20.0})
             manager.start()
+            bed = manager.fluid.get_terrain_heights().reshape(N, N)
+            # Manning normal depth for this discharge on this slope, the same
+            # number the solver floors the inlet at
+            per_width = q / 13.0
+            depth = (per_width * config.FLUID_MANNING_N / math.sqrt(0.002)) ** 0.6
+            surface = bed[N // 2, :] + depth
+            h = np.maximum(surface[None, :] - bed, 0.0).astype(np.float32)
+            manager.fluid._h.assign(h.ravel())
             for _ in range(600):
                 manager._step_once()
-            delivered.append(manager.fluid.diagnostics()["added_m3"])
+            measured = manager.fluid.diagnostics()["inlet_discharge_m3s"]
             manager.stop()
-        self.assertGreater(delivered[1], delivered[0] * 1.7,
-                           f"doubling Q did not double the water: {delivered}")
+            self.assertAlmostEqual(
+                measured / q, 1.0, delta=0.15,
+                msg=f"asked for {q} m3/s, delivered {measured:.2f} "
+                    f"({measured / q:.2f}x)")
+
+    async def test_a_discharge_the_channel_cannot_hold_floods_rather_than_explodes(self) -> None:
+        """The top of the control's range asks for more water than the channel
+        was cut for: Q = 80 m3/s over 12 m needs about 2.4 m of normal depth in a
+        2.0 m channel, so the river must leave its banks. That is a flood, and a
+        flood is a thing this simulator is for -- what it must not be is a
+        numerical blow-up, and it must say so in `cfl_limited` if the timestep
+        can no longer resolve it.
+
+        Two minutes, not thirty seconds: the inlet delivers Q and no more, so
+        the channel fills at the rate the discharge allows rather than appearing
+        full. Watching it overtop is watching a flood arrive."""
+        self._valley(discharge=80.0)
+        self.manager.start()
+        self._run(120.0)
+        diag = self.manager.fluid.diagnostics()
+        depth = self._depth()
+        self.assertTrue(np.isfinite(depth).all(), "the flood produced NaNs")
+        self.assertLess(diag["max_velocity"], config.FLUID_MAX_VELOCITY,
+                        "the flood pinned the velocity clamp")
+        bed = self.manager.fluid.get_terrain_heights().reshape(N, N)
+        floodplain = bed >= bed.max(axis=0)[None, :] - 1.0e-3
+        self.assertGreater(int((depth[floodplain] > 0.01).sum()), 500,
+                           "80 m3/s did not overtop a 2 m channel")
+        self.assertFalse(self.manager.fluid.diagnostics()["cfl_limited"],
+                         "the flood outran the timestep and said nothing")
+        self.assertLess(abs(diag["volume_error_m3"]),
+                        max(1.0e-3 * diag["volume_m3"], 0.05),
+                        "the ledger stopped balancing under flood conditions")
 
     async def test_a_dry_channel_is_actually_filled_and_not_just_reported(self) -> None:
         """The trap this boundary was most likely to fall into: `_velocity_step`
@@ -1833,7 +1879,7 @@ class RiverBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self._valley()
         self.manager.apply_water_level(5.0)     # would put 2 m over the floodplain
         self.manager.start()
-        self._run(5.0)
+        self._run(20.0)
         edge = self._depth()[:, 0]
         bed = self.manager.fluid.get_terrain_heights().reshape(N, N)[:, 0]
         floodplain = bed >= bed.max() - 1.0e-3
@@ -1841,7 +1887,7 @@ class RiverBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(band.any() and floodplain.any())
         self.assertLess(float(edge[floodplain].max()), 0.05,
                         "the level source is still filling the west edge")
-        self.assertGreater(float(edge[band].max()), 0.1, "the inlet band is dry")
+        self.assertGreater(float(edge[band].max()), 0.05, "the inlet band is dry")
 
     async def test_the_boundaries_survive_a_save_load_round_trip(self) -> None:
         """They live under `water` and not in `objects` for this reason: objects

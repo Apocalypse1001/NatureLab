@@ -84,23 +84,47 @@ if WARP_IMPORTED:
                 # no water moved at all. Same shape as the bug that made the
                 # outlet inert before v0.8.0; see `_apply_outflow`.
                 #
-                # The velocity to prescribe is NOT q/h, even though q/h is the
-                # mean velocity of the flow being delivered. `_depth_step` moves
-                # water across the inlet face at the AVERAGE of the two cells'
-                # velocities, u_face = (u[0] + u[1])/2, so prescribing q/h at
-                # cell 0 delivers (q/h + u[1])/2 * h -- measured at roughly twice
-                # the requested discharge while the diagnostics happily reported
-                # the requested one, because u[0]*h[0] = q is true by
-                # construction and says nothing about what crossed the face.
+                # The edge velocity is the mean velocity of the arriving flow,
+                # u = q/h, and nothing more: the discharge itself is delivered
+                # by `_depth_step`, which is handed q directly for this face.
                 #
-                # Solving u_face * h = q for the edge value gives this. Clamped
-                # at zero so a strong interior velocity can never turn the inlet
-                # into a drain; u[1] is one substep stale, which the steady state
-                # absorbs.
+                # It was tried the other way first, and the record is worth
+                # keeping. `_depth_step` transports across a face at the average
+                # of the two cells' velocities, so prescribing q/h here made the
+                # face carry (q/h + u[1])/2 * h -- about twice the requested
+                # discharge. Solving u_face*h = q for the edge value gives
+                # u[0] = 2q/h - u[1], which delivers exactly Q and is also an
+                # odd-even feedback: the edge velocity set to minus its
+                # neighbour's is the definition of a 2dx mode, the grid is
+                # collocated with a central surface gradient so nothing damps
+                # that mode, and with erosion on it locks in and alternate cells
+                # scour. Relaxing the response only slowed it down. Prescribing
+                # the flux where the flux actually lives removes the coupling
+                # instead of fighting it.
+                #
+                # The Froude cap keeps a nearly dry edge cell from turning q/h
+                # into a jet: water arriving faster than about twice critical is
+                # not a river entering a channel, it is a division by a small
+                # number.
                 if inlet_q[j] > 0.0 and h[idx] > dry:
-                    ux = wp.max(0.0, 2.0 * inlet_q[j] / h[idx] - u[idx + 1])
+                    ux = wp.min(inlet_q[j] / h[idx],
+                                2.0 * wp.sqrt(gravity * h[idx]))
                 else:
                     ux = 0.0
+            if i == 1 and inlet_q[j] > 0.0 and h[idx] > dry and h[idx - 1] > dry:
+                # The arriving water brings its momentum with it. Without this
+                # the flux boundary hands cell 1 mass and nothing else, the mass
+                # piles into a mound, the mound's own surface gradient shoves
+                # water back at the boundary, and the inlet reach rings.
+                #
+                # Mixing, not forcing: the fraction of this cell's column that
+                # was replaced this substep arrives at the inlet velocity, the
+                # rest keeps the velocity it had. At equilibrium the two are the
+                # same number and the term does nothing.
+                arriving = wp.min(inlet_q[j] / h[idx - 1],
+                                  2.0 * wp.sqrt(gravity * h[idx - 1]))
+                fraction = wp.min(1.0, inlet_q[j] * dt / (dx * h[idx]))
+                ux = ux + fraction * (arriving - ux)
             if (i >= width - 1 - outflow_columns and outflow_columns > 0
                     and j >= outflow_row_lo and j <= outflow_row_hi):
                 # Open outlet: the east edge is allowed to keep its velocity so
@@ -128,12 +152,69 @@ if WARP_IMPORTED:
     def _depth_step(h: wp.array(dtype=float), u: wp.array(dtype=float),
                     v: wp.array(dtype=float), bed: wp.array(dtype=float),
                     solid: wp.array(dtype=wp.int32), next_h: wp.array(dtype=float),
+                    inlet_q: wp.array(dtype=float),
                     width: int, height: int, dx: float, dt: float):
         idx = wp.tid()
         i = idx % width
         j = idx // width
         if solid[idx] != 0:
             next_h[idx] = 0.0
+        elif inlet_q[j] > 0.0 and i <= 1:
+            # The river inlet is a flux boundary, so its discharge is written
+            # where fluxes live rather than being coaxed out of an edge
+            # velocity. Both cells compute the same number from the same depth,
+            # so the water that leaves cell 0 is exactly the water that arrives
+            # in cell 1 -- prescribing it independently on each side would leak
+            # or manufacture volume at the boundary.
+            #
+            # Capped by what the edge cell actually holds: a dry inlet cannot
+            # deliver its discharge, and taking more than is there would push
+            # the cell negative, where `wp.max(0.0, ...)` would quietly create
+            # the difference and put the volume ledger out.
+            crossing = wp.min(inlet_q[j], h[idx - i] * dx / dt)
+            if i == 0:
+                q_out = float(0.0)
+                if j < height - 1 and solid[idx + width] == 0:
+                    face = 0.5 * (v[idx] + v[idx + width])
+                    if face >= 0.0:
+                        q_out = q_out + _face_flux(face, h[idx], bed[idx],
+                                                   bed[idx + width])
+                    else:
+                        q_out = q_out + _face_flux(face, h[idx + width],
+                                                   bed[idx + width], bed[idx])
+                if j > 0 and solid[idx - width] == 0:
+                    face = 0.5 * (v[idx - width] + v[idx])
+                    if face >= 0.0:
+                        q_out = q_out - _face_flux(face, h[idx - width],
+                                                   bed[idx - width], bed[idx])
+                    else:
+                        q_out = q_out - _face_flux(face, h[idx], bed[idx],
+                                                   bed[idx - width])
+                next_h[idx] = wp.max(0.0, h[idx] - dt * (crossing + q_out) / dx)
+            else:
+                q_right = float(0.0)
+                q_up = float(0.0)
+                q_down = float(0.0)
+                if i < width - 1 and solid[idx + 1] == 0:
+                    face = 0.5 * (u[idx] + u[idx + 1])
+                    if face >= 0.0:
+                        q_right = _face_flux(face, h[idx], bed[idx], bed[idx + 1])
+                    else:
+                        q_right = _face_flux(face, h[idx + 1], bed[idx + 1], bed[idx])
+                if j < height - 1 and solid[idx + width] == 0:
+                    face = 0.5 * (v[idx] + v[idx + width])
+                    if face >= 0.0:
+                        q_up = _face_flux(face, h[idx], bed[idx], bed[idx + width])
+                    else:
+                        q_up = _face_flux(face, h[idx + width], bed[idx + width], bed[idx])
+                if j > 0 and solid[idx - width] == 0:
+                    face = 0.5 * (v[idx - width] + v[idx])
+                    if face >= 0.0:
+                        q_down = _face_flux(face, h[idx - width], bed[idx - width], bed[idx])
+                    else:
+                        q_down = _face_flux(face, h[idx], bed[idx], bed[idx - width])
+                value = h[idx] - dt * ((q_right - crossing) + (q_up - q_down)) / dx
+                next_h[idx] = wp.max(0.0, value)
         else:
             q_right = float(0.0)
             q_left = float(0.0)
@@ -200,7 +281,8 @@ if WARP_IMPORTED:
                            solid: wp.array(dtype=wp.int32),
                            inlet_q: wp.array(dtype=float),
                            normal_depth: wp.array(dtype=float),
-                           width: int, height: int, area: float,
+                           width: int, height: int, dx: float, dt: float,
+                           area: float,
                            capacity_scale: float, added: wp.array(dtype=float)):
         """Local inlet on the west edge, prescribing discharge rather than level.
 
@@ -228,8 +310,25 @@ if WARP_IMPORTED:
         q = inlet_q[j]
         if q <= 0.0:
             return
-        depth = wp.max(h[idx + 1], normal_depth[j])
-        wp.atomic_add(added, 0, (depth - h[idx]) * area)
+        target = wp.max(h[idx + 1], normal_depth[j])
+        # A discharge boundary delivers Q and no more. Holding the edge cell at
+        # its target depth unconditionally makes it an infinite reservoir
+        # instead: whatever the interior draws, the boundary refills, and with
+        # erosion on that closes a loop -- the flow scours a hollow, the hollow
+        # accelerates the flow, the faster flow draws harder, and the inlet
+        # obliges. Measured before this cap: a requested 12 m3/s delivering 700,
+        # 34 000 m3 on a map that should have held 3 000, and the velocity clamp
+        # pinned at 20 m/s.
+        #
+        # In steady state a cell of width dx loses exactly q*dt/dx of depth per
+        # substep to the face, so this allowance replaces the water that leaves
+        # and nothing else. If the interior pulls harder than that, the edge
+        # depth falls -- which is the honest answer: a pipe delivering Q cannot
+        # be made to deliver more by pulling on it.
+        allowance = q * dt / dx
+        gain = wp.min(wp.max(0.0, target - h[idx]), allowance)
+        depth = h[idx] + gain
+        wp.atomic_add(added, 0, gain * area)
         h[idx] = depth
         # Arriving loaded to capacity, computed from the velocity the erosion
         # kernel will use a few lines later in this same substep rather than
@@ -656,18 +755,20 @@ if WARP_IMPORTED:
                             inlet_q: wp.array(dtype=float),
                             width: int, dx: float,
                             stats: wp.array(dtype=float)):
-        """Discharge actually crossing the inlet face, in m3/s.
+        """Discharge crossing the first face inside the domain, in m3/s.
 
-        Measured the way `_depth_step` transports it -- average face velocity,
-        upwind available depth -- and deliberately NOT as u[0]*h[0]: the edge
-        velocity is prescribed from q, so u[0]*h[0] returns the request whatever
-        the solver does with it. An instrument that cannot disagree with the
-        setting it is checking is not an instrument.
+        Measured one cell downstream of the boundary, at the face between
+        columns 1 and 2, and computed the way `_depth_step` transports it. The
+        boundary's own face is prescribed, so measuring there would return the
+        requested Q whatever the solver did with it -- an instrument that cannot
+        disagree with the setting it is checking is not an instrument. This one
+        can: it reads what the river is actually carrying just inside the map,
+        which is the question the number is asked for.
         """
         idx = wp.tid()
         i = idx % width
         j = idx // width
-        if i != 0 or solid[idx] != 0 or inlet_q[j] <= 0.0 or solid[idx + 1] != 0:
+        if i != 1 or solid[idx] != 0 or inlet_q[j] <= 0.0 or solid[idx + 1] != 0:
             return
         face = 0.5 * (u[idx] + u[idx + 1])
         if face >= 0.0:
@@ -1398,6 +1499,7 @@ class WarpShallowWaterSolver(FluidSolver):
             self._v, self._next_v = self._next_v, self._v
             wp.launch(_depth_step, dim=self._count, inputs=[self._h, self._u,
                       self._v, self._bed, self._obstacles, self._next_h,
+                      self._inlet_q,
                       self._width, self._height, float(self._terrain.cell_size), dt],
                       device=self.device)
             self._h, self._next_h = self._next_h, self._h
@@ -1410,7 +1512,8 @@ class WarpShallowWaterSolver(FluidSolver):
                           inputs=[self._h, self._u, self._v, self._sediment,
                                   self._obstacles,
                                   self._inlet_q, self._inlet_normal_depth,
-                                  self._width, self._height, area,
+                                  self._width, self._height,
+                                  float(self._terrain.cell_size), dt, area,
                                   config.SEDIMENT_CAPACITY_SCALE,
                                   self._diag_added], device=self.device)
             elif self._source_enabled and not self._source_count:

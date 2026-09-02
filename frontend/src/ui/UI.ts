@@ -39,6 +39,7 @@ export class UI {
   private particlesEl: HTMLSpanElement;
   private fluidEl: HTMLSpanElement;
   private fluxEl: HTMLSpanElement;
+  private substepEl: HTMLSpanElement;
   private wsEl: HTMLSpanElement;
   private gpuEl: HTMLSpanElement;
   private warpEl: HTMLSpanElement;
@@ -61,6 +62,7 @@ export class UI {
     this.particlesEl = this.root.querySelector('#dbg-particles')!;
     this.fluidEl = this.root.querySelector('#dbg-fluid')!;
     this.fluxEl = this.root.querySelector('#dbg-flux')!;
+    this.substepEl = this.root.querySelector('#dbg-substeps')!;
     this.wsEl = this.root.querySelector('#dbg-ws')!;
     this.gpuEl = this.root.querySelector('#dbg-gpu')!;
     this.warpEl = this.root.querySelector('#dbg-warp')!;
@@ -326,6 +328,12 @@ export class UI {
       // totals. A river whose inlet reports 12 m³/s while nothing arrives
       // downstream is a bug you can only see here.
       'Q in/out <span id="dbg-flux">– / –</span> | ' +
+      // Substeps and the CFL flag, because the failure they describe is silent:
+      // when the solver cannot resolve the wave speed in FLUID_MAX_SUBSTEPS it
+      // runs anyway, at a timestep it knows is too long. The river gets worse
+      // and no test falls over. Shown as a number so the cost of a steeper
+      // slope or a bigger discharge is visible while it is being chosen.
+      'Substeps <span id="dbg-substeps">1</span> | ' +
       'WS <span id="dbg-ws">offline</span> | ' +
       'Warp <span id="dbg-warp">–</span> | ' +
       'CUDA <span id="dbg-cuda">–</span> | ' +
@@ -389,7 +397,8 @@ export class UI {
                                  sources?: number; drains?: number;
                                  inlet_enabled?: boolean;
                                  inlet_discharge_m3s?: number;
-                                 added_m3?: number; removed_m3?: number } }): void {
+                                 added_m3?: number; removed_m3?: number;
+                                 substeps?: number; cfl_limited?: boolean } }): void {
     // Keep the checkbox honest about what the solver is actually doing: the
     // flag is streamed live, so a world loaded with erosion on -- or a state
     // changed by anything other than this checkbox -- still shows correctly.
@@ -412,6 +421,11 @@ export class UI {
     if (state.fluid?.inlet_enabled !== undefined) {
       this.setRiverInletEnabled(state.fluid.inlet_enabled);
     }
+    const limited = state.fluid?.cfl_limited === true;
+    this.substepEl.textContent = limited
+      ? `${state.fluid?.substeps ?? 0} CFL-LIMITED`
+      : String(state.fluid?.substeps ?? 0);
+    this.substepEl.className = limited ? 'bad' : '';
   }
 
   logEvent(e: SimEvent): void {

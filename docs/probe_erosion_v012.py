@@ -160,6 +160,54 @@ def run(label, slope, depth, edge_source=False, channel=False, seconds=20.0):
     return float(loss.max()), diag
 
 
+def run_river(label, seconds=180.0, discharge=12.0, slope=0.002):
+    """The same question, asked of the finished v0.12.0 river.
+
+    The 120 s runaway further up was measured with the edge-level source feeding
+    clean water into a sheet -- which is exactly the artifact that was then
+    fixed. So the number has to be taken again on the configuration that ships:
+    generated valley, local discharge inlet, local outlet, erosion on.
+    """
+    from app.simulation import SimulationManager    # noqa: E402  (probe-only)
+
+    manager = SimulationManager()
+    info = manager.apply_terrain_river({"slope": slope})["river"]
+    manager.apply_water_level(0.0)
+    manager.apply_river_inlet({"enabled": True, "width_m": 12.0,
+                               "discharge_m3s": discharge})
+    manager.apply_river_outlet({"width_m": 20.0})
+    manager.apply_water_erosion(True)
+    manager.start()
+    bed0 = manager.fluid.get_terrain_heights().reshape(N, N).copy()
+    print("")
+    print("=== %s ===" % label)
+    print("  Q=%.1f m3/s  slope=%.2f%%  incision=%.1f m" %
+          (discharge, slope * 100, info["incision"]))
+    print("   t(s)   Qin   Qout  binding%  max|u|  max cut  substeps cfl_limited")
+    step = 0
+    while manager.sim_time < seconds:
+        manager._step_once()
+        step += 1
+        if step % 1800:
+            continue
+        d = manager.fluid.diagnostics()
+        h = np.asarray(manager.fluid._h.numpy()).reshape(N, N)
+        u = np.asarray(manager.fluid._u.numpy()).reshape(N, N)
+        v = np.asarray(manager.fluid._v.numpy()).reshape(N, N)
+        sed = np.asarray(manager.fluid._sediment.numpy()).reshape(N, N)
+        speed = np.hypot(u, v)
+        wet = h > 0.05
+        hungry = wet & (SCALE * speed * h - sed > 0.0)
+        demand = (SCALE * speed * h - sed) * ERODE
+        binding = float((demand[hungry] > CLAMP).mean() * 100) if hungry.any() else 0.0
+        cut = float((bed0 - manager.fluid.get_terrain_heights().reshape(N, N)).max())
+        print("  %5.1f %6.2f %6.2f  %7.2f  %6.2f  %7.3f  %6d   %s" %
+              (manager.sim_time, d["inlet_discharge_m3s"],
+               d["removed_m3"] / max(manager.sim_time, 1e-9), binding,
+               d["max_velocity"], cut, d["substeps"], d["cfl_limited"]))
+    manager.stop()
+
+
 if __name__ == "__main__":
     print("config: SEDIMENT_CAPACITY_SCALE=%s  ERODE_RATE=%s  MAX_BED_CHANGE=%s m/s  "
           "MANNING_N=%s" % (SCALE, ERODE, CLAMP, config.FLUID_MANNING_N))
