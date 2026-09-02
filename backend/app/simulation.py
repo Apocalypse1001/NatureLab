@@ -115,6 +115,50 @@ class SimulationManager:
         """Open/close the downstream map edge. Read live each tick."""
         self.world.water.outflow_enabled = bool(enabled)
 
+    def apply_river_inlet(self, fields: Dict[str, Any]) -> Dict[str, Any]:
+        """Configure the prescribed-discharge inlet on the west edge.
+
+        Q is the control and the water level is the answer, so there is no
+        "level" field here on purpose: prescribing both over-determines the
+        boundary and the two disagree the moment the channel changes.
+        """
+        water = self.world.water
+        for key, value in fields.items():
+            if key == "enabled":
+                water.inlet_enabled = bool(value)
+            elif key == "centre_z":
+                water.inlet_centre_z = finite_number(value, "inlet.centre_z")
+            elif key == "width_m":
+                width = finite_number(value, "inlet.width_m")
+                if not 1.0 <= width <= config.WORLD_SIZE_M:
+                    raise ValueError("inlet.width_m out of range")
+                water.inlet_width_m = width
+            elif key == "discharge_m3s":
+                q = finite_number(value, "inlet.discharge_m3s")
+                if not 0.0 <= q <= 10_000.0:
+                    raise ValueError("inlet.discharge_m3s out of range")
+                water.inlet_discharge_m3s = q
+            else:
+                raise ValueError(f"unknown inlet field: {key!r}")
+        return {"enabled": water.inlet_enabled, "centre_z": water.inlet_centre_z,
+                "width_m": water.inlet_width_m,
+                "discharge_m3s": water.inlet_discharge_m3s}
+
+    def apply_river_outlet(self, fields: Dict[str, Any]) -> Dict[str, Any]:
+        """Narrow the east-edge outlet to a band, or (width 0) open it fully."""
+        water = self.world.water
+        for key, value in fields.items():
+            if key == "centre_z":
+                water.outlet_centre_z = finite_number(value, "outlet.centre_z")
+            elif key == "width_m":
+                width = finite_number(value, "outlet.width_m")
+                if not 0.0 <= width <= config.WORLD_SIZE_M:
+                    raise ValueError("outlet.width_m out of range")
+                water.outlet_width_m = width
+            else:
+                raise ValueError(f"unknown outlet field: {key!r}")
+        return {"centre_z": water.outlet_centre_z, "width_m": water.outlet_width_m}
+
     @staticmethod
     def _affects_fluid_boundary(obj) -> bool:
         """Does this object change what the fluid solver sees as a boundary?
@@ -333,8 +377,17 @@ class SimulationManager:
             # read live, so the RiverLab toggle takes effect while RUNNING
             self.fluid.set_erosion(self.world.water.erosion_enabled)
         if hasattr(self.fluid, "set_outflow"):
-            self.fluid.set_outflow(config.FLUID_OUTFLOW_COLUMNS
-                                   if self.world.water.outflow_enabled else 0)
+            water = self.world.water
+            self.fluid.set_outflow(
+                config.FLUID_OUTFLOW_COLUMNS if water.outflow_enabled else 0,
+                water.outlet_centre_z, water.outlet_width_m)
+        if hasattr(self.fluid, "set_river_inlet"):
+            # Read live like every other water control, so the discharge can be
+            # changed while RUNNING -- which is the whole shape of the flood
+            # hydrograph that comes next.
+            water = self.world.water
+            self.fluid.set_river_inlet(water.inlet_enabled, water.inlet_centre_z,
+                                       water.inlet_width_m, water.inlet_discharge_m3s)
         if hasattr(self.fluid, "set_water_features"):
             # Positions are read live every tick rather than snapshotted, so a
             # SOURCE or DRAIN can be dragged while RUNNING and the water reacts

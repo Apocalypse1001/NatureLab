@@ -109,6 +109,8 @@ const ui = new UI(uiHost, {
   // scene through the same path a brush stroke does -- no second sync to keep
   // right. Rejected by the backend while RUNNING, like every terrain edit.
   generateRiver: (params) => net.send({ op: 'terrain_river', params }),
+  setRiverInlet: (fields) => net.send({ op: 'river_inlet', fields }),
+  setRiverOutlet: (fields) => net.send({ op: 'river_outlet', fields }),
   getObjects: () => [...store.objects.values()],
 });
 

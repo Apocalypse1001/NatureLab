@@ -125,6 +125,12 @@ async def _dispatch(ws: WebSocket, msg: dict) -> dict | None:
         if op == "water_outflow":
             manager.apply_water_outflow(bool(msg.get("enabled", True)))
             return {"type": "ack", "op": op}
+        if op == "river_inlet":
+            state = manager.apply_river_inlet(msg.get("fields") or {})
+            return {"type": "ack", "op": op, "inlet": state}
+        if op == "river_outlet":
+            state = manager.apply_river_outlet(msg.get("fields") or {})
+            return {"type": "ack", "op": op, "outlet": state}
         if op == "water_erosion":
             manager.apply_water_erosion(bool(msg.get("enabled", False)))
             return {"type": "ack", "op": op}

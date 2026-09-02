@@ -16,10 +16,12 @@ if WARP_IMPORTED:
                        v: wp.array(dtype=float), bed: wp.array(dtype=float),
                        solid: wp.array(dtype=wp.int32),
                        next_u: wp.array(dtype=float), next_v: wp.array(dtype=float),
+                       inlet_q: wp.array(dtype=float),
                        width: int, height: int, dx: float, dt: float,
                        gravity: float, dry: float, manning_n: float,
                        friction_min_depth: float,
-                       max_velocity: float, outflow_columns: int):
+                       max_velocity: float, outflow_columns: int,
+                       outflow_row_lo: int, outflow_row_hi: int):
         idx = wp.tid()
         i = idx % width
         j = idx // width
@@ -73,8 +75,34 @@ if WARP_IMPORTED:
             ux = ux / (1.0 + drag)
             vz = vz / (1.0 + drag)
             if i == 0:
-                ux = 0.0
-            if i >= width - 1 - outflow_columns and outflow_columns > 0:
+                # v0.12.0: the west edge is where a prescribed-discharge inlet
+                # lives, and its velocity has to be imposed HERE rather than in
+                # the inlet kernel. This line used to be an unconditional
+                # `ux = 0.0`, which runs every substep after the inlet kernel
+                # has already written its u -- so a Q inlet that set u anywhere
+                # else would report the requested discharge in diagnostics while
+                # no water moved at all. Same shape as the bug that made the
+                # outlet inert before v0.8.0; see `_apply_outflow`.
+                #
+                # The velocity to prescribe is NOT q/h, even though q/h is the
+                # mean velocity of the flow being delivered. `_depth_step` moves
+                # water across the inlet face at the AVERAGE of the two cells'
+                # velocities, u_face = (u[0] + u[1])/2, so prescribing q/h at
+                # cell 0 delivers (q/h + u[1])/2 * h -- measured at roughly twice
+                # the requested discharge while the diagnostics happily reported
+                # the requested one, because u[0]*h[0] = q is true by
+                # construction and says nothing about what crossed the face.
+                #
+                # Solving u_face * h = q for the edge value gives this. Clamped
+                # at zero so a strong interior velocity can never turn the inlet
+                # into a drain; u[1] is one substep stale, which the steady state
+                # absorbs.
+                if inlet_q[j] > 0.0 and h[idx] > dry:
+                    ux = wp.max(0.0, 2.0 * inlet_q[j] / h[idx] - u[idx + 1])
+                else:
+                    ux = 0.0
+            if (i >= width - 1 - outflow_columns and outflow_columns > 0
+                    and j >= outflow_row_lo and j <= outflow_row_hi):
                 # Open outlet: the east edge is allowed to keep its velocity so
                 # water can actually leave, but only outward -- clamping the
                 # inward direction stops the boundary from ever acting as a
@@ -141,19 +169,85 @@ if WARP_IMPORTED:
 
     @wp.kernel
     def _apply_source(h: wp.array(dtype=float), bed: wp.array(dtype=float),
+                      u: wp.array(dtype=float), v: wp.array(dtype=float),
+                      sediment: wp.array(dtype=float),
                       solid: wp.array(dtype=wp.int32), width: int, height: int,
-                      source_columns: int, level: float):
+                      source_columns: int, level: float, area: float,
+                      capacity_scale: float, added: wp.array(dtype=float)):
         idx = wp.tid()
         if idx < width * height:
             i = idx % width
             if i < source_columns and solid[idx] == 0:
-                h[idx] = wp.max(0.0, level - bed[idx])
+                target = wp.max(0.0, level - bed[idx])
+                wp.atomic_add(added, 0, (target - h[idx]) * area)
+                h[idx] = target
+                # v0.12.0: the arriving water carries what it can carry.
+                # Without this the source columns see clean water every substep
+                # for ever, are therefore at maximum hunger for ever, and sit on
+                # SEDIMENT_MAX_BED_CHANGE for ever -- which is where the v0.11.0
+                # "erosion is limited by the clamp" reading came from: 29 of the
+                # 36 clamped cells were these. Measured in
+                # docs/07_river_plan.md. A river arriving at capacity is not
+                # hungry and does not scour its own inlet.
+                speed = wp.sqrt(u[idx] * u[idx] + v[idx] * v[idx])
+                sediment[idx] = capacity_scale * speed * target
+
+
+    @wp.kernel
+    def _apply_river_inlet(h: wp.array(dtype=float), u: wp.array(dtype=float),
+                           v: wp.array(dtype=float),
+                           sediment: wp.array(dtype=float),
+                           solid: wp.array(dtype=wp.int32),
+                           inlet_q: wp.array(dtype=float),
+                           normal_depth: wp.array(dtype=float),
+                           width: int, height: int, area: float,
+                           capacity_scale: float, added: wp.array(dtype=float)):
+        """Local inlet on the west edge, prescribing discharge rather than level.
+
+        A river is delivered as a discharge Q; a level is what the channel
+        answers with. So this kernel owns `h` only, and `_velocity_step` turns
+        the same q into u = q/h -- the two halves of one boundary condition,
+        deliberately not both written here (see the comment at `i == 0`).
+
+        Depth is the interior value carried outward (zero-gradient), floored at
+        the normal depth for the requested q on this bed slope. Zero-gradient
+        alone cannot start a dry channel -- h[0] = h[1] = 0 for ever, and the
+        inlet is silently inert; the floor is what lets the flow arrive at the
+        depth Manning says it should have. Where the channel is already deeper
+        than that, backwater from downstream wins, which is the physically right
+        way round for subcritical flow.
+
+        NOT "add Q*dt of volume to the edge cells": volume with no momentum to
+        go with it makes a mound that spreads radially, not a river.
+        """
+        idx = wp.tid()
+        i = idx % width
+        j = idx // width
+        if i != 0 or solid[idx] != 0:
+            return
+        q = inlet_q[j]
+        if q <= 0.0:
+            return
+        depth = wp.max(h[idx + 1], normal_depth[j])
+        wp.atomic_add(added, 0, (depth - h[idx]) * area)
+        h[idx] = depth
+        # Arriving loaded to capacity, computed from the velocity the erosion
+        # kernel will use a few lines later in this same substep rather than
+        # from the requested q -- the two differ while the flow is developing,
+        # and the difference is a gap the inlet would erode its own bed to
+        # close. Equal capacity, zero gap, no self-scour.
+        speed = wp.sqrt(u[idx] * u[idx] + v[idx] * v[idx])
+        sediment[idx] = capacity_scale * speed * depth
 
 
     @wp.kernel
     def _apply_outflow(h: wp.array(dtype=float), u: wp.array(dtype=float),
+                       sediment: wp.array(dtype=float),
                        solid: wp.array(dtype=wp.int32), width: int, height: int,
-                       columns: int, dx: float, dt: float):
+                       columns: int, row_lo: int, row_hi: int,
+                       dx: float, dt: float, area: float,
+                       removed: wp.array(dtype=float),
+                       sediment_out: wp.array(dtype=float)):
         """Let water leave through the east edge instead of piling against it.
 
         Every outer face is otherwise no-flux, so water that enters the map can
@@ -170,13 +264,30 @@ if WARP_IMPORTED:
         to be non-zero in the first place -- before that change this kernel was
         inert, because the edge column's u was clamped to 0 every substep before
         anything could use it.
+
+        v0.12.0 adds two things. The outlet can be a band of rows rather than
+        the whole edge, so a valley can drain through its channel and not
+        through its floodplain. And the departing water takes its suspended load
+        with it: before this, `h` left and the sediment it was carrying stayed,
+        so the east edge slowly turned into a bar made of material the river had
+        already delivered to the sea.
         """
         idx = wp.tid()
         i = idx % width
+        j = idx // width
         if i < width - columns or solid[idx] != 0:
             return
+        if j < row_lo or j > row_hi:
+            return
         outward = wp.max(0.0, u[idx])
-        h[idx] = wp.max(0.0, h[idx] - outward * h[idx] * dt / dx)
+        fraction = wp.min(1.0, outward * dt / dx)
+        loss = h[idx] * fraction
+        h[idx] = wp.max(0.0, h[idx] - loss)
+        wp.atomic_add(removed, 0, loss * area)
+        # the same fraction of the column leaves, so the same fraction of what
+        # that column was carrying leaves with it
+        wp.atomic_add(sediment_out, 0, sediment[idx] * fraction * area)
+        sediment[idx] = sediment[idx] * (1.0 - fraction)
 
 
     @wp.kernel
@@ -185,7 +296,8 @@ if WARP_IMPORTED:
                              centres: wp.array(dtype=wp.vec3),
                              radii: wp.array(dtype=float),
                              levels: wp.array(dtype=float),
-                             count: int, width: int, height: int, dx: float):
+                             count: int, width: int, height: int, dx: float,
+                             area: float, added: wp.array(dtype=float)):
         """Placeable inflow: hold water at `level` inside a disc of `radius`.
 
         Same rule as the edge inflow (`h = max(0, level - bed)`), so a source
@@ -209,7 +321,9 @@ if WARP_IMPORTED:
             dxc = x - centre[0]
             dzc = z - centre[2]
             if dxc * dxc + dzc * dzc <= radius * radius:
-                h[idx] = wp.max(h[idx], wp.max(0.0, levels[n] - bed[idx]))
+                target = wp.max(h[idx], wp.max(0.0, levels[n] - bed[idx]))
+                wp.atomic_add(added, 0, (target - h[idx]) * area)
+                h[idx] = target
 
 
     @wp.kernel
@@ -275,7 +389,8 @@ if WARP_IMPORTED:
                       circulation: wp.array(dtype=float),
                       samples: wp.array(dtype=float),
                       count: int, width: int, height: int, dx: float, dt: float,
-                      dry: float, swirl_gain: float, max_velocity: float):
+                      dry: float, swirl_gain: float, max_velocity: float,
+                      area: float, removed_total: wp.array(dtype=float)):
         """Remove water through a localized sink and spin up the flow around it.
 
         Removal uses a smooth radial profile and is capped by the water actually
@@ -330,7 +445,11 @@ if WARP_IMPORTED:
             falloff = 1.0 - ratio * ratio
             removed = wp.min(h[idx], strength * falloff * dt)
             h[idx] = h[idx] - removed
+            wp.atomic_add(removed_total, 0, removed * area)
             if h[idx] <= dry:
+                # the dregs are removed too, so the volume ledger stays exact
+                # rather than exact-to-within-a-film
+                wp.atomic_add(removed_total, 0, h[idx] * area)
                 h[idx] = 0.0
                 u[idx] = 0.0
                 v[idx] = 0.0
@@ -514,37 +633,66 @@ if WARP_IMPORTED:
             particles[n] = wp.vec3(sx, sy, sz)
 
 
+    # One packed array instead of five: every entry is read back to the host
+    # every frame, and each readback is a device sync. Packing them means the
+    # whole diagnostic set costs one sync, which is what makes it affordable to
+    # measure at both ends of a frame -- the CFL decision needs the state the
+    # substeps will start from, and a client reading diagnostics needs the state
+    # they ended at, and those are not the same state.
+    STAT_DEPTH, STAT_SPEED, STAT_WAVE = 0, 1, 2
+    STAT_VOLUME, STAT_WET, STAT_INLET = 3, 4, 5
+    STAT_COUNT = 6
+
     @wp.kernel
-    def _clear_diagnostics(max_depth: wp.array(dtype=float),
-                           max_speed: wp.array(dtype=float),
-                           max_wave: wp.array(dtype=float),
-                           volume: wp.array(dtype=float), wet: wp.array(dtype=wp.int32)):
-        max_depth[0] = 0.0
-        max_speed[0] = 0.0
-        max_wave[0] = 0.0
-        volume[0] = 0.0
-        wet[0] = 0
+    def _clear_diagnostics(stats: wp.array(dtype=float)):
+        for k in range(6):
+            stats[k] = 0.0
+
+
+    @wp.kernel
+    def _measure_inlet_flux(h: wp.array(dtype=float), u: wp.array(dtype=float),
+                            bed: wp.array(dtype=float),
+                            solid: wp.array(dtype=wp.int32),
+                            inlet_q: wp.array(dtype=float),
+                            width: int, dx: float,
+                            stats: wp.array(dtype=float)):
+        """Discharge actually crossing the inlet face, in m3/s.
+
+        Measured the way `_depth_step` transports it -- average face velocity,
+        upwind available depth -- and deliberately NOT as u[0]*h[0]: the edge
+        velocity is prescribed from q, so u[0]*h[0] returns the request whatever
+        the solver does with it. An instrument that cannot disagree with the
+        setting it is checking is not an instrument.
+        """
+        idx = wp.tid()
+        i = idx % width
+        j = idx // width
+        if i != 0 or solid[idx] != 0 or inlet_q[j] <= 0.0 or solid[idx + 1] != 0:
+            return
+        face = 0.5 * (u[idx] + u[idx + 1])
+        if face >= 0.0:
+            q = _face_flux(face, h[idx], bed[idx], bed[idx + 1])
+        else:
+            q = _face_flux(face, h[idx + 1], bed[idx + 1], bed[idx])
+        wp.atomic_add(stats, 5, q * dx)
 
 
     @wp.kernel
     def _reduce_diagnostics(h: wp.array(dtype=float), u: wp.array(dtype=float),
                             v: wp.array(dtype=float), solid: wp.array(dtype=wp.int32),
                             gravity: float, area: float, dry: float,
-                            max_depth: wp.array(dtype=float),
-                            max_speed: wp.array(dtype=float),
-                            max_wave: wp.array(dtype=float),
-                            volume: wp.array(dtype=float), wet: wp.array(dtype=wp.int32)):
+                            stats: wp.array(dtype=float)):
         idx = wp.tid()
         if solid[idx] == 0:
             depth = wp.max(0.0, h[idx])
             speed = wp.sqrt(u[idx] * u[idx] + v[idx] * v[idx])
             wave = wp.max(wp.abs(u[idx]), wp.abs(v[idx])) + wp.sqrt(gravity * depth)
-            wp.atomic_max(max_depth, 0, depth)
-            wp.atomic_max(max_speed, 0, speed)
-            wp.atomic_max(max_wave, 0, wave)
-            wp.atomic_add(volume, 0, depth * area)
+            wp.atomic_max(stats, 0, depth)
+            wp.atomic_max(stats, 1, speed)
+            wp.atomic_max(stats, 2, wave)
+            wp.atomic_add(stats, 3, depth * area)
             if depth > dry:
-                wp.atomic_add(wet, 0, 1)
+                wp.atomic_add(stats, 4, 1.0)
 
 
     @wp.kernel
@@ -742,6 +890,18 @@ class WarpShallowWaterSolver(FluidSolver):
         # as they did in 0.7.0 -- a world with no SOURCE object behaves
         # identically, which is what keeps the whole 0.7.0 suite valid.
         self._outflow_columns = 0
+        # v0.12.0: outlet rows and the local discharge inlet. The defaults are
+        # the 0.8.0 behaviour exactly -- outlet across the whole east edge, no
+        # river inlet -- so every world that predates this is unaffected.
+        self._outflow_rows = (0, 0)
+        self._inlet_enabled = False
+        self._inlet_q = self._inlet_normal_depth = None
+        self._inlet_q_host = np.zeros(0, dtype=np.float32)
+        self._inlet_request = {"discharge_m3s": 0.0, "width_m": 0.0, "centre_z": 0.0}
+        self._added_m3 = 0.0
+        self._removed_m3 = 0.0
+        self._sediment_out_m3 = 0.0
+        self._volume_at_start = 0.0
         self._source_count = 0
         self._drain_count = 0
         self._src_centres = self._src_radii = self._src_levels = None
@@ -772,8 +932,14 @@ class WarpShallowWaterSolver(FluidSolver):
         self._bed_host = bed_grid.ravel().copy()
         depth_grid = np.zeros_like(bed_grid, dtype=np.float32)
         source_columns = min(config.FLUID_SOURCE_COLUMNS, self._width)
-        depth_grid[:, :source_columns] = np.maximum(
-            self._level - bed_grid[:, :source_columns], 0.0)
+        water = getattr(world, "water", None)
+        inlet_wanted = bool(getattr(water, "inlet_enabled", False))
+        if not inlet_wanted:
+            # A river inlet owns the west edge; pre-filling it from the level
+            # control as well would put a wall of water across the floodplain at
+            # t = 0 and then leave it to drain, which is not a river starting.
+            depth_grid[:, :source_columns] = np.maximum(
+                self._level - bed_grid[:, :source_columns], 0.0)
         depth = depth_grid.ravel()
         zeros = np.zeros(self._count, dtype=np.float32)
         self._obstacle_host = np.zeros(self._count, dtype=np.int32)
@@ -790,11 +956,20 @@ class WarpShallowWaterSolver(FluidSolver):
         self._sediment = wp.zeros(self._count, dtype=float, device=self.device)
         self._next_sediment = wp.empty(self._count, dtype=float, device=self.device)
         self._obstacles = wp.array(self._obstacle_host, dtype=wp.int32, device=self.device)
-        self._diag_max_depth = wp.zeros(1, dtype=float, device=self.device)
-        self._diag_max_speed = wp.zeros(1, dtype=float, device=self.device)
-        self._diag_max_wave = wp.zeros(1, dtype=float, device=self.device)
-        self._diag_volume = wp.zeros(1, dtype=float, device=self.device)
-        self._diag_wet = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self._diag_stats = wp.zeros(6, dtype=float, device=self.device)
+        self._diag_added = wp.zeros(1, dtype=float, device=self.device)
+        self._diag_removed = wp.zeros(1, dtype=float, device=self.device)
+        self._diag_sediment_out = wp.zeros(1, dtype=float, device=self.device)
+        self._inlet_q_host = np.zeros(self._height, dtype=np.float32)
+        self._inlet_q = wp.zeros(self._height, dtype=float, device=self.device)
+        self._inlet_normal_depth = wp.zeros(self._height, dtype=float,
+                                            device=self.device)
+        self._inlet_enabled = False
+        self._inlet_request = {"discharge_m3s": 0.0, "width_m": 0.0, "centre_z": 0.0}
+        self._outflow_rows = (0, self._height - 1)
+        self._added_m3 = 0.0
+        self._removed_m3 = 0.0
+        self._sediment_out_m3 = 0.0
         self._seen_terrain_revision = -1
         self._seen_obstacle_revision = -1
         self.terrain_gpu_uploads = 1
@@ -816,8 +991,18 @@ class WarpShallowWaterSolver(FluidSolver):
         tracers = np.column_stack((tracer_x, tracer_y, tracer_z)).astype(np.float32)
         tracers[depth[tracer_idx] <= config.FLUID_DRY_DEPTH, 1] = -100.0
         self._flow_particles = wp.array(tracers, dtype=wp.vec3, device=self.device)
+        if inlet_wanted:
+            # The boundary is part of the world, so it is restored with the
+            # world rather than waiting for the first tick's live sync.
+            self.set_river_inlet(True, float(water.inlet_centre_z),
+                                 float(water.inlet_width_m),
+                                 float(water.inlet_discharge_m3s))
+        if water is not None and float(getattr(water, "outlet_width_m", 0.0)) > 0.0:
+            self.set_outflow(self._outflow_columns, float(water.outlet_centre_z),
+                             float(water.outlet_width_m))
         self._recombine_bed()
         self._measure()
+        self._volume_at_start = float(self._diag["volume_m3"])
 
     def _build_obstacle_mask(self, terrain, obstacles: dict) -> np.ndarray:
         mask = np.zeros(self._count, dtype=np.int32)
@@ -1022,13 +1207,78 @@ class WarpShallowWaterSolver(FluidSolver):
             self._recombine_bed()
             self._measure()
 
-    def set_outflow(self, columns: int) -> None:
+    def set_outflow(self, columns: int, centre_z: float = 0.0,
+                    width_m: float = 0.0) -> None:
         """Width, in cells, of the transmissive outlet on the east edge.
 
         Zero restores the fully closed domain of 0.7.0 -- which is what the
         volume-conservation test wants, and it says so in its own name.
+
+        v0.12.0: `width_m` narrows the outlet to a band of rows centred on
+        `centre_z`, so a valley drains through its channel instead of through
+        its floodplain. Zero (the default) keeps the whole edge open, which is
+        what every world before this expects.
         """
         self._outflow_columns = max(0, int(columns))
+        if width_m <= 0.0 or self._height <= 0:
+            self._outflow_rows = (0, max(0, self._height - 1))
+            return
+        self._outflow_rows = self._edge_band(centre_z, width_m)
+
+    def _edge_band(self, centre_z: float, width_m: float) -> tuple:
+        """Rows covered by a band `width_m` wide centred on world z=`centre_z`."""
+        cell = float(self._terrain.cell_size)
+        centre_row = centre_z / cell + (self._height - 1) * 0.5
+        half = max(0.5, width_m * 0.5 / cell)
+        lo = int(max(0, math.ceil(centre_row - half)))
+        hi = int(min(self._height - 1, math.floor(centre_row + half)))
+        if hi < lo:
+            lo = hi = int(min(self._height - 1, max(0, round(centre_row))))
+        return lo, hi
+
+    def set_river_inlet(self, enabled: bool, centre_z: float = 0.0,
+                        width_m: float = 12.0, discharge_m3s: float = 0.0) -> None:
+        """Prescribed-discharge inlet on a band of the west edge.
+
+        Q is the control; the level the channel settles at is the answer, not a
+        second knob -- prescribing both over-determines the boundary. The band
+        carries q = Q/W per unit width, and the depth it arrives at is the
+        normal depth for that q on the local bed slope, computed here on the
+        host from Manning: h = (q*n/sqrt(S))^(3/5).
+
+        That number is a floor, not a prescription: `_apply_river_inlet` takes
+        the interior depth when the channel is deeper than normal, so backwater
+        from downstream is respected. It exists because pure zero-gradient
+        cannot start a dry channel -- h[0] = h[1] = 0 stays 0 for ever.
+        """
+        enabled = bool(enabled) and discharge_m3s > 0.0 and width_m > 0.0
+        request = {"discharge_m3s": float(discharge_m3s), "width_m": float(width_m),
+                   "centre_z": float(centre_z)}
+        if enabled == self._inlet_enabled and request == self._inlet_request:
+            return
+        self._inlet_enabled = enabled
+        self._inlet_request = request
+        if self._inlet_q is None:
+            return
+        q_row = np.zeros(self._height, dtype=np.float32)
+        depth_row = np.zeros(self._height, dtype=np.float32)
+        if enabled:
+            lo, hi = self._edge_band(centre_z, width_m)
+            span_m = (hi - lo + 1) * float(self._terrain.cell_size)
+            q = float(discharge_m3s) / max(span_m, 1.0e-6)     # m2/s per unit width
+            q_row[lo:hi + 1] = q
+            bed = self._bed_host.reshape(self._height, self._width)
+            probe = min(self._width - 1, 8)
+            slope = ((bed[lo:hi + 1, 0] - bed[lo:hi + 1, probe])
+                     / (probe * float(self._terrain.cell_size)))
+            # a flat or adverse bed has no normal depth; the floor keeps the
+            # inlet finite there instead of demanding an infinite one
+            slope = np.maximum(slope, 1.0e-4)
+            normal = (q * config.FLUID_MANNING_N / np.sqrt(slope)) ** 0.6
+            depth_row[lo:hi + 1] = np.minimum(normal, 10.0)
+        self._inlet_q_host = q_row
+        self._inlet_q.assign(q_row)
+        self._inlet_normal_depth.assign(depth_row)
 
     def set_water_features(self, sources: list, drains: list) -> None:
         """Upload placeable SOURCE and DRAIN objects, in world coordinates.
@@ -1091,42 +1341,58 @@ class WarpShallowWaterSolver(FluidSolver):
     def _measure(self) -> None:
         if self._h is None:
             return
-        wp.launch(_clear_diagnostics, dim=1, inputs=[self._diag_max_depth,
-                  self._diag_max_speed, self._diag_max_wave, self._diag_volume,
-                  self._diag_wet], device=self.device)
+        wp.launch(_clear_diagnostics, dim=1, inputs=[self._diag_stats],
+                  device=self.device)
         wp.launch(_reduce_diagnostics, dim=self._count, inputs=[self._h, self._u,
                   self._v, self._obstacles, float(self._world.environment.gravity),
                   float(self._terrain.cell_size ** 2), config.FLUID_DRY_DEPTH,
-                  self._diag_max_depth, self._diag_max_speed, self._diag_max_wave,
-                  self._diag_volume, self._diag_wet], device=self.device)
-        max_wave = float(self._diag_max_wave.numpy()[0])
+                  self._diag_stats], device=self.device)
+        if self._inlet_enabled:
+            wp.launch(_measure_inlet_flux, dim=self._count,
+                      inputs=[self._h, self._u, self._bed, self._obstacles,
+                              self._inlet_q, self._width,
+                              float(self._terrain.cell_size),
+                              self._diag_stats], device=self.device)
+        stats = self._diag_stats.numpy()          # the frame's one device sync
+        max_wave = float(stats[2])
         cfl_dt = (config.FIXED_DT if max_wave <= 1.0e-8 else
                   config.FLUID_CFL * self._terrain.cell_size / max_wave)
         self._diag.update({
+            "inlet_discharge_m3s": float(stats[5]),
             "cfl_dt": cfl_dt,
-            "max_depth": float(self._diag_max_depth.numpy()[0]),
-            "max_velocity": float(self._diag_max_speed.numpy()[0]),
-            "wet_cells": int(self._diag_wet.numpy()[0]),
-            "volume_m3": float(self._diag_volume.numpy()[0]),
+            "max_depth": float(stats[0]),
+            "max_velocity": float(stats[1]),
+            "wet_cells": int(stats[4]),
+            "volume_m3": float(stats[3]),
         })
 
     def advance(self, global_dt: float, max_substeps: int, stability_dt: float) -> int:
         if self._h is None:
             return 0
+        # Measured at both ends of the frame, for two different consumers. Here,
+        # because the substep count must answer to the state these substeps
+        # actually start from -- including any state written from outside since
+        # the last frame. And again after the loop, because a client reading
+        # diagnostics wants the frame that just ran: reporting the previous
+        # frame's volume alongside this frame's inflow made the volume ledger
+        # look out by exactly one frame of inflow. Two measurements cost two
+        # device syncs, which is why the diagnostics were packed into one array.
         self._measure()
         required = max(1, math.ceil(global_dt / max(self._diag["cfl_dt"], 1.0e-8)))
         substeps = min(max_substeps, required)
         dt = global_dt / substeps
         self._diag["cfl_limited"] = required > max_substeps
         gravity = float(self._world.environment.gravity)
+        area = float(self._terrain.cell_size ** 2)
         for _ in range(substeps):
             wp.launch(_velocity_step, dim=self._count, inputs=[self._h, self._u,
                       self._v, self._bed, self._obstacles, self._next_u,
-                      self._next_v, self._width, self._height,
+                      self._next_v, self._inlet_q, self._width, self._height,
                       float(self._terrain.cell_size), dt, gravity,
                       config.FLUID_DRY_DEPTH, config.FLUID_MANNING_N,
                       config.FLUID_FRICTION_MIN_DEPTH,
-                      config.FLUID_MAX_VELOCITY, self._outflow_columns],
+                      config.FLUID_MAX_VELOCITY, self._outflow_columns,
+                      self._outflow_rows[0], self._outflow_rows[1]],
                       device=self.device)
             self._u, self._next_u = self._next_u, self._u
             self._v, self._next_v = self._next_v, self._v
@@ -1135,21 +1401,36 @@ class WarpShallowWaterSolver(FluidSolver):
                       self._width, self._height, float(self._terrain.cell_size), dt],
                       device=self.device)
             self._h, self._next_h = self._next_h, self._h
-            if self._source_enabled and not self._source_count:
+            if self._inlet_enabled:
+                # A local discharge inlet is the river's own boundary and takes
+                # over from the edge-level source, for the same reason a placed
+                # SOURCE does: one map, one answer to "where does the water come
+                # from". The level mode stays available and unchanged.
+                wp.launch(_apply_river_inlet, dim=self._count,
+                          inputs=[self._h, self._u, self._v, self._sediment,
+                                  self._obstacles,
+                                  self._inlet_q, self._inlet_normal_depth,
+                                  self._width, self._height, area,
+                                  config.SEDIMENT_CAPACITY_SCALE,
+                                  self._diag_added], device=self.device)
+            elif self._source_enabled and not self._source_count:
                 # a placed SOURCE takes over from the edge inflow entirely --
                 # otherwise the map has two sources and "where does the water
                 # come from" stops having a single answer
                 wp.launch(_apply_source, dim=self._count, inputs=[self._h,
-                          self._bed, self._obstacles, self._width,
+                          self._bed, self._u, self._v, self._sediment,
+                          self._obstacles, self._width,
                           self._height, config.FLUID_SOURCE_COLUMNS,
-                          self._level], device=self.device)
+                          self._level, area, config.SEDIMENT_CAPACITY_SCALE,
+                          self._diag_added], device=self.device)
             if self._source_count:
                 wp.launch(_apply_point_sources, dim=self._count,
                           inputs=[self._h, self._bed, self._obstacles,
                                   self._src_centres, self._src_radii,
                                   self._src_levels, self._source_count,
                                   self._width, self._height,
-                                  float(self._terrain.cell_size)],
+                                  float(self._terrain.cell_size), area,
+                                  self._diag_added],
                           device=self.device)
             if self._drain_count:
                 self._drain_circulation.zero_()
@@ -1170,13 +1451,17 @@ class WarpShallowWaterSolver(FluidSolver):
                                   self._drain_count, self._width, self._height,
                                   float(self._terrain.cell_size), dt,
                                   config.FLUID_DRY_DEPTH, config.DRAIN_SWIRL_GAIN,
-                                  config.FLUID_MAX_VELOCITY], device=self.device)
+                                  config.FLUID_MAX_VELOCITY, area,
+                                  self._diag_removed], device=self.device)
             if self._outflow_columns:
                 wp.launch(_apply_outflow, dim=self._count,
-                          inputs=[self._h, self._u, self._obstacles,
+                          inputs=[self._h, self._u, self._sediment,
+                                  self._obstacles,
                                   self._width, self._height,
                                   self._outflow_columns,
-                                  float(self._terrain.cell_size), dt],
+                                  self._outflow_rows[0], self._outflow_rows[1],
+                                  float(self._terrain.cell_size), dt, area,
+                                  self._diag_removed, self._diag_sediment_out],
                           device=self.device)
             if self._erosion_enabled:
                 # RiverLab (v0.6.0): pick material up where the flow is fast and
@@ -1212,8 +1497,28 @@ class WarpShallowWaterSolver(FluidSolver):
                               float(self._terrain.cell_size), dt,
                               config.FLUID_DRY_DEPTH], device=self.device)
             self._time += dt
+        self._fold_ledger()
+        self._measure()
         self.last_substeps = substeps
         return substeps
+
+    def _fold_ledger(self) -> None:
+        """Move this frame's device-side volume counters into Python floats.
+
+        Accumulated per frame and folded here rather than summed on the device
+        for the whole run: a float32 accumulator that has reached thousands of
+        m3 silently stops noticing the cubic metre being added to it. Folding
+        also leaves the device counters at zero for the next frame, so every
+        path that injects or removes water must call this afterwards.
+        """
+        if self._diag_added is None:
+            return
+        self._added_m3 += float(self._diag_added.numpy()[0])
+        self._removed_m3 += float(self._diag_removed.numpy()[0])
+        self._sediment_out_m3 += float(self._diag_sediment_out.numpy()[0])
+        self._diag_added.zero_()
+        self._diag_removed.zero_()
+        self._diag_sediment_out.zero_()
 
     def _host_fields(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self._h is None:
@@ -1286,11 +1591,17 @@ class WarpShallowWaterSolver(FluidSolver):
 
     def set_level(self, level: float) -> None:
         level = float(level)
-        if abs(level - self._level) > 1.0e-9 and self._h is not None:
+        if (abs(level - self._level) > 1.0e-9 and self._h is not None
+                and not self._inlet_enabled):
             self._source_enabled = True
             wp.launch(_apply_source, dim=self._count, inputs=[self._h, self._bed,
+                      self._u, self._v, self._sediment,
                       self._obstacles, self._width, self._height,
-                      config.FLUID_SOURCE_COLUMNS, level], device=self.device)
+                      config.FLUID_SOURCE_COLUMNS, level,
+                      float(self._terrain.cell_size ** 2),
+                      config.SEDIMENT_CAPACITY_SCALE, self._diag_added],
+                      device=self.device)
+            self._fold_ledger()
         self._level = level
 
     def get_water_height(self, x=0.0, z=0.0) -> float:
@@ -1326,6 +1637,19 @@ class WarpShallowWaterSolver(FluidSolver):
         return {"solver": "warp_shallow_water", "device": self.device,
                 "erosion": self._erosion_enabled,
                 "outflow_columns": self._outflow_columns,
+                # v0.12.0 volume ledger. Without it a boundary condition cannot
+                # be shown to work: "water appears at the inlet" and "the right
+                # amount of water appears at the inlet" look identical on
+                # screen. volume_m3 - (added - removed) is the solver's own
+                # conservation error and should stay at numerical noise.
+                "added_m3": self._added_m3,
+                "removed_m3": self._removed_m3,
+                "volume_error_m3": (self._diag["volume_m3"] - self._volume_at_start
+                                    - self._added_m3 + self._removed_m3),
+                "sediment_out_m3": self._sediment_out_m3,
+                "inlet_enabled": self._inlet_enabled,
+                "inlet_request_m3s": self._inlet_request["discharge_m3s"],
+                "outflow_rows": list(self._outflow_rows),
                 "sources": self._source_count,
                 "drains": self._drain_count,
                 "drain_swirl_mps": (

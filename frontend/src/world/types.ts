@@ -66,7 +66,12 @@ export interface SimStateMessage {
   gauges: GaugeState[];
   fluid?: { solver: string; device?: string; grid?: number[]; substeps: number;
             wet_cells?: number; volume_m3?: number; cfl_dt?: number;
-            max_depth?: number; max_velocity?: number };
+            max_depth?: number; max_velocity?: number;
+            erosion?: boolean; outflow_columns?: number; cfl_limited?: boolean;
+            // v0.12.0 river boundaries and their volume ledger
+            inlet_enabled?: boolean; inlet_request_m3s?: number;
+            inlet_discharge_m3s?: number; added_m3?: number; removed_m3?: number;
+            volume_error_m3?: number; sediment_out_m3?: number };
 }
 
 export interface GaugeSample {

@@ -264,6 +264,39 @@ try {
   assert(rotation.length === 3 && rotation.every(Number.isFinite), 'rotation is not xyz');
   report('rotation xyz round-trip');
 
+  // v0.12.0: the river, driven the way a user drives it -- generate a valley
+  // from the Terrain panel, switch the inlet on, and check the HUD's own
+  // discharge readout rather than the backend's internals. The sim is IDLE
+  // here (RESET above), which is required: terrain edits are refused while
+  // RUNNING, and that refusal is itself worth exercising from the UI.
+  await page.evaluate(() => document.querySelector('#river-generate').click());
+  await waitFor(() => page.evaluate(() => {
+    const h = window.__NL.store.terrain.heights;
+    return Math.max(...h) - Math.min(...h) > 1.0;      // a valley, not a plain
+  }));
+  report('river valley generated from the Terrain panel');
+
+  await page.evaluate(() => {
+    document.querySelector('#river-outlet-width').value = '20';
+    document.querySelector('#river-outlet-width').dispatchEvent(new Event('input'));
+    const box = document.querySelector('#river-inlet');
+    box.checked = true;
+    box.dispatchEvent(new Event('change'));
+    window.__NL.net.send({ op: 'water_level', level: 0 });
+    window.__NL.net.send({ op: 'start' });
+  });
+  await waitFor(() => page.evaluate(() =>
+    document.querySelector('#sim-status')?.textContent === 'RUNNING'));
+  await waitFor(() => page.evaluate(() => {
+    const text = document.querySelector('#dbg-flux')?.textContent ?? '';
+    const match = text.match(/^([\d.]+) m³\/s \| ([\d.]+) in/);
+    return match && Number(match[1]) > 1 && Number(match[2]) > 10;
+  }), 60_000);
+  report('river inlet delivers a measured discharge');
+  await page.evaluate(() => window.__NL.net.send({ op: 'reset' }));
+  await waitFor(() => page.evaluate(() =>
+    document.querySelector('#sim-status')?.textContent === 'IDLE'));
+
   assert(errors.length === 0, errors.join('\n'));
   report('no browser errors');
   // read the version off the running backend rather than hard-coding it, so

@@ -326,11 +326,28 @@ class WaterState:
     # that cannot run off the map just fills it, which is what the closed
     # boundary did for every version up to 0.7.0.
     outflow_enabled: bool = True
+    # v0.12.0 river boundaries. These live in `water` and not in `objects`: a
+    # saved river whose inlet was an object would load as a dry map with a
+    # decoration on it, because the objects are restored after the water is.
+    # Off by default, so a world that predates them behaves exactly as before --
+    # edge-level inflow across the whole west edge, outlet across the whole east.
+    inlet_enabled: bool = False
+    inlet_centre_z: float = 0.0      # world z of the inlet band's centre
+    inlet_width_m: float = 12.0      # how much of the edge the river occupies
+    inlet_discharge_m3s: float = 12.0  # prescribed Q -- the level is the answer
+    outlet_centre_z: float = 0.0
+    outlet_width_m: float = 0.0      # 0 = the whole edge, as before v0.12.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {"level": self.level, "visible": self.visible,
                 "erosion_enabled": self.erosion_enabled,
-                "outflow_enabled": self.outflow_enabled}
+                "outflow_enabled": self.outflow_enabled,
+                "inlet_enabled": self.inlet_enabled,
+                "inlet_centre_z": self.inlet_centre_z,
+                "inlet_width_m": self.inlet_width_m,
+                "inlet_discharge_m3s": self.inlet_discharge_m3s,
+                "outlet_centre_z": self.outlet_centre_z,
+                "outlet_width_m": self.outlet_width_m}
 
 
 @dataclass
@@ -383,7 +400,10 @@ class WorldState:
     # ------------------------------------------------------------------ (de)serialise
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "version": 2,
+            # 3: water carries the river inlet/outlet. Older files simply lack
+            # the keys and get the pre-v0.12.0 defaults from WaterState, so the
+            # migration is the default values themselves -- no rewrite needed.
+            "version": 3,
             "terrain": {"width": self.terrain.width, "height": self.terrain.height,
                         "cell_size": self.terrain.cell_size,
                         "heights": self.terrain.to_list()},
@@ -399,8 +419,26 @@ class WorldState:
         state = WorldState()
         state.terrain = TerrainGrid.from_dict(data.get("terrain", {}))
         water = data.get("water", {})
-        state.water = WaterState(level=finite_number(water.get("level", 0.5), "water.level"),
-                                 visible=bool(water.get("visible", True)))
+        # Everything under `water` is restored, including the two toggles that
+        # were written to file but silently dropped on load before v0.12.0 --
+        # which meant a saved world with erosion on came back with it off, and
+        # so did every reset(), since reset clones through this same path.
+        state.water = WaterState(
+            level=finite_number(water.get("level", 0.5), "water.level"),
+            visible=bool(water.get("visible", True)),
+            erosion_enabled=bool(water.get("erosion_enabled", False)),
+            outflow_enabled=bool(water.get("outflow_enabled", True)),
+            inlet_enabled=bool(water.get("inlet_enabled", False)),
+            inlet_centre_z=finite_number(water.get("inlet_centre_z", 0.0),
+                                         "water.inlet_centre_z"),
+            inlet_width_m=finite_number(water.get("inlet_width_m", 12.0),
+                                        "water.inlet_width_m"),
+            inlet_discharge_m3s=finite_number(water.get("inlet_discharge_m3s", 12.0),
+                                              "water.inlet_discharge_m3s"),
+            outlet_centre_z=finite_number(water.get("outlet_centre_z", 0.0),
+                                          "water.outlet_centre_z"),
+            outlet_width_m=finite_number(water.get("outlet_width_m", 0.0),
+                                         "water.outlet_width_m"))
         env = data.get("environment", {})
         state.environment = EnvironmentState(
             gravity=finite_number(env.get("gravity", 9.81), "environment.gravity"),

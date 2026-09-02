@@ -22,6 +22,9 @@ export interface UICallbacks {
   setTool(tool: 'select' | 'raise' | 'lower'): void;
   setBrush(radius: number, strength: number): void;
   generateRiver(params: { slope: number; bed_width: number; incision: number }): void;
+  setRiverInlet(fields: { enabled?: boolean; width_m?: number;
+                          discharge_m3s?: number }): void;
+  setRiverOutlet(fields: { width_m?: number }): void;
   getObjects(): ObjectData[];
 }
 
@@ -35,6 +38,7 @@ export class UI {
   private objectsEl: HTMLSpanElement;
   private particlesEl: HTMLSpanElement;
   private fluidEl: HTMLSpanElement;
+  private fluxEl: HTMLSpanElement;
   private wsEl: HTMLSpanElement;
   private gpuEl: HTMLSpanElement;
   private warpEl: HTMLSpanElement;
@@ -56,6 +60,7 @@ export class UI {
     this.objectsEl = this.root.querySelector('#dbg-objects')!;
     this.particlesEl = this.root.querySelector('#dbg-particles')!;
     this.fluidEl = this.root.querySelector('#dbg-fluid')!;
+    this.fluxEl = this.root.querySelector('#dbg-flux')!;
     this.wsEl = this.root.querySelector('#dbg-ws')!;
     this.gpuEl = this.root.querySelector('#dbg-gpu')!;
     this.warpEl = this.root.querySelector('#dbg-warp')!;
@@ -148,6 +153,55 @@ export class UI {
     outflow.onchange = () => this.cb.setOutflow(outflow.checked);
     outflowRow.append(outflow);
     panel.append(outflowRow);
+
+    // v0.12.0: a river is delivered as a discharge; the level it runs at is the
+    // channel's answer, not a second setting. So this is Q in m3/s and there is
+    // deliberately no companion "inlet level" control -- prescribing both
+    // over-determines the boundary and the two disagree the moment the bed
+    // changes. While it is on, the edge-inflow level control above is inert:
+    // one map, one answer to "where does the water come from".
+    const inletRow = el('label', 'slider-row', 'River inlet (prescribed discharge)');
+    const inlet = el('input', '') as HTMLInputElement;
+    inlet.id = 'river-inlet';
+    inlet.type = 'checkbox';
+    inlet.onchange = () => this.cb.setRiverInlet({ enabled: inlet.checked });
+    inletRow.append(inlet);
+    panel.append(inletRow);
+
+    const flow = el('div', 'slider-row');
+    flow.innerHTML = '<label>Discharge Q <output id="river-q-out">12</output> m³/s</label>';
+    const discharge = el('input', '') as HTMLInputElement;
+    discharge.id = 'river-discharge';
+    discharge.type = 'range'; discharge.min = '1'; discharge.max = '80';
+    discharge.step = '1'; discharge.value = '12';
+    discharge.oninput = () => {
+      this.root.querySelector('#river-q-out')!.textContent = discharge.value;
+      this.cb.setRiverInlet({ discharge_m3s: parseFloat(discharge.value) });
+    };
+    flow.append(discharge);
+    flow.insertAdjacentHTML('beforeend',
+      '<label>Inlet width <output id="river-inlet-w-out">12</output> m</label>');
+    const inletWidth = el('input', '') as HTMLInputElement;
+    inletWidth.id = 'river-inlet-width';
+    inletWidth.type = 'range'; inletWidth.min = '4'; inletWidth.max = '60';
+    inletWidth.step = '1'; inletWidth.value = '12';
+    inletWidth.oninput = () => {
+      this.root.querySelector('#river-inlet-w-out')!.textContent = inletWidth.value;
+      this.cb.setRiverInlet({ width_m: parseFloat(inletWidth.value) });
+    };
+    flow.append(inletWidth);
+    flow.insertAdjacentHTML('beforeend',
+      '<label>Outlet width <output id="river-outlet-w-out">0</output> m (0 = whole edge)</label>');
+    const outletWidth = el('input', '') as HTMLInputElement;
+    outletWidth.id = 'river-outlet-width';
+    outletWidth.type = 'range'; outletWidth.min = '0'; outletWidth.max = '80';
+    outletWidth.step = '2'; outletWidth.value = '0';
+    outletWidth.oninput = () => {
+      this.root.querySelector('#river-outlet-w-out')!.textContent = outletWidth.value;
+      this.cb.setRiverOutlet({ width_m: parseFloat(outletWidth.value) });
+    };
+    flow.append(outletWidth);
+    panel.append(flow);
 
     const erosionRow = el('label', 'slider-row', 'Erosion (river reshapes the bed)');
     const erosion = el('input', '') as HTMLInputElement;
@@ -267,6 +321,11 @@ export class UI {
       'Objects <span id="dbg-objects">0</span> | ' +
       'Tracers source <span id="dbg-particles">0</span> | ' +
       'Wet cells <span id="dbg-fluid">0</span> | ' +
+      // The balance is the instrument that says whether the boundaries are
+      // doing what they claim: in / out as measured discharge, and the running
+      // totals. A river whose inlet reports 12 m³/s while nothing arrives
+      // downstream is a bug you can only see here.
+      'Q in/out <span id="dbg-flux">– / –</span> | ' +
       'WS <span id="dbg-ws">offline</span> | ' +
       'Warp <span id="dbg-warp">–</span> | ' +
       'CUDA <span id="dbg-cuda">–</span> | ' +
@@ -298,6 +357,11 @@ export class UI {
     this.statusEl.className = status === 'RUNNING' ? 'ok' : '';
   }
 
+  setRiverInletEnabled(enabled: boolean): void {
+    const box = this.root.querySelector<HTMLInputElement>('#river-inlet');
+    if (box) box.checked = enabled;
+  }
+
   setErosionEnabled(enabled: boolean): void {
     const box = this.root.querySelector<HTMLInputElement>('#water-erosion');
     if (box) box.checked = enabled;
@@ -322,7 +386,10 @@ export class UI {
   setSimStats(state: { sim_fps: number; objects: number; particles: number;
                        fluid?: { wet_cells?: number; volume_m3?: number;
                                  erosion?: boolean; outflow_columns?: number;
-                                 sources?: number; drains?: number } }): void {
+                                 sources?: number; drains?: number;
+                                 inlet_enabled?: boolean;
+                                 inlet_discharge_m3s?: number;
+                                 added_m3?: number; removed_m3?: number } }): void {
     // Keep the checkbox honest about what the solver is actually doing: the
     // flag is streamed live, so a world loaded with erosion on -- or a state
     // changed by anything other than this checkbox -- still shows correctly.
@@ -336,6 +403,15 @@ export class UI {
     const wet = state.fluid?.wet_cells ?? 0;
     const volume = state.fluid?.volume_m3 ?? 0;
     this.fluidEl.textContent = `${wet.toLocaleString()} / ${volume.toFixed(1)} m³`;
+    const qIn = state.fluid?.inlet_discharge_m3s;
+    const added = state.fluid?.added_m3 ?? 0;
+    const removed = state.fluid?.removed_m3 ?? 0;
+    this.fluxEl.textContent = state.fluid?.inlet_enabled
+      ? `${(qIn ?? 0).toFixed(1)} m³/s | ${added.toFixed(0)} in / ${removed.toFixed(0)} out m³`
+      : `${added.toFixed(0)} in / ${removed.toFixed(0)} out m³`;
+    if (state.fluid?.inlet_enabled !== undefined) {
+      this.setRiverInletEnabled(state.fluid.inlet_enabled);
+    }
   }
 
   logEvent(e: SimEvent): void {

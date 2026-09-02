@@ -188,8 +188,14 @@ class Physics04Tests(unittest.IsolatedAsyncioTestCase):
                                 car_state.position[2] - car2_state.position[2])
         self.assertGreaterEqual(separation, 4.5)
 
+        # Raising the level while RUNNING must put water in immediately, not at
+        # the next tick. This used to re-apply the level it already had (1.5)
+        # and pass on the diagnostics being one frame stale -- it was reading
+        # "the map is still filling", not "the control did something"; since
+        # v0.12.0 the diagnostics describe the frame that just ran, so the
+        # assertion needs a real change to measure.
         before = self.manager.fluid.diagnostics()["volume_m3"]
-        self.manager.apply_water_level(1.5)
+        self.manager.apply_water_level(2.5)
         self.manager.fluid._measure()
         self.assertGreater(self.manager.fluid.diagnostics()["volume_m3"], before)
         self.manager._step_once()
@@ -1578,6 +1584,296 @@ class RiverValleyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(wet.any(), "the channel never filled")
         self.assertGreater(float(u[wet].mean()), 0.0,
                            "water on a sloped bed did not move downstream")
+
+
+class RiverBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    """v0.12.0: the local inlet, the local outlet, and the ledger that proves them.
+
+    A boundary condition cannot be checked by looking at the screen -- "water
+    appears at the inlet" and "the right amount of water appears at the inlet"
+    look identical -- so every test here reads the volume ledger or a measured
+    discharge, never a picture.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    def _valley(self, discharge: float = 12.0, width: float = 12.0,
+                outlet_width: float = 20.0, **river) -> dict:
+        info = self.manager.apply_terrain_river(river)["river"]
+        self.manager.apply_water_level(0.0)
+        self.manager.apply_river_inlet({"enabled": True, "width_m": width,
+                                        "discharge_m3s": discharge})
+        self.manager.apply_river_outlet({"width_m": outlet_width})
+        return info
+
+    def _prime(self, depth: float) -> None:
+        """Fill the channel to `depth`, surface parallel to the bed.
+
+        Starting a 200 m channel from dry costs two minutes of simulated time
+        before the flow is developed; priming it puts the tests at the state
+        they are actually asking about. It also injects water behind the
+        ledger's back, so a primed run cannot be used for the balance test --
+        which is why that test does not prime.
+        """
+        bed = self.manager.fluid.get_terrain_heights().reshape(N, N)
+        surface = bed[N // 2, :] + depth
+        h = np.maximum(surface[None, :] - bed, 0.0).astype(np.float32)
+        self.manager.fluid._h.assign(h.ravel())
+
+    def _run(self, seconds: float) -> None:
+        for _ in range(int(seconds * 60)):
+            self.manager._step_once()
+
+    def _depth(self) -> np.ndarray:
+        return np.asarray(self.manager.fluid._h.numpy(), dtype=np.float32).reshape(N, N)
+
+    async def test_the_inlet_delivers_the_discharge_it_was_asked_for(self) -> None:
+        """Q is the control, so the number that matters is the one crossing the
+        face -- measured the way the depth step transports it, not as u*h at the
+        edge cell, which returns the request by construction whatever happens."""
+        self._valley(discharge=12.0)
+        self.manager.start()
+        self._prime(0.79)
+        self._run(10.0)
+        measured = self.manager.fluid.diagnostics()["inlet_discharge_m3s"]
+        self.assertAlmostEqual(measured, 12.0, delta=0.6,
+                               msg=f"asked for 12 m3/s, delivered {measured:.2f}")
+
+    async def test_doubling_the_discharge_doubles_what_arrives(self) -> None:
+        """One cause changed. The inlet is not a switch with a plausible number
+        printed next to it."""
+        delivered = []
+        for q in (6.0, 12.0):
+            manager = SimulationManager()
+            manager.apply_terrain_river({})
+            manager.apply_water_level(0.0)
+            manager.apply_river_inlet({"enabled": True, "width_m": 12.0,
+                                       "discharge_m3s": q})
+            manager.start()
+            for _ in range(600):
+                manager._step_once()
+            delivered.append(manager.fluid.diagnostics()["added_m3"])
+            manager.stop()
+        self.assertGreater(delivered[1], delivered[0] * 1.7,
+                           f"doubling Q did not double the water: {delivered}")
+
+    async def test_a_dry_channel_is_actually_filled_and_not_just_reported(self) -> None:
+        """The trap this boundary was most likely to fall into: `_velocity_step`
+        used to zero the west column's velocity every substep, so an inlet that
+        wrote its velocity anywhere else would report the requested discharge
+        while no water moved at all. Both halves are asserted -- the ledger says
+        water entered, and the wetted front says it went somewhere."""
+        self._valley()
+        self.manager.start()
+        self._run(20.0)
+        depth = self._depth()
+        diag = self.manager.fluid.diagnostics()
+        self.assertGreater(diag["added_m3"], 100.0, "no water entered the map")
+        wet_columns = np.nonzero((depth > 0.05).any(axis=0))[0]
+        reach_m = float(wet_columns.max()) * config.TERRAIN_CELL_SIZE
+        self.assertGreater(reach_m, 20.0,
+                           f"water entered but never moved downstream ({reach_m:.1f} m)")
+        u = np.asarray(self.manager.fluid._u.numpy()).reshape(N, N)
+        self.assertGreater(float(u[depth > 0.05].mean()), 0.1,
+                           "the wetted cells are not moving downstream")
+
+    async def test_the_river_stays_in_its_channel(self) -> None:
+        """The test that could not be written against the edge inflow, because
+        that one wets the whole west edge including the floodplain: with a local
+        inlet, water on the floodplain can only have got there by leaving the
+        channel."""
+        info = self._valley(discharge=12.0)
+        self.manager.start()
+        self._prime(info["operating_depth"] * 0.8)
+        self._run(20.0)
+        depth = self._depth()
+        bed = self.manager.fluid.get_terrain_heights().reshape(N, N)
+        floodplain = bed >= bed.max(axis=0)[None, :] - 1.0e-3
+        self.assertLess(float(depth[floodplain].max()), 0.05,
+                        "the river climbed out onto the floodplain")
+        mid = N // 2
+        self.assertGreater(float(depth[mid, N // 2]), 0.3, "the channel ran dry")
+
+    async def test_water_leaves_only_through_the_outlet_band(self) -> None:
+        """A valley drains through its channel, not through its floodplain --
+        so the outlet is a band of rows, and the rest of the edge is a wall.
+
+        Measured as discharge leaving the map, not as depth at the edge. Depth
+        is the wrong instrument here: water piling against the closed part of
+        the edge spreads sideways into the open part and leaves through it, so
+        within seconds the whole edge sits at one level whatever the mask says.
+        That is correct physics and a useless assertion.
+        """
+        removed = {}
+        for width_m in (0.0, 20.0):            # 0 = the whole edge, as before
+            manager = SimulationManager()
+            manager.apply_water_level(0.0)
+            manager.apply_river_outlet({"width_m": width_m})
+            manager.start()
+            manager.fluid._source_enabled = False   # no inflow: drainage alone
+            manager.fluid._h.assign(np.full(N * N, 1.0, dtype=np.float32))
+            manager.fluid._u.assign(np.full(N * N, 1.0, dtype=np.float32))
+            for _ in range(300):
+                manager._step_once()
+            removed[width_m] = manager.fluid.diagnostics()["removed_m3"]
+            manager.stop()
+        span = 20.0 / config.WORLD_SIZE_M
+        self.assertGreater(removed[20.0], 0.0, "nothing left through the open band")
+        self.assertLess(removed[20.0], removed[0.0] * span * 1.5,
+                        f"the narrowed outlet still drains most of the edge: "
+                        f"{removed[20.0]:.1f} m3 against {removed[0.0]:.1f} m3 at full width")
+
+    async def test_the_closed_part_of_the_edge_is_a_wall(self) -> None:
+        """The other half of that claim, with no lateral spreading to hide it:
+        put the water only outside the band and nothing may leave at all."""
+        self.manager.apply_water_level(0.0)
+        self.manager.apply_river_outlet({"width_m": 20.0})
+        self.manager.start()
+        self.manager.fluid._source_enabled = False
+        lo, hi = self.manager.fluid.diagnostics()["outflow_rows"]
+        depth = np.full((N, N), 1.0, dtype=np.float32)
+        depth[lo:hi + 1, :] = 0.0
+        self.manager.fluid._h.assign(depth.ravel())
+        self.manager.fluid._u.assign(np.full(N * N, 1.0, dtype=np.float32))
+        self._run(2.0)
+        self.assertEqual(self.manager.fluid.diagnostics()["removed_m3"], 0.0,
+                         "water left through the closed part of the edge")
+
+    async def test_the_volume_ledger_closes(self) -> None:
+        """Inflow and outflow counters exist so the boundary can be audited, and
+        an audit that does not add up is worse than none. Everything that
+        injects or removes water reports it, so volume(t) - volume(0) must equal
+        added - removed to within float32 reduction noise."""
+        self._valley()
+        self.manager.start()
+        self._run(30.0)
+        diag = self.manager.fluid.diagnostics()
+        self.assertGreater(diag["added_m3"], 0.0)
+        self.assertLess(abs(diag["volume_error_m3"]), max(1.0e-3 * diag["volume_m3"], 0.05),
+                        f"the ledger does not balance: {diag['volume_error_m3']:.4f} m3 "
+                        f"of {diag['volume_m3']:.1f}")
+
+    async def test_the_outlet_carries_the_suspended_load_away(self) -> None:
+        """Before this the water left and the sediment it was carrying stayed,
+        so the east edge slowly grew a bar out of material the river had already
+        delivered to the sea.
+
+        Erosion is off and the sediment field is placed by hand, so nothing else
+        can add to it or move it: what the domain loses must be exactly what the
+        outlet reports exporting. A scenario test would have compared two runs
+        whose flows differ, and a faster flow carries more load -- which would
+        have confounded the very thing being measured.
+        """
+        results = {}
+        for outflow in (False, True):
+            manager = SimulationManager()
+            manager.apply_water_level(0.0)
+            manager.apply_water_outflow(outflow)
+            manager.start()
+            manager.fluid._source_enabled = False
+            manager.fluid._h.assign(np.full(N * N, 1.0, dtype=np.float32))
+            manager.fluid._u.assign(np.full(N * N, 1.0, dtype=np.float32))
+            manager.fluid._sediment.assign(np.full(N * N, 0.02, dtype=np.float32))
+            before = float(np.asarray(manager.fluid._sediment.numpy()).sum())
+            for _ in range(300):
+                manager._step_once()
+            after = float(np.asarray(manager.fluid._sediment.numpy()).sum())
+            results[outflow] = (before - after, manager.fluid.diagnostics()["sediment_out_m3"])
+            manager.stop()
+        self.assertEqual(results[False], (0.0, 0.0),
+                         "a shut outlet exported sediment")
+        lost, reported = results[True]
+        area = config.TERRAIN_CELL_SIZE ** 2
+        self.assertGreater(reported, 0.0, "the open outlet exported nothing")
+        self.assertAlmostEqual(lost * area, reported, delta=reported * 0.01,
+                               msg=f"sediment vanished unaccounted: domain lost "
+                                   f"{lost * area:.4f} m3, outlet reported {reported:.4f}")
+
+    async def test_the_inlet_arrives_loaded_and_does_not_scour_itself(self) -> None:
+        """Measured in docs/07_river_plan.md: an inlet fed with clean water is at
+        maximum hunger for ever and sits on SEDIMENT_MAX_BED_CHANGE for ever,
+        which is where the v0.11.0 reading "erosion is limited by the clamp"
+        came from. Water that arrives carrying its capacity is not hungry."""
+        self._valley()
+        self.manager.apply_water_erosion(True)
+        self.manager.start()
+        self._prime(0.79)
+        before = self.manager.fluid.get_terrain_heights().reshape(N, N).copy()
+        self._run(20.0)
+        after = self.manager.fluid.get_terrain_heights().reshape(N, N)
+        ceiling = config.SEDIMENT_MAX_BED_CHANGE * 20.0
+        cut = float((before - after)[:, 0].max())
+        self.assertLess(cut, ceiling * 0.25,
+                        f"the inlet is scouring at the clamp: {cut:.3f} m of {ceiling:.3f}")
+
+    async def test_the_edge_level_source_no_longer_scours_its_own_columns(self) -> None:
+        """The same fix on the older boundary, which is where the artifact was
+        actually measured: before it, the source columns cut 0.3989 m of a
+        0.400 m ceiling in 1200 steps, and that number was being read as a
+        statement about erosion physics."""
+        self.manager.apply_water_level(1.0)
+        self.manager.apply_water_erosion(True)
+        self.manager.start()
+        before = self.manager.fluid.get_terrain_heights().reshape(N, N).copy()
+        self._run(20.0)
+        after = self.manager.fluid.get_terrain_heights().reshape(N, N)
+        ceiling = config.SEDIMENT_MAX_BED_CHANGE * 20.0
+        cut = float((before - after)[:, :config.FLUID_SOURCE_COLUMNS].max())
+        self.assertLess(cut, ceiling * 0.25,
+                        f"the level source still scours its inlet: {cut:.3f} m")
+
+    async def test_the_river_inlet_replaces_the_edge_level_source(self) -> None:
+        """One map, one answer to "where does the water come from" -- the same
+        rule a placed SOURCE already follows."""
+        self._valley()
+        self.manager.apply_water_level(5.0)     # would put 2 m over the floodplain
+        self.manager.start()
+        self._run(5.0)
+        edge = self._depth()[:, 0]
+        bed = self.manager.fluid.get_terrain_heights().reshape(N, N)[:, 0]
+        floodplain = bed >= bed.max() - 1.0e-3
+        band = self.manager.fluid._inlet_q_host > 0.0
+        self.assertTrue(band.any() and floodplain.any())
+        self.assertLess(float(edge[floodplain].max()), 0.05,
+                        "the level source is still filling the west edge")
+        self.assertGreater(float(edge[band].max()), 0.1, "the inlet band is dry")
+
+    async def test_the_boundaries_survive_a_save_load_round_trip(self) -> None:
+        """They live under `water` and not in `objects` for this reason: objects
+        are restored after the water is, so a river whose inlet was an object
+        would load as a dry map with a decoration on it. The erosion and outflow
+        toggles are checked here too -- they were written to file and silently
+        dropped on load before v0.12.0, which also meant every reset() lost
+        them."""
+        self._valley(discharge=9.0, width=16.0, outlet_width=24.0)
+        self.manager.apply_water_erosion(True)
+        self.manager.apply_water_outflow(False)
+        self.manager.save("test_river_boundaries")
+        other = SimulationManager()
+        other.load("test_river_boundaries")
+        water = other.world.water
+        self.assertTrue(water.inlet_enabled)
+        self.assertAlmostEqual(water.inlet_discharge_m3s, 9.0)
+        self.assertAlmostEqual(water.inlet_width_m, 16.0)
+        self.assertAlmostEqual(water.outlet_width_m, 24.0)
+        self.assertTrue(water.erosion_enabled)
+        self.assertFalse(water.outflow_enabled)
+        other.stop()
+        (config.DATA_DIR / "test_river_boundaries.json").unlink()
+
+    async def test_bad_boundary_settings_are_refused(self) -> None:
+        for bad in ({"width_m": 0.0}, {"discharge_m3s": -1.0},
+                    {"discharge_m3s": float("inf")}, {"nonsense": 1.0}):
+            with self.assertRaises(ValueError, msg=f"accepted inlet {bad}"):
+                self.manager.apply_river_inlet(bad)
+        for bad in ({"width_m": -1.0}, {"centre_z": float("nan")}, {"nonsense": 1}):
+            with self.assertRaises(ValueError, msg=f"accepted outlet {bad}"):
+                self.manager.apply_river_outlet(bad)
 
 
 if __name__ == "__main__":
