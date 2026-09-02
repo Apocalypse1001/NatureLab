@@ -17,7 +17,8 @@ if WARP_IMPORTED:
                        solid: wp.array(dtype=wp.int32),
                        next_u: wp.array(dtype=float), next_v: wp.array(dtype=float),
                        width: int, height: int, dx: float, dt: float,
-                       gravity: float, dry: float, damping: float,
+                       gravity: float, dry: float, manning_n: float,
+                       friction_min_depth: float,
                        max_velocity: float, outflow_columns: int):
         idx = wp.tid()
         i = idx % width
@@ -48,9 +49,29 @@ if WARP_IMPORTED:
                 if h[idx + width] <= dry and bed[idx + width] >= eta:
                     eta_u = eta
 
-            decay = wp.max(0.0, 1.0 - damping * dt)
-            ux = (u[idx] - gravity * dt * (eta_r - eta_l) / (2.0 * dx)) * decay
-            vz = (v[idx] - gravity * dt * (eta_u - eta_d) / (2.0 * dx)) * decay
+            ux = u[idx] - gravity * dt * (eta_r - eta_l) / (2.0 * dx)
+            vz = v[idx] - gravity * dt * (eta_u - eta_d) / (2.0 * dx)
+
+            # Manning bed friction: tau/rho = g*n^2*|u|*u / h^(4/3). Depth is in
+            # the law, which is the whole point -- the bed drags on the bottom of
+            # the column and a deep column has more momentum to lose per unit of
+            # that drag, so a channel outruns a sheet over the same ground.
+            #
+            # Applied semi-implicitly (divide by 1 + drag) rather than explicitly
+            # (subtract drag): the explicit form overshoots and can reverse the
+            # flow when friction is strong -- exactly where a wetting front lives,
+            # h small and the coefficient large -- and would need its own dt limit.
+            # The implicit form is unconditionally stable and can only ever slow
+            # water down, never turn it around. FrictionLawTests checks that.
+            #
+            # One denominator built from the full speed, applied to both
+            # components: a per-component denominator would drag axis-aligned flow
+            # harder than diagonal flow and quietly bend the river toward the grid.
+            speed = wp.sqrt(ux * ux + vz * vz)
+            hf = wp.max(h[idx], friction_min_depth)
+            drag = gravity * manning_n * manning_n * speed * dt / wp.pow(hf, 1.3333333)
+            ux = ux / (1.0 + drag)
+            vz = vz / (1.0 + drag)
             if i == 0:
                 ux = 0.0
             if i >= width - 1 - outflow_columns and outflow_columns > 0:
@@ -1103,7 +1124,8 @@ class WarpShallowWaterSolver(FluidSolver):
                       self._v, self._bed, self._obstacles, self._next_u,
                       self._next_v, self._width, self._height,
                       float(self._terrain.cell_size), dt, gravity,
-                      config.FLUID_DRY_DEPTH, config.FLUID_DAMPING,
+                      config.FLUID_DRY_DEPTH, config.FLUID_MANNING_N,
+                      config.FLUID_FRICTION_MIN_DEPTH,
                       config.FLUID_MAX_VELOCITY, self._outflow_columns],
                       device=self.device)
             self._u, self._next_u = self._next_u, self._u

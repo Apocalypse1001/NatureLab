@@ -28,12 +28,27 @@ if WARP_IMPORTED:
                           ground_areas: wp.array(dtype=float),
                           static: wp.array(dtype=wp.int32),
                           states: wp.array(dtype=wp.int32),
-                           immersions: wp.array(dtype=float),
+                           surfaces: wp.array(dtype=float),
+                           supports: wp.array(dtype=float),
                           forces: wp.array(dtype=wp.vec3),
                           dynamic: wp.array(dtype=wp.int32),
                           dt: float, gravity: float, rho: float):
         i = wp.tid()
-        depth = wp.max(0.0, immersions[i])
+        # How deep the body would sit if it rested where it rests -- measured
+        # from its support (the bed, or a bridge deck), never from its own
+        # current y. Measuring from y is a tautology for anything already
+        # afloat: a floating body is held at `surface - draft`, so its immersion
+        # is exactly its draft, and the buoyancy that follows equals its weight
+        # to within 0.000% (measured, CAR: 14715.0 N against 14715.0 N). Under
+        # that criterion a floating body is permanently one rounding error from
+        # sinking, and the moment the water stopped being artificially calm --
+        # v0.11.0 gave it real depth-dependent friction and therefore real waves
+        # -- cars began flickering between FLOATING and MOVING every few frames.
+        # Measured from the support the question is the physical one, "is there
+        # enough water here to carry this?", and the answer stops depending on
+        # the answer it gave last frame. For a grounded body support IS its y, so
+        # the moment a body starts to float is unchanged.
+        depth = wp.max(0.0, surfaces[i] - supports[i])
         height = volumes[i] / wp.max(ground_areas[i], 1.0e-6)
         submerged = wp.clamp(depth / wp.max(height, 1.0e-6), 0.0, 1.0)
         buoyancy = buoyancies[i] * rho * gravity * volumes[i] * submerged
@@ -285,7 +300,9 @@ class PlaceholderRigidBodySystem(RigidBodySystem):
         wp.launch(_integrate_bodies, dim=count, inputs=[self._d_positions,
             self._d_velocities, self._d_masses, self._d_frictions,
                    self._d_buoyancies, self._d_volumes, self._d_ground_areas,
-                   self._d_static, self._d_states, samples["immersions_device"],
+                   self._d_static, self._d_states,
+                   samples["surface_elevations_device"],
+                   samples["support_elevations_device"],
                    samples["forces_device"],
                   self._d_dynamic, dt, float(self._world.environment.gravity),
                   config.WATER_DENSITY], device=samples["device"])
@@ -355,7 +372,11 @@ class PlaceholderRigidBodySystem(RigidBodySystem):
             self._cache_fluid_samples(depths, surfaces, supports, flow_velocities)
 
         gravity = float(self._world.environment.gravity)
-        submerged = np.clip(immersions / np.maximum(self.buffer.body_heights, 1.0e-6), 0.0, 1.0)
+        # same criterion as the GPU kernel above -- measured from the support
+        available = (np.maximum(0.0, surfaces - supports)
+                     if fluid_samples is not None else immersions)
+        submerged = np.clip(available / np.maximum(self.buffer.body_heights, 1.0e-6),
+                            0.0, 1.0)
         buoyancy_force = (self.buffer.buoyancies * config.WATER_DENSITY * gravity
                           * self.buffer.volumes * submerged)
         weight = self.buffer.masses * gravity

@@ -16,6 +16,8 @@ sys.path.insert(0, str(ROOT / "backend"))
 from app import config, protocol  # noqa: E402
 from app.simulation import SimulationManager  # noqa: E402
 from app.world_state import WorldState  # noqa: E402
+from app.compute_engine import create_engine  # noqa: E402
+from app.fluid_solver import create_fluid_solver  # noqa: E402
 
 # Grid geometry is derived, never hard-coded: these tests used to spell out
 # "101" and column literals like [col(0.0), 8], which silently became wrong the first
@@ -199,6 +201,35 @@ class Physics04Tests(unittest.IsolatedAsyncioTestCase):
         self.manager.fluid._measure()
         lowered = self.manager.fluid.diagnostics()["volume_m3"]
         self.assertLess(lowered, raised)
+
+    async def test_a_floating_body_does_not_flicker_out_of_floating(self) -> None:
+        """A body afloat must not re-decide its buoyancy from the height that
+        buoyancy itself put it at.
+
+        Immersion measured from the body's own y is a tautology for anything
+        already floating: it is held at `surface - draft`, so its immersion is
+        exactly its draft and the resulting buoyancy equals its weight to
+        0.000% (CAR: 14715.0 N against 14715.0 N -- draft/height reduces to
+        weight/max_buoyancy for every body, by algebra, not by tuning). Such a
+        body is one wave away from sinking, and once v0.11.0 gave the water
+        depth-dependent friction and therefore real waves, cars began flickering:
+        307 FLOATING/MOVING/SETTLED transitions in 406 frames. Measured from the
+        support instead -- the bed, or a bridge deck -- the question stops
+        depending on its own last answer, and the count is 0.
+        """
+        self.manager.apply_water_level(1.5)
+        car = self.manager.apply_object_add({"type": "CAR", "position": [x_at(10), 0, 0]})
+        self.manager.start()
+        states: list[str] = []
+        for _ in range(600):
+            self.manager._step_once()
+            states.append(self.manager.world.objects[car["id"]].state)
+        self.assertIn("FLOATING", states, "the car never floated in 1.5 m of water")
+        afloat = states[states.index("FLOATING"):]
+        flips = sum(1 for a, b in zip(afloat, afloat[1:]) if a != b)
+        self.assertEqual(flips, 0,
+                         f"the car flickered out of FLOATING {flips} times: "
+                         f"{sorted(set(afloat))}")
 
     async def test_edge_flow_moves_light_box(self) -> None:
         self.manager.apply_water_level(1.5)
@@ -710,12 +741,23 @@ class RiverLabTests(unittest.IsolatedAsyncioTestCase):
         river_b = cut(True)
         self.assertLess(float(river_a.min()), -0.01, "River A did not erode at all")
         difference = np.abs(river_b - river_a)
-        self.assertGreater(int((difference > 0.01).sum()), 20,
-                           "the boulder changed almost nothing about the bed")
-        # and the change is concentrated at and downstream of the rock (column 8),
-        # not spread uniformly -- otherwise this is drift, not causation
         near = difference[:, 6:20].max()
         far = difference[:, N - 40:].max()
+        # Measured by the size of the change and by where it sits -- deliberately
+        # NOT by counting cells that differ. That count is dominated by
+        # SEDIMENT_MAX_BED_CHANGE, which both rivers hit: at 0.02 m/s the bed can
+        # move at most 0.400 m in these 1200 steps and River A already moves
+        # 0.3989 m of it, on this law and on the one before it. Wherever both
+        # rivers are pegged at the same ceiling they cannot differ, so widening
+        # the saturated region (v0.11.0's friction made deep water faster, and the
+        # eroding area went 5628 -> 14472 cells) collapses the count -- 90 -> 17 --
+        # while the boulder's actual effect GREW, 0.314 -> 0.366 m. Counting cells
+        # was measuring the limiter. See docs/06_next_steps.md: the erosion
+        # calibration is owed a rederivation against this friction law.
+        self.assertGreater(float(near), 0.1,
+                           f"the boulder barely changed the bed: {near:.3f} m")
+        self.assertGreater(float(difference.sum()), 1.0,
+                           f"the two beds are all but identical: {difference.sum():.3f}")
         self.assertGreater(float(near), float(far) * 3.0,
                            f"bed change was not localised to the rock: {near} vs {far}")
 
@@ -1171,7 +1213,15 @@ class BridgeAndPeopleTests(unittest.IsolatedAsyncioTestCase):
         goes first. Same shape of test as the existing BOX-before-CAR one."""
         self.manager.apply_object_add({"type": "PERSON", "position": [x_at(20), 0.0, 6.0]})
         self.manager.apply_object_add({"type": "CAR", "position": [x_at(20), 0.0, -6.0]})
-        self.manager.apply_water_level(1.2)
+        # Shallow on purpose. A CAR's draft is 0.43 m, so at the 1.2 m this test
+        # used to run at the car is simply afloat, and an afloat body has no
+        # friction left to hold it: both bodies leave with the arriving front
+        # within 0.2 s of each other and the ordering means nothing. Measured
+        # across levels: 0.25/0.35 m neither moves, 0.50 m person 10.80 s and car
+        # 11.58 s (car sliding, not floating -- this is the claim), 0.80 m and
+        # 1.20 m both go together with the car afloat. The lesson lives in the
+        # shallow regime, which is also the one people actually drive into.
+        self.manager.apply_water_level(0.5)
         self.manager.start()
         person = next(o for o in self.manager.world.objects.values() if o.type == "PERSON")
         car = next(o for o in self.manager.world.objects.values() if o.type == "CAR")
@@ -1301,6 +1351,100 @@ class VelocityStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(heights, velocities,
                            "the velocity field is not throttled below the height frames")
         self.assertGreaterEqual(velocities, 1)
+
+
+class FrictionLawTests(unittest.IsolatedAsyncioTestCase):
+    """Bed friction is what decides where water goes once a channel exists.
+
+    These tests measure the friction law directly rather than through a
+    scenario: a flat bed with a uniform depth and a uniform initial velocity
+    has zero surface gradient, so gravity contributes nothing and whatever
+    slows the water down is friction alone.
+    """
+
+    def _decay(self, depth: float, steps: int = 300, u0: float = 1.0) -> float:
+        """Mean interior speed left after `steps` frames of friction only."""
+        world = WorldState()
+        world.water.level = 0.0
+        solver = create_fluid_solver(create_engine().device)
+        solver.initialize(world)
+        solver._source_enabled = False          # no inflow: friction in isolation
+        solver.set_boundaries(world.terrain, {}, 0, 0)
+        solver._h.assign(np.full(solver._count, depth, dtype=np.float32))
+        solver._u.assign(np.full(solver._count, u0, dtype=np.float32))
+        solver._v.assign(np.zeros(solver._count, dtype=np.float32))
+        for _ in range(steps):
+            solver.advance(1.0 / 60.0, 8, 1.0 / 120.0)
+        u = np.asarray(solver._u.numpy(), dtype=np.float32).reshape(N, N)
+        return float(u[N // 4:3 * N // 4, N // 4:3 * N // 4].mean())
+
+    async def test_friction_is_depth_dependent_not_uniform(self) -> None:
+        """The one test that tells the two laws apart.
+
+        Real bed friction is a stress on the bottom shared over the water
+        column, so a deep column keeps its speed far better than a thin sheet
+        over the same bed -- that is why a river stays in its channel and only
+        creeps across a floodplain. A velocity damping that does not read the
+        depth gives the identical answer for both, and this ratio comes out 1.
+        """
+        deep = self._decay(1.0)
+        thin = self._decay(0.0625)          # 1/16 the depth
+        self.assertGreater(deep, 0.5, "deep water was stopped by bed friction")
+        self.assertGreater(
+            deep / max(thin, 1.0e-6), 2.0,
+            f"friction does not depend on depth: deep={deep:.3f} thin={thin:.3f} "
+            f"ratio={deep / max(thin, 1.0e-6):.2f} (uniform damping gives 1.0)")
+
+    def _terminal_speed_on_slope(self, depth: float, slope: float,
+                                 seconds: float = 20.0) -> float:
+        """Mean interior speed of a uniform sheet let go on a constant slope."""
+        world = WorldState()
+        world.water.level = 0.0
+        fall = (np.arange(N, dtype=np.float32) * config.TERRAIN_CELL_SIZE * slope)
+        world.terrain.heights[:, :] = (fall[-1] - fall)[None, :]
+        solver = create_fluid_solver(create_engine().device)
+        solver.initialize(world)
+        solver._source_enabled = False
+        solver.set_boundaries(world.terrain, {}, 0, 0)
+        solver._h.assign(np.full(solver._count, depth, dtype=np.float32))
+        for _ in range(int(seconds * 60)):
+            solver.advance(1.0 / 60.0, 8, 1.0 / 120.0)
+        u = np.asarray(solver._u.numpy(), dtype=np.float32).reshape(N, N)
+        return float(np.abs(u[N // 4:3 * N // 4, N // 4:3 * N // 4]).mean())
+
+    async def test_steady_flow_lands_near_the_manning_velocity(self) -> None:
+        """Quantitative check that the law is Manning and not merely "something
+        that reads the depth": the speed a sheet settles at on a constant slope
+        should approach u = h^(2/3) * sqrt(S) / n.
+
+        Asserted only within a factor of two, deliberately. The analytic value
+        holds for steady *uniform* flow, and this is a finite map with closed
+        ends where the sheet is also draining downhill, so demanding a tight
+        match would be asserting the setup rather than the law. The number that
+        actually discriminates the two friction laws is the depth ratio above;
+        the measured-versus-analytic pair is recorded in TEST_REPORT.md.
+        """
+        slope, depth = 0.05, 0.5
+        measured = self._terminal_speed_on_slope(depth, slope)
+        analytic = depth ** (2.0 / 3.0) * math.sqrt(slope) / config.FLUID_MANNING_N
+        self.assertGreater(measured, analytic * 0.5,
+                           f"far below Manning: {measured:.2f} vs {analytic:.2f} m/s")
+        self.assertLess(measured, analytic * 2.0,
+                        f"far above Manning: {measured:.2f} vs {analytic:.2f} m/s")
+
+    async def test_friction_can_only_slow_water_never_reverse_it(self) -> None:
+        """Friction is applied by dividing, not by subtracting.
+
+        Subtracting g*n^2*|u|*u*dt/h^(4/3) overshoots exactly where the
+        coefficient is largest -- a thin fast sheet, i.e. a wetting front -- and
+        turns the flow around, which shows up as a front that shudders backwards
+        and needs its own timestep limit to suppress. Dividing by (1 + drag) is
+        unconditionally stable and cannot change the sign, whatever the depth.
+        """
+        u0 = 3.0
+        left = self._decay(config.FLUID_FRICTION_MIN_DEPTH, steps=60, u0=u0)
+        self.assertGreater(left, 0.0, "friction reversed the flow instead of slowing it")
+        self.assertLess(left, u0, "the thin sheet was not slowed at all")
 
 
 if __name__ == "__main__":

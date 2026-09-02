@@ -9,7 +9,7 @@ from pathlib import Path
 # running build always says which version it is -- the donor 0.5.0 tree carried
 # no version string anywhere, which made "which build am I looking at?"
 # answerable only by file timestamps.
-VERSION = "0.10.1"
+VERSION = "0.11.0"
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_DIR = BACKEND_DIR.parent
@@ -60,7 +60,21 @@ FLUID_STABILITY_DT = 1.0 / 120.0
 FLUID_CFL = 0.45
 FLUID_DRY_DEPTH = 1.0e-4
 FLUID_MAX_VELOCITY = 20.0
-FLUID_DAMPING = 0.15
+# Bed friction: Manning's law, not a uniform velocity damping. Bed stress is
+# shared over the whole water column, so the deceleration goes as |u|/h^(4/3):
+# a deep channel keeps its speed while a thin sheet is held back. That is why a
+# river stays in its bed and only creeps out across a floodplain. The depth-blind
+# damping that stood here up to v0.10.1 (FLUID_DAMPING = 0.15) gave a 1.5 m
+# channel and a 5 cm sheet the identical answer, and no value of it could
+# produce the difference -- see FrictionLawTests.
+FLUID_MANNING_N = 0.03           # s/m^(1/3): a clean, straight natural channel
+# Depth floor for the friction term. This is a physics knob, not a guard against
+# dividing by zero: it alone decides how fast a wetting front creeps forward, and
+# it sets the depth below which the new law brakes HARDER than the old damping
+# did -- about 0.12 m at 1 m/s and 0.20 m at 2 m/s. Above that the new law is the
+# weaker of the two (17x weaker at 1 m depth), so the change is not "more drag"
+# or "less drag": it is drag that finally reads the depth.
+FLUID_FRICTION_MIN_DEPTH = 0.02  # m
 FLUID_SOURCE_COLUMNS = 2     # prescribed inflow starts at the left map edge
 WATER_DENSITY = 1000.0
 RIGID_STOP_SPEED = 1.0e-3
