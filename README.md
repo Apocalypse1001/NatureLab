@@ -15,7 +15,7 @@ The backend is authoritative. The frontend draws, edits and measures — it neve
 motion. That distinction is the whole project: a prettier picture that hid the physics
 would defeat the point, so if the simulation is wrong, the screen shows it.
 
-Version 0.12.2. Backend suite 87/87, browser E2E 19/19, on an RTX 5090.
+Version 0.12.2. Backend suite 87/87, browser E2E 20/20, on an RTX 5090.
 
 ---
 
@@ -153,7 +153,7 @@ Node.js ≥ 22.12 and Chrome/Edge.
 
 ```bat
 python tests\test_backend.py     # 87 CUDA/Warp physics and regression tests
-node tests\e2e.mjs               # 19 browser + WebSocket checks, own backend on 8756
+node tests\e2e.mjs               # 20 browser + WebSocket checks, own backend on 8756
 ```
 
 The physics suite covers lake-at-rest, 1D symmetry, volume conservation, terrain barriers,

@@ -2075,14 +2075,27 @@ class DamAndScenarioTests(unittest.IsolatedAsyncioTestCase):
         world = self._scenario("scenario_river")
         roads = [o for o in world.objects.values() if o.type == "ROAD"]
         self.assertTrue(roads)
-        snapshot = self.manager.rigid.obstacle_snapshot()
-        before = self.manager.world.terrain.heights.copy()
-        self.manager.fluid.set_boundaries(self.manager.world.terrain, snapshot,
-                                          self.manager.terrain_revision + 1,
-                                          self.manager.obstacle_revision + 1)
-        np.testing.assert_allclose(self.manager.world.terrain.heights, before,
-                                   atol=1e-6,
-                                   err_msg="a road changed the bed")
+        # Read the arrays the flow kernels actually use. Asserting that
+        # `terrain.heights` is unchanged would prove nothing: `set_boundaries`
+        # never writes to it -- it reads it and builds the solid mask and the
+        # raised-bed offset alongside, and `_bed` is their sum. That assertion
+        # would pass just as happily with ROAD given a bed_height of 5 m.
+        fluid = self.manager.fluid
+        fluid.set_boundaries(self.manager.world.terrain,
+                             self.manager.rigid.obstacle_snapshot(),
+                             self.manager.terrain_revision + 1,
+                             self.manager.obstacle_revision + 1)
+        stride = self.manager.world.terrain.width + 1
+        for road in roads:
+            i = int(round(road.position[0] / config.TERRAIN_CELL_SIZE
+                          + config.TERRAIN_CELLS / 2))
+            j = int(round(road.position[2] / config.TERRAIN_CELL_SIZE
+                          + config.TERRAIN_CELLS / 2))
+            index = j * stride + i
+            self.assertEqual(int(fluid._obstacle_host[index]), 0,
+                             f"{road.id} was rasterized into the solid mask")
+            self.assertAlmostEqual(float(fluid._bed_offset_host[index]), 0.0, places=6,
+                                   msg=f"{road.id} raised the bed under itself")
 
 
 if __name__ == "__main__":

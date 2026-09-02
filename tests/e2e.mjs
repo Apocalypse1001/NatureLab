@@ -297,6 +297,45 @@ try {
   await waitFor(() => page.evaluate(() =>
     document.querySelector('#sim-status')?.textContent === 'IDLE'));
 
+  // v0.12.2: the Scenarios bookmark. Clicked as a user clicks it, not by
+  // sending the `load` op -- the button, its onclick and `loadScenario` are the
+  // only new user-facing wiring in the feature, and driving the op underneath
+  // them would verify everything except the part that is new.
+  await page.evaluate(() => {
+    const button = [...document.querySelectorAll('.panel.left button')]
+      .find((b) => b.textContent === 'Dam');
+    if (!button) throw new Error('no Dam scenario button');
+    button.click();
+  });
+  await waitFor(() => page.evaluate(() => window.__NL.store.objects.size >= 60));
+  const scenario = await page.evaluate(() => {
+    const objects = [...window.__NL.store.objects.values()];
+    return {
+      objects: objects.length,
+      types: [...new Set(objects.map((o) => o.type))],
+      // seated on the ground: an object written at y = 0 would be three metres
+      // under this floodplain and would simply look absent
+      lowest: Math.min(...objects.map((o) => o.position[1])),
+      // the loaded world's own discharge has to reach the control, or the
+      // slider and the status bar disagree in plain sight
+      discharge: document.querySelector('#river-discharge')?.value,
+      inlet: document.querySelector('#river-inlet')?.checked,
+      erosion: document.querySelector('#water-erosion')?.checked,
+      outflow: document.querySelector('#water-outflow')?.checked,
+      meshes: window.__NL.sceneManager.objectsRoot.children.length,
+    };
+  });
+  assert(scenario.objects >= 60 && scenario.meshes === scenario.objects,
+    `scenario loaded ${scenario.objects} objects but ${scenario.meshes} meshes`);
+  for (const type of ['HOUSE', 'ROAD', 'PERSON', 'TREE', 'DEBRIS', 'GAUGE']) {
+    assert(scenario.types.includes(type), `scenario is missing ${type}`);
+  }
+  assert(scenario.lowest > 0.1, `scenario object buried at y=${scenario.lowest}`);
+  assert(scenario.discharge === '30', `Q slider reads ${scenario.discharge}, want 30`);
+  assert(scenario.inlet === true && scenario.outflow === true
+    && scenario.erosion === false, 'scenario water controls out of sync');
+  report('Scenarios button loads the dam world and syncs its controls');
+
   assert(errors.length === 0, errors.join('\n'));
   report('no browser errors');
   // read the version off the running backend rather than hard-coding it, so
