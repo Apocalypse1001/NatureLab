@@ -18,6 +18,7 @@ from .events import EventLog, EventType
 from .fluid_solver import SOLID_OBSTACLE_TYPES, FluidSolver, create_fluid_solver
 from .persistence import load_world, save_world
 from .rigid_body import PlaceholderRigidBodySystem, RigidBodySystem
+from .terrain_gen import river_valley
 from .world_state import WorldState, finite_number, vector3
 
 SendText = Callable[[str], Coroutine[None, None, None]]
@@ -215,6 +216,21 @@ class SimulationManager:
         self.terrain_revision += 1
         return {"heights": self.world.terrain.to_list(),
                 "checksum": self.world.terrain.checksum()}
+
+    def apply_terrain_river(self, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        """Replace the terrain with a generated river valley.
+
+        Same gate and the same patch shape as the brush -- it is the same kind
+        of edit, a whole-map one -- so the frontend reuses one code path and the
+        solver picks it up through the existing terrain revision.
+        """
+        if self.status == self.RUNNING:
+            raise ValueError("terrain editing is disabled while simulation is RUNNING")
+        effective = river_valley(self.world.terrain, params)
+        self.terrain_revision += 1
+        return {"heights": self.world.terrain.to_list(),
+                "checksum": self.world.terrain.checksum(),
+                "river": effective}
 
     def apply_water_level(self, level: float) -> None:
         self.world.water.level = finite_number(level, "water.level")

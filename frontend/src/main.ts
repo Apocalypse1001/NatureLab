@@ -105,6 +105,10 @@ const ui = new UI(uiHost, {
     editor.brushRadius = radius;
     editor.brushStrength = strength;
   },
+  // The reply is an ordinary terrain_patch, so the generated valley reaches the
+  // scene through the same path a brush stroke does -- no second sync to keep
+  // right. Rejected by the backend while RUNNING, like every terrain edit.
+  generateRiver: (params) => net.send({ op: 'terrain_river', params }),
   getObjects: () => [...store.objects.values()],
 });
 

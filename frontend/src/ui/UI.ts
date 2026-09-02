@@ -21,6 +21,7 @@ export interface UICallbacks {
   setTracerCount(count: number): void;
   setTool(tool: 'select' | 'raise' | 'lower'): void;
   setBrush(radius: number, strength: number): void;
+  generateRiver(params: { slope: number; bed_width: number; incision: number }): void;
   getObjects(): ObjectData[];
 }
 
@@ -207,6 +208,53 @@ export class UI {
       this.cb.setBrush(parseFloat(size.value), parseFloat(strength.value));
     };
     panel.append(brush);
+
+    // v0.12.0: a channel is a precondition for a river, not a decoration -- the
+    // flow is driven by the slope of the bed, so on the flat starting map no
+    // inflow setting produces anything but a spreading puddle. Drawing 200 m of
+    // channel with the brush is hundreds of strokes and leaves lumps that stand
+    // waves up, so the bed is generated analytically instead. Replaces the whole
+    // terrain, which is why it is a button and not a drag tool.
+    panel.append(el('h3', '', 'River valley'));
+    const river = el('div', 'slider-row');
+    river.innerHTML =
+      '<label>Slope <output id="river-slope-out">0.20</output> %</label>';
+    const slope = el('input', '') as HTMLInputElement;
+    slope.id = 'river-slope';
+    slope.type = 'range'; slope.min = '0.05'; slope.max = '1.0';
+    slope.step = '0.05'; slope.value = '0.20';
+    river.append(slope);
+    river.insertAdjacentHTML('beforeend',
+      '<label>Channel width <output id="river-width-out">12</output> m</label>');
+    const width = el('input', '') as HTMLInputElement;
+    width.id = 'river-width';
+    width.type = 'range'; width.min = '4'; width.max = '40';
+    width.step = '1'; width.value = '12';
+    river.append(width);
+    river.insertAdjacentHTML('beforeend',
+      '<label>Incision <output id="river-depth-out">2.0</output> m</label>');
+    const incision = el('input', '') as HTMLInputElement;
+    incision.id = 'river-incision';
+    incision.type = 'range'; incision.min = '0.5'; incision.max = '6.0';
+    incision.step = '0.5'; incision.value = '2.0';
+    river.append(incision);
+    slope.oninput = () => {
+      this.root.querySelector('#river-slope-out')!.textContent = slope.value;
+    };
+    width.oninput = () => {
+      this.root.querySelector('#river-width-out')!.textContent = width.value;
+    };
+    incision.oninput = () => {
+      this.root.querySelector('#river-depth-out')!.textContent = incision.value;
+    };
+    panel.append(river);
+    const generate = btn('Generate river valley', () => this.cb.generateRiver({
+      slope: parseFloat(slope.value) / 100,      // the control is in percent
+      bed_width: parseFloat(width.value),
+      incision: parseFloat(incision.value),
+    }));
+    generate.id = 'river-generate';
+    panel.append(generate);
     return panel;
   }
 

@@ -1447,5 +1447,138 @@ class FrictionLawTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(left, u0, "the thin sheet was not slowed at all")
 
 
+class RiverValleyTests(unittest.IsolatedAsyncioTestCase):
+    """v0.12.0: the generated channel the rest of the river work stands on.
+
+    These test the *geometry*, deliberately. Whether the flow stays in the
+    channel is a question about the inlet, not about the bed: the edge inflow
+    wets the entire west edge including the floodplain, so a containment test
+    written now would fail for the boundary condition's reasons and be weakened
+    to pass. It belongs with the local inlet.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    def _generate(self, **params) -> tuple[np.ndarray, dict]:
+        patch = self.manager.apply_terrain_river(params)
+        return self.manager.world.terrain.heights.copy(), patch["river"]
+
+    async def test_the_bed_falls_downstream_at_the_slope_it_was_asked_for(self) -> None:
+        """The only thing that makes water move in an open channel is the slope
+        of the bed, so this is the generator's whole job. Checked cell by cell
+        against the requested slope rather than end to end, because a mean fall
+        can hide a staircase."""
+        for slope in (0.001, 0.002, 0.005):
+            heights, info = self._generate(slope=slope)
+            centre = heights[N // 2, :]
+            drop = -np.diff(centre)
+            expected = slope * config.TERRAIN_CELL_SIZE
+            np.testing.assert_allclose(drop, expected, rtol=1e-4, atol=1e-6)
+            self.assertGreater(info["inlet_bed"], info["outlet_bed_actual"],
+                               "the river runs uphill")
+
+    async def test_the_cross_section_is_a_channel_and_not_a_ditch_or_a_ridge(self) -> None:
+        """Bottom flat and lowest, banks strictly rising outward, floodplain
+        flat at the top -- and the bank top exactly `incision` above the bed, so
+        the depth the channel can hold is the depth that was asked for."""
+        heights, info = self._generate(bed_width=12.0, incision=2.0, bank_run=4.0)
+        column = heights[:, N // 2]
+        mid = N // 2
+        half_bed = int(12.0 / 2 / config.TERRAIN_CELL_SIZE)
+        bed = column[mid - half_bed + 1:mid + half_bed]
+        np.testing.assert_allclose(bed, bed[0], atol=1e-6)
+        top = int((12.0 / 2 + 4.0) / config.TERRAIN_CELL_SIZE)
+        bank = column[mid + half_bed:mid + top + 1]
+        self.assertTrue(np.all(np.diff(bank) > 0.0), "the bank does not rise outward")
+        self.assertAlmostEqual(float(column[mid + top] - bed[0]), 2.0, places=3)
+        floodplain = column[mid + top + 1:]
+        np.testing.assert_allclose(floodplain, floodplain[0], atol=1e-6)
+        self.assertAlmostEqual(info["operating_depth"], 1.0, places=6)
+
+    async def test_the_bed_is_smooth_enough_not_to_stand_waves_up(self) -> None:
+        """The reason the bed is generated instead of brushed. A step in the bed
+        is a step in the surface the flow has to climb; the acceptance bound is
+        derived from the geometry rather than picked -- downstream, no cell may
+        drop by more than the slope says, and across the channel no cell may
+        rise faster than the bank's own average gradient allows."""
+        heights, _ = self._generate(slope=0.002, incision=2.0, bank_run=4.0)
+        along = np.abs(np.diff(heights, axis=1))
+        self.assertLessEqual(float(along.max()),
+                             0.002 * config.TERRAIN_CELL_SIZE + 1e-6,
+                             "a step downstream: the flow would jump it")
+        across = np.abs(np.diff(heights, axis=0))
+        # smoothstep peaks at 1.5x the mean gradient, and never above it
+        bank_mean = 2.0 / (4.0 / config.TERRAIN_CELL_SIZE)
+        self.assertLessEqual(float(across.max()), bank_mean * 1.5 + 1e-6,
+                             "a step across the channel steeper than the bank")
+
+    async def test_a_meander_swings_the_channel_without_breaking_the_descent(self) -> None:
+        """Optional and off by default in v0.12.0 -- the discharge counters need
+        a straight reference channel first -- but when asked for it must move
+        the deepest point sideways and leave the downstream fall alone."""
+        straight, _ = self._generate(meander_amplitude=0.0)
+        winding, _ = self._generate(meander_amplitude=20.0, meander_wavelength=120.0)
+        deepest = np.argmin(winding, axis=0)
+        self.assertGreater(int(deepest.max() - deepest.min()), 20,
+                           "the meander did not move the channel")
+        np.testing.assert_array_equal(np.argmin(straight, axis=0),
+                                      np.full(N, np.argmin(straight[:, 0])))
+        for grid in (straight, winding):
+            centre = grid[np.argmin(grid, axis=0), np.arange(N)]
+            self.assertTrue(np.all(np.diff(centre) < 0.0),
+                            "the channel bottom stopped falling downstream")
+
+    async def test_bad_parameters_are_refused_and_the_terrain_is_left_alone(self) -> None:
+        before = self.manager.world.terrain.heights.copy()
+        for bad in ({"slope": 0.5}, {"bed_width": 0.0}, {"incision": -1.0},
+                    {"meander_amplitude": 95.0}, {"nonsense": 1.0},
+                    {"slope": float("nan")}):
+            with self.assertRaises(ValueError, msg=f"accepted {bad}"):
+                self.manager.apply_terrain_river(bad)
+        np.testing.assert_array_equal(self.manager.world.terrain.heights, before)
+
+    async def test_generating_while_running_is_refused_like_any_terrain_edit(self) -> None:
+        self.manager.start()
+        with self.assertRaises(ValueError):
+            self.manager.apply_terrain_river({})
+
+    async def test_the_valley_survives_a_save_load_round_trip(self) -> None:
+        """The save format already carries all 40 401 elevations, which is why
+        the generator needs no file format of its own -- but that is a claim
+        about the format, so it is tested and not assumed."""
+        heights, info = self._generate(slope=0.003, bed_width=16.0, incision=2.5)
+        self.manager.world.water.level = info["inlet_level"]
+        self.manager.save("test_river_valley")
+        other = SimulationManager()
+        other.load("test_river_valley")
+        np.testing.assert_allclose(other.world.terrain.heights, heights, atol=1e-6)
+        self.assertAlmostEqual(other.world.water.level, info["inlet_level"], places=5)
+        other.stop()
+        (config.DATA_DIR / "test_river_valley.json").unlink()
+
+    async def test_the_solver_sees_the_generated_bed(self) -> None:
+        """A generated valley that the GPU never hears about is a picture. The
+        bed the solver holds after start() must be the bed that was generated,
+        and water dropped on it must run downhill rather than sit still."""
+        heights, info = self._generate()
+        self.manager.apply_water_level(info["inlet_level"])
+        self.manager.start()
+        np.testing.assert_allclose(
+            self.manager.fluid.get_terrain_heights().reshape(N, N), heights, atol=1e-5)
+        for _ in range(120):
+            self.manager._step_once()
+        u = np.asarray(self.manager.fluid._u.numpy()).reshape(N, N)
+        h = np.asarray(self.manager.fluid._h.numpy()).reshape(N, N)
+        wet = h > 0.05
+        self.assertTrue(wet.any(), "the channel never filled")
+        self.assertGreater(float(u[wet].mean()), 0.0,
+                           "water on a sloped bed did not move downstream")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
