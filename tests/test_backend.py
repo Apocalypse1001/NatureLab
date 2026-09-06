@@ -2218,6 +2218,21 @@ class VolcanoLabTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(props["vent_discharge_m3s"], config.LAVA_VENT_DISCHARGE_M3S)
         self.assertEqual(props["vent_temperature_c"], config.LAVA_ERUPTION_TEMP_C)
 
+    async def test_vent_survives_a_save_load_round_trip(self) -> None:
+        """Same check every other placeable type in this suite has -- a new
+        metadata key silently never reaching an object is exactly the bug
+        `default_properties`'s own backfill comment names (`bed_height`)."""
+        manager = SimulationManager()
+        manager.apply_object_add({"type": "VENT", "position": [10.0, 0.0, 0.0]})
+        manager.save("volcanotest")
+        manager.load("volcanotest")
+        vent = next(o for o in manager.world.objects.values() if o.type == "VENT")
+        self.assertEqual(float(vent.metadata["vent_radius"]), config.LAVA_VENT_RADIUS_M)
+        self.assertEqual(float(vent.metadata["vent_discharge_m3s"]),
+                         config.LAVA_VENT_DISCHARGE_M3S)
+        self.assertEqual(float(vent.metadata["vent_temperature_c"]),
+                         config.LAVA_ERUPTION_TEMP_C)
+
     async def test_volcano_cone_falls_monotonically_from_the_apex(self) -> None:
         """Regression for a real bug this version measured: an earlier cone
         blended a flat crater platform into the flank and overshot, building a
