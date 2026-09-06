@@ -1187,6 +1187,7 @@ class FluidSolver:
     def get_water_height(self, x: float = 0.0, z: float = 0.0) -> float: ...
     def get_velocity_field(self) -> Optional[np.ndarray]: ...
     def get_water_height_field(self) -> np.ndarray: ...
+    def get_lava_temperature_field(self) -> np.ndarray: ...
     def get_flow_particles(self) -> np.ndarray: ...
     def diagnostics(self) -> dict: ...
 
@@ -1237,6 +1238,7 @@ class PlaceholderFluidSolver(FluidSolver):
     def get_water_height_field(self) -> np.ndarray:
         return (np.full(self._terrain.heights.size, self._level, dtype=np.float32)
                  if self._terrain is not None else np.zeros(0, dtype=np.float32))
+    def get_lava_temperature_field(self) -> np.ndarray: return np.zeros(0, dtype=np.float32)
     def get_flow_particles(self) -> np.ndarray: return np.zeros((0, 3), dtype=np.float32)
     def diagnostics(self) -> dict:
         return {"solver": "placeholder", "substeps": self.last_substeps}
@@ -2156,6 +2158,17 @@ class WarpShallowWaterSolver(FluidSolver):
         _, u, v = self._host_fields()
         return (np.column_stack((u, np.zeros_like(u), v)).astype(np.float32)
                  if len(u) else None)
+
+    def get_lava_temperature_field(self) -> np.ndarray:
+        """Per-cell lava temperature in Celsius, same grid and ordering as
+        `get_water_height_field`. Empty whenever no VENT is in the world --
+        see FrameKind.LAVA_TEMPERATURE in protocol.py -- so a river or dam
+        scene never pays for a field that has nothing to show.
+        """
+        if not self._lava_enabled or self._temperature is None:
+            return np.zeros(0, dtype=np.float32)
+        return (np.asarray(self._temperature.numpy(), dtype=np.float32)
+                - 273.15).astype(np.float32)
 
     def get_flow_particles(self) -> np.ndarray:
         if self._flow_particles is None:

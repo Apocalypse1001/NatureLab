@@ -112,19 +112,23 @@ export class BackendClient {
     if (view.getUint8(2) !== 2) return;
     const kind = view.getUint8(3);
     const count = view.getUint32(4, true);
-    const components = [3, 1, 3, 10, 3, 1][kind];
+    const components = [3, 1, 3, 10, 3, 1, 1][kind];
     if (!components || buffer.byteLength !== 16 + count * components * 4) return;
     const floats = new Float32Array(buffer, 16, count * components);
     if (kind === 0) this.particleHandler?.(floats, count);
     if (kind === 1) this.waterHeightHandler?.(floats, count,
       Number(view.getBigUint64(8, true)) / 1000);
     if (kind === 2) this.velocityFieldHandler?.(floats, count);
+    if (kind === 6) this.lavaTemperatureHandler?.(floats, count);
   }
 
   particleHandler: ((positions: Float32Array, count: number) => void) | null = null;
   waterHeightHandler: ((heights: Float32Array, count: number,
                          simTime: number) => void) | null = null;
   velocityFieldHandler: ((velocities: Float32Array, count: number) => void) | null = null;
+  // VolcanoLab (v0.13.0): FrameKind.LAVA_TEMPERATURE, same grid/ordering as
+  // WATER_HEIGHT -- degrees Celsius per terrain vertex, driving the glow ramp.
+  lavaTemperatureHandler: ((temperatures: Float32Array, count: number) => void) | null = null;
 
   send(op: Record<string, unknown>): boolean {
     if (this.ws?.readyState === WebSocket.OPEN) {

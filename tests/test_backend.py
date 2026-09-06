@@ -115,6 +115,22 @@ class Physics04Tests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             protocol.decode_frame(bytes(corrupt))
 
+    async def test_lava_temperature_frame_round_trips(self) -> None:
+        """FrameKind.LAVA_TEMPERATURE (v0.13.0): the frontend's `[3, 1, 3, 10,
+        3, 1, 1]` components table and the backend's `_COMPONENTS` dict are two
+        hand-maintained lists that must agree, or the frame silently vanishes
+        on the wire (BackendClient.handleBinary drops anything with a falsy
+        components lookup, no error). This is the backend half of that
+        contract: one float per cell, same shape as WATER_HEIGHT."""
+        temps = np.linspace(20.0, 1150.0, N * N, dtype=np.float32)
+        payload = protocol.encode_lava_temperature(temps, 2.5)
+        kind, count, t, values = protocol.decode_frame(payload)
+        self.assertEqual(kind, protocol.FrameKind.LAVA_TEMPERATURE)
+        self.assertEqual(count, N * N)
+        self.assertEqual(values.shape, (N * N, 1))
+        self.assertAlmostEqual(t, 2.5, places=3)
+        np.testing.assert_allclose(values.reshape(-1), temps)
+
     async def test_warp_shallow_water_stability_and_stream(self) -> None:
         self.manager.apply_water_level(0.5)
         self.manager.start()
@@ -1361,6 +1377,66 @@ class VelocityStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(velocities, 1)
 
 
+class LavaTemperatureStreamTests(unittest.IsolatedAsyncioTestCase):
+    """VolcanoLab (v0.13.0) item 8: FrameKind.LAVA_TEMPERATURE reaches the
+    wire only once a VENT exists, and carries the solver's own field --
+    mirrors VelocityStreamTests, the precedent for testing a bulk frame
+    through SimulationManager rather than assuming _stream's gate is wired
+    correctly. A river/dam world silently never sending this frame is the
+    passing case; the failure mode a bad merge would produce is either that
+    frame missing when a volcano needs it (glow never appears) or wrongly
+    present for a plain river (wasted bandwidth, and any receiver still alive
+    would try to shade water that was never lava).
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+        self.manager.attach(self._text, self._binary)
+        self.binary_frames: list[bytes] = []
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    async def _text(self, value: str) -> None:
+        pass
+
+    async def _binary(self, value: bytes) -> None:
+        self.binary_frames.append(value)
+
+    def _lava_frames(self) -> list:
+        found = []
+        for payload in self.binary_frames:
+            kind, count, _, values = protocol.decode_frame(payload)
+            if kind == protocol.FrameKind.LAVA_TEMPERATURE:
+                found.append((count, values))
+        return found
+
+    async def test_no_vent_means_no_lava_temperature_frame(self) -> None:
+        self.manager.apply_water_level(1.0)
+        self.manager.start()
+        for _ in range(120):
+            self.manager._step_once()
+        for _ in range(5):
+            await self.manager._stream()
+        self.assertEqual(self._lava_frames(), [],
+                         "a river/dam world must not pay for a frame it has no VENT to fill")
+
+    async def test_a_vent_streams_temperature_matching_the_solver(self) -> None:
+        self.manager.apply_object_add({"type": "VENT", "position": [0.0, 0.0, 0.0]})
+        self.manager.start()
+        for _ in range(180):
+            self.manager._step_once()
+        for _ in range(5):
+            await self.manager._stream()
+        frames = self._lava_frames()
+        self.assertTrue(frames, "no LAVA_TEMPERATURE frame was streamed once a VENT existed")
+        count, values = frames[-1]
+        self.assertEqual(count, N * N)
+        solver_field = self.manager.fluid.get_lava_temperature_field()
+        np.testing.assert_allclose(values.reshape(-1), solver_field, atol=1e-3)
+
+
 class FrictionLawTests(unittest.IsolatedAsyncioTestCase):
     """Bed friction is what decides where water goes once a channel exists.
 
@@ -2007,10 +2083,11 @@ class DamAndScenarioTests(unittest.IsolatedAsyncioTestCase):
         the camera it looks like an object that was never placed at all -- which
         is why this is a test and not a comment.
         """
-        for name in ("scenario_river", "scenario_dam"):
+        minimums = {"scenario_river": 60, "scenario_dam": 60, "scenario_volcano": 25}
+        for name, minimum in minimums.items():
             with self.subTest(scenario=name):
                 world = self._scenario(name)
-                self.assertGreaterEqual(len(world.objects), 60)
+                self.assertGreaterEqual(len(world.objects), minimum)
                 for obj in world.objects.values():
                     ground = world.terrain.height_at(obj.position[0], obj.position[2])
                     self.assertAlmostEqual(
@@ -2036,6 +2113,35 @@ class DamAndScenarioTests(unittest.IsolatedAsyncioTestCase):
                     self.assertGreater(
                         abs(obj.position[2]), half_top,
                         msg=f"{obj.id} sits in the channel at z={obj.position[2]:.1f}")
+
+    async def test_the_volcano_settlement_is_graded_by_distance_from_the_vent(self) -> None:
+        """tools/make_scenarios.py's build_volcano_settlement claims three
+        rings: a homestead inside the measured 48 m run-out (expected to
+        burn), a village just past it (safe at the shipped discharge), and an
+        outer fringe further still. This is the layout's one falsifiable
+        claim -- checked here rather than trusted from the generator's own
+        docstring, the same reason test_no_scenario_object_stands_in_the_channel
+        exists instead of a comment."""
+        from app import config as app_config
+        world = self._scenario("scenario_volcano")
+        vents = [o for o in world.objects.values() if o.type == "VENT"]
+        self.assertEqual(len(vents), 1, "the scenario must ship exactly one VENT")
+        vx, _, vz = vents[0].position
+        run_out = 48.0
+        distances = {}
+        for obj in world.objects.values():
+            if obj.type in ("VENT", "GAUGE"):
+                continue
+            d = float(np.hypot(obj.position[0] - vx, obj.position[2] - vz))
+            distances[obj.id] = d
+            self.assertGreater(d, app_config.LAVA_VENT_RADIUS_M,
+                               f"{obj.id} sits inside the vent's own disc")
+        self.assertTrue(any(d < run_out for d in distances.values()),
+                        "no object sits inside the measured run-out -- "
+                        "the homestead ring is missing")
+        self.assertTrue(any(d > run_out for d in distances.values()),
+                        "no object sits past the measured run-out -- "
+                        "the village/fringe rings are missing")
 
     async def test_a_loaded_scenario_puts_its_own_water_settings_on_the_solver(self) -> None:
         """Erosion and the open edge belong to the world, like the inlet.
@@ -2140,6 +2246,31 @@ class VolcanoLabTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(h[centre, centre], 0.0, "the vent did not fill its own disc")
         self.assertGreater(T[centre, centre], config.LAVA_ERUPTION_TEMP_C - 5.0,
                            "the vent erupted lava that was not actually hot")
+
+    async def test_lava_temperature_field_is_empty_until_a_vent_is_active(self) -> None:
+        """get_lava_temperature_field() feeds FrameKind.LAVA_TEMPERATURE
+        (see SimulationManager._stream) and has to report its own emptiness
+        rather than rely on the caller checking `lava_enabled` first -- the
+        same discipline get_water_height_field already has for a solver with
+        no terrain. Also checks the Kelvin -> Celsius conversion is not
+        skipped (an unconverted ambient cell would read ~293, not ~20) and not
+        doubled (an unconverted-then-subtracted eruption cell would read
+        ~877C instead of ~1150C, and would still glow on screen -- see
+        docs/08_volcano_plan.md's item 8 closure note)."""
+        _, solver = self._flat_solver()
+        self.assertEqual(len(solver.get_lava_temperature_field()), 0,
+                         "a lava-less world must not stream a temperature field")
+        solver.set_lava_vents([([0.0, 0.0, 0.0], 3.0, 20.0, config.LAVA_ERUPTION_TEMP_C)])
+        for _ in range(60):
+            solver.advance(1.0 / 60.0, 8, 1.0 / 120.0)
+        field = solver.get_lava_temperature_field()
+        self.assertEqual(field.size, N * N)
+        grid = field.reshape(N, N)
+        centre = N // 2
+        self.assertGreater(grid[centre, centre], config.LAVA_ERUPTION_TEMP_C - 5.0,
+                           "vent cell did not read back its own eruption temperature")
+        self.assertLess(float(grid[0, 0]), 100.0,
+                        "far-field ambient cell was not converted from Kelvin")
 
     def _cool(self, depth: float, seconds: float = 5.0) -> float:
         """Mean temperature left after `seconds` of pure radiative cooling.

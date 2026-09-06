@@ -483,6 +483,40 @@ const builders: Record<string, Builder> = {
     return g;
   },
 
+  VENT: (obj) => {
+    // VolcanoLab (v0.13.0). Drawn at the solver's own vent radius
+    // (obj.metadata.vent_radius, config.LAVA_VENT_RADIUS_M by default) --
+    // same discipline as SOURCE/DRAIN: the marker is the real footprint the
+    // discharge disc uses, not a decorative icon. A basalt rim (the crater
+    // lip a real vent builds from its own spatter) around a glowing throat;
+    // the throat's own colour is a static stand-in for the actual glow,
+    // which is driven by the streamed temperature field once lava is
+    // flowing -- see SceneManager.buildWaterMaterial's lava ramp.
+    const g = new THREE.Group();
+    const radius = obj.metadata.vent_radius ?? 3.0;
+    const rock = new THREE.MeshStandardMaterial({
+      color: 0x2b2422, roughness: 0.95, flatShading: true,
+    });
+    const throat = new THREE.MeshStandardMaterial({
+      color: 0xff5a1f, emissive: 0xff3300, emissiveIntensity: 1.6, roughness: 0.5,
+    });
+    const rim = new THREE.Mesh(
+      roughened(new THREE.TorusGeometry(radius, radius * 0.32, 10, 40), variant(obj.id) * 71,
+                0.8, 1.0),
+      rock);
+    rim.rotation.x = Math.PI / 2;
+    rim.position.y = radius * 0.28;
+    const cone = new THREE.Mesh(
+      new THREE.ConeGeometry(radius * 1.35, radius * 0.9, 24, 1, true), rock);
+    cone.position.y = radius * 0.45;
+    const glow = new THREE.Mesh(
+      new THREE.CircleGeometry(radius * 0.62, 24), throat);
+    glow.rotation.x = -Math.PI / 2;
+    glow.position.y = radius * 0.05;
+    g.add(cone, rim, glow);
+    return g;
+  },
+
   GAUGE: () => {
     // A staff gauge, so the pole is graduated: alternating 0.25 m bands from
     // the ground up. The sparkline carries the numbers, but a child reads depth

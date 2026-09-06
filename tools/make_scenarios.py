@@ -1,28 +1,35 @@
 """Write the ready-to-load scenario worlds into data/.
 
-    python tools/make_scenarios.py            # both scenarios
+    python tools/make_scenarios.py            # all scenarios
     python tools/make_scenarios.py --only dam
 
-Two scenarios ship: `scenario_river` (a town on the bank of a running river) and
-`scenario_dam` (the same town, below a dam holding back a reservoir). Both are
-ordinary saved worlds -- the save format already carries the whole terrain and
-every object, so a scenario needs no new file format, no new WebSocket op and no
-new load path. The frontend's Scenarios buttons send exactly the `load` the
-existing LOAD button sends.
+Three scenarios ship: `scenario_river` (a town on the bank of a running river),
+`scenario_dam` (the same town, below a dam holding back a reservoir), and
+`scenario_volcano` (a settlement on the flank of a generated cone, graded by
+distance from the vent -- see docs/10_volcano2_plan.md). All are ordinary saved
+worlds -- the save format already carries the whole terrain and every object, so
+a scenario needs no new file format, no new WebSocket op and no new load path.
+The frontend's Scenarios buttons send exactly the `load` the existing LOAD
+button sends.
 
 This lives in `tools/` for the reason `make_river_world.py` does: the layout used
 in tests and screenshots has to be reproducible from a command line, and a broken
 frontend must never be what stands between someone and a scenario on screen.
 
-Two rules the layout obeys, both of which are easy to get wrong invisibly:
+Rules the layout obeys, all of which are easy to get wrong invisibly:
 
 * **Every object is seated on the ground it stands on.** The floodplain here sits
-  near 2.5-2.9 m, so an object written with `y = 0` is buried three metres deep
-  and simply looks *missing* in a screenshot from above -- not broken, missing.
-  Every placement goes through `seat()`, which reads `terrain.height_at`.
-* **Nothing is placed in the channel.** The trapezoidal channel plus its banks
-  occupy |z| < bed_width/2 + bank_run, and a house dropped in there is a dam the
-  user did not ask for.
+  near 2.5-2.9 m (and the volcano's flank varies continuously from 0 to 36 m), so
+  an object written with `y = 0` is buried or floating and simply looks *missing*
+  in a screenshot -- not broken, missing. Every placement goes through `seat()`,
+  which reads `terrain.height_at`.
+* **Nothing is placed in the river channel.** The trapezoidal channel plus its
+  banks occupy |z| < bed_width/2 + bank_run, and a house dropped in there is a
+  dam the user did not ask for.
+* **The volcano settlement is placed at graded, measured distance from the vent**
+  (build_volcano_settlement's docstring), not scattered -- the whole point is a
+  legible causal experiment, the same role the dam scenario's discharge slider
+  plays for build_dam.
 """
 from __future__ import annotations
 
@@ -37,7 +44,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from app import persistence                                    # noqa: E402
-from app.terrain_gen import dam_ridge, river_valley           # noqa: E402
+from app.terrain_gen import dam_ridge, river_valley, volcano_cone  # noqa: E402
 from app.world_state import WorldState                         # noqa: E402
 
 # The town sits on the north bank, downstream of the dam station, in both
@@ -188,40 +195,154 @@ def build_dam(world: WorldState) -> Dict[str, Any]:
     return effective
 
 
+# VolcanoLab (v0.14.0). Kīlauea is the PHYSICAL reference, not a 1:1 scale
+# model: it already supplies config.py's real numbers (LAVA_ERUPTION_TEMP_C =
+# 1150, LAVA_SOLIDUS_TEMP_C = 980 -- genuinely its erupting/solidus basalt
+# temperatures) and its behaviour (effusive summit-vent flows, a lava lake at
+# the source). Its real flank slope is ~2-10 deg, which would need a base
+# radius near 460 m for a 40 m cone -- more than twice this 200 m map, so the
+# VERTICAL proportion is compressed to fit, the same way every other
+# dimension in this world is not drawn at real-world scale. See
+# docs/10_volcano2_plan.md.
+VOLCANO_PEAK_M = 36.0
+VOLCANO_BASE_RADIUS_M = 90.0
+# Measured, not picked: docs/10_volcano2_plan.md's calibration probe ran the
+# real solver (SimulationManager + this exact cone + a default VENT) to
+# convergence at three slopes between 18.9 deg and this cone's 21.8 deg, and
+# the lava front settled at L = 47-52 m in every one of them regardless of
+# slope -- the same "not sharply sensitive to geometry" result
+# docs/08_volcano_plan.md's Замер 2 already found on a gentler cone.
+VOLCANO_MEASURED_RUNOUT_M = 48.0
+
+
+def build_volcano(world: WorldState) -> Dict[str, Any]:
+    effective = volcano_cone(world.terrain, {"peak_height": VOLCANO_PEAK_M,
+                                              "base_radius": VOLCANO_BASE_RADIUS_M})
+    vent_x, _, vent_z = effective["vent_position"]
+    seat(world, "VENT", vent_x, vent_z)
+    water = world.water
+    water.level = 0.0
+    water.visible = True
+    water.erosion_enabled = False
+    water.outflow_enabled = True
+    return effective
+
+
+def build_volcano_settlement(world: WorldState) -> Dict[str, int]:
+    """Place a settlement around the cone at graded distance from the vent,
+    rather than a random scatter -- the point is a legible causal experiment,
+    the same one the dam scenario's discharge slider sets up (see build_dam's
+    comment): this ships at a distance where the default VENT survives, and
+    raising `vent_discharge_m3s` in the properties panel (or just waiting) is
+    the user's to try.
+
+    Three rings, all south-east of the vent so they read as one settlement
+    rather than a test rig scattered on every compass point:
+
+    * ~18-24 m -- an isolated homestead, inside the measured 48 m run-out.
+      Expected to burn; it is the demonstration that the causal chain works.
+    * ~55-65 m -- the village, just past the measured run-out. Safe at the
+      shipped discharge, endangered by raising it or by waiting long enough
+      for a slower creep past 48 m -- the actual experiment.
+    * ~78-85 m -- a few outlying trees on the outer flank, first casualties
+      if the flow ever reaches that far; nothing built there, on purpose.
+    """
+    rng = np.random.RandomState(20260906)
+    counts: Dict[str, int] = {}
+
+    def tally(kind: str, n: int = 1) -> None:
+        counts[kind] = counts.get(kind, 0) + n
+
+    def polar(distance: float, degrees: float) -> tuple:
+        angle = np.radians(degrees)
+        return distance * np.sin(angle), distance * np.cos(angle)
+
+    # --- the homestead, inside the measured run-out ------------------------
+    x, z = polar(20.0, 45.0)
+    seat(world, "HOUSE", x, z, yaw=np.radians(225))
+    tally("house")
+    x, z = polar(24.0, 60.0)
+    seat(world, "CAR", x, z)
+    tally("car")
+    x, z = polar(16.0, 30.0)
+    seat(world, "TREE", x, z)
+    tally("tree")
+
+    # --- the village, just past it ------------------------------------------
+    for i, deg in enumerate((35.0, 48.0, 62.0, 75.0)):
+        x, z = polar(58.0 + (i % 2) * 5.0, deg)
+        seat(world, "HOUSE", x, z, yaw=np.radians(deg + 180.0))
+        tally("house")
+    for x, z in (polar(60.0, 42.0), polar(66.0, 68.0)):
+        seat(world, "CAR", x, z)
+        tally("car")
+    for x, z in (polar(52.0, 40.0), polar(56.0, 70.0), polar(50.0, 55.0)):
+        seat(world, "PERSON", x, z)
+        tally("person")
+
+    # --- outer flank fringe --------------------------------------------------
+    for _ in range(14):
+        deg = rng.uniform(15.0, 85.0)
+        distance = rng.uniform(70.0, 85.0)
+        x, z = polar(distance, deg)
+        seat(world, "TREE", x, z)
+        tally("tree")
+
+    # --- instruments -----------------------------------------------------
+    # One at the measured run-out itself (does the flow reach here at all?),
+    # one in the village (what is happening to the settlement?).
+    x, z = polar(VOLCANO_MEASURED_RUNOUT_M, 52.0)
+    seat(world, "GAUGE", x, z)
+    x, z = polar(60.0, 52.0)
+    seat(world, "GAUGE", x, z)
+    tally("gauge", 2)
+    return counts
+
+
 SCENARIOS = {
-    "river": ("scenario_river", build_river),
-    "dam": ("scenario_dam", build_dam),
+    "river": ("scenario_river", build_river, build_town),
+    "dam": ("scenario_dam", build_dam, build_town),
+    "volcano": ("scenario_volcano", build_volcano, build_volcano_settlement),
 }
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--only", choices=sorted(SCENARIOS),
-                        help="build just one scenario (default: both)")
+                        help="build just one scenario (default: all)")
     args = parser.parse_args(argv)
 
     wanted = [args.only] if args.only else sorted(SCENARIOS)
     for key in wanted:
-        name, build = SCENARIOS[key]
+        name, build, build_objects = SCENARIOS[key]
         world = WorldState()
-        effective = build(world)          # terrain first: the town is seated on it
-        counts = build_town(world)
+        effective = build(world)          # terrain first: objects are seated on it
+        counts = build_objects(world)
         path = persistence.save_world(world, name)
 
         print(f"wrote {path}")
         print("  " + ", ".join(f"{n} {kind}" for kind, n in sorted(counts.items())))
-        print(f"  {len(world.objects)} objects, "
-              f"inlet Q {world.water.inlet_discharge_m3s:g} m3/s")
-        if "crest_elevation" in effective:
-            print(f"  dam crest {effective['crest_elevation']:.2f} m, spillway lip "
-                  f"{effective['spill_elevation']:.2f} m, channel bed "
-                  f"{effective['channel_bed_at_dam']:.2f} m")
-            print(f"  reservoir {effective['reservoir_volume_m3']:.0f} m3 below "
-                  f"the lip; measured: spills at 120 s, holds at Q=30, "
-                  f"crest overtopped at 360 s at Q=60")
+        if "vent_position" in effective:
+            vent = next(o for o in world.objects.values() if o.type == "VENT")
+            print(f"  {len(world.objects)} objects, "
+                  f"vent Q {vent.metadata['vent_discharge_m3s']:g} m3/s")
+            print(f"  cone peak {effective['peak_height']:.1f} m, base radius "
+                  f"{effective['base_radius']:.1f} m; measured run-out "
+                  f"{VOLCANO_MEASURED_RUNOUT_M:.0f} m at the shipped discharge "
+                  f"(docs/10_volcano2_plan.md)")
         else:
-            print(f"  channel bed {effective['inlet_bed']:.2f} m (inlet) -> "
-                  f"{effective['outlet_bed_actual']:.2f} m (outlet)")
+            print(f"  {len(world.objects)} objects, "
+                  f"inlet Q {world.water.inlet_discharge_m3s:g} m3/s")
+            if "crest_elevation" in effective:
+                print(f"  dam crest {effective['crest_elevation']:.2f} m, spillway lip "
+                      f"{effective['spill_elevation']:.2f} m, channel bed "
+                      f"{effective['channel_bed_at_dam']:.2f} m")
+                print(f"  reservoir {effective['reservoir_volume_m3']:.0f} m3 below "
+                      f"the lip; measured: spills at 120 s, holds at Q=30, "
+                      f"crest overtopped at 360 s at Q=60")
+            else:
+                print(f"  channel bed {effective['inlet_bed']:.2f} m (inlet) -> "
+                      f"{effective['outlet_bed_actual']:.2f} m (outlet)")
     return 0
 
 

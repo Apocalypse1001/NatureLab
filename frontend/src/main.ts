@@ -73,6 +73,9 @@ net.waterHeightHandler = (heights, count, simTime) => {
     store.waterFrameTime = simTime;
   }
 };
+net.lavaTemperatureHandler = (temperatures, count) => {
+  sceneManager.setLavaTemperature(temperatures, count);
+};
 
 // ---------------------------------------------------------------------- ui
 const ui = new UI(uiHost, {

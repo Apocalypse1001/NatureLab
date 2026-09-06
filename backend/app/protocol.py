@@ -18,6 +18,7 @@ class FrameKind(IntEnum):
     OBJECT_TRANSFORMS = 3
     TERRAIN_PATCH = 4
     EVENTS = 5
+    LAVA_TEMPERATURE = 6
 
 
 _COMPONENTS = {
@@ -27,6 +28,7 @@ _COMPONENTS = {
     FrameKind.OBJECT_TRANSFORMS: 10,  # position3 + rotation3 + quaternion/scale4 scaffold
     FrameKind.TERRAIN_PATCH: 3,       # grid i, grid j, height
     FrameKind.EVENTS: 1,              # numeric event records; JSON remains fallback
+    FrameKind.LAVA_TEMPERATURE: 1,    # degrees C, same terrain-vertex order as WATER_HEIGHT
 }
 
 
@@ -59,6 +61,16 @@ def encode_velocity_field(velocities: np.ndarray, sim_time: float) -> bytes:
     invented motion, which is precisely what this project's own rules forbid.
     """
     return encode_float_frame(FrameKind.VELOCITY_FIELD, velocities, sim_time)
+
+
+def encode_lava_temperature(temperature_c: np.ndarray, sim_time: float) -> bytes:
+    """Encode per-cell lava temperature (Celsius), terrain-vertex row-major --
+    the same ordering and grid as WATER_HEIGHT, so the frontend can drive the
+    glow shader off `aLavaTemp` with no extra index math. Only sent while a
+    VENT is in the world (see SimulationManager._stream); a lava-less scene
+    has nothing to glow and should not pay for the frame.
+    """
+    return encode_float_frame(FrameKind.LAVA_TEMPERATURE, temperature_c, sim_time)
 
 
 def decode_frame(payload: bytes) -> tuple[FrameKind, int, float, np.ndarray]:

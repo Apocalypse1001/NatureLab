@@ -49,6 +49,12 @@ const SCENARIOS: { name: string; label: string; hint: string }[] = [
         + 'spillway carries the river and the dam holds. Push Q past about 60 '
         + 'and the crest goes under in roughly six minutes of simulated time '
         + '-- or cut the crest with the terrain brush and watch it go at once' },
+  { name: 'scenario_volcano', label: 'Volcano',
+    hint: 'A settlement on the flank of a generated cone. The homestead '
+        + 'inside the measured 48 m lava run-out is expected to burn; the '
+        + 'village just past it is safe at the vent’s shipped discharge '
+        + '-- raise "Discharge Q" in the vent’s own properties, or just '
+        + 'wait, to push the flow further' },
 ];
 
 export class UI {
@@ -552,6 +558,19 @@ export class UI {
        (v) => this.cb.updateObject(obj.id, { metadata: { ...obj.metadata, foundation_height: v } })],
       ['Damage resistance', 'resistance', obj.metadata.damage_resistance ?? 0,
        (v) => this.cb.updateObject(obj.id, { metadata: { ...obj.metadata, damage_resistance: v } })],
+    );
+    // VolcanoLab (v0.13.0/v0.14.0): the vent's own discharge, radius and
+    // eruption temperature are read live every step (SimulationManager's
+    // vent snapshot re-reads metadata, not a value baked in at placement), so
+    // this is the same "push the slider" experiment build_dam's discharge
+    // control already sets up -- see the Volcano scenario's hint text.
+    if (obj.type === 'VENT') fields.push(
+      ['Discharge Q (m³/s)', 'vent_q', obj.metadata.vent_discharge_m3s ?? 0,
+       (v) => this.cb.updateObject(obj.id, { metadata: { ...obj.metadata, vent_discharge_m3s: v } })],
+      ['Vent radius (m)', 'vent_radius', obj.metadata.vent_radius ?? 0,
+       (v) => this.cb.updateObject(obj.id, { metadata: { ...obj.metadata, vent_radius: v } })],
+      ['Eruption temp (°C)', 'vent_temp', obj.metadata.vent_temperature_c ?? 0,
+       (v) => this.cb.updateObject(obj.id, { metadata: { ...obj.metadata, vent_temperature_c: v } })],
     );
     for (const [label, key, value, apply] of fields) {
       const row = el('div', 'prop-row');

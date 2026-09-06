@@ -540,6 +540,7 @@ class SimulationManager:
         if self._send_text is None or self._send_bytes is None:
             return
         particle_count = 0
+        lava_active = bool(getattr(self.fluid, "_lava_enabled", False))
         if self.status == self.RUNNING or self._flush_final_frame:
             if self.status == self.PAUSED:
                 self._flush_final_frame = False
@@ -556,6 +557,18 @@ class SimulationManager:
                     await self._send_bytes(protocol.encode_water_height(heights, self.sim_time))
                 except Exception:
                     return
+            # VolcanoLab (v0.13.0): the glow shader's only input. Gated on
+            # lava_active, same as the terrain resync below -- a river or dam
+            # scene has no VENT, so this stays a zero-cost no-op for every
+            # world that isn't a volcano.
+            if lava_active:
+                temperatures = self.fluid.get_lava_temperature_field()
+                if len(temperatures):
+                    try:
+                        await self._send_bytes(
+                            protocol.encode_lava_temperature(temperatures, self.sim_time))
+                    except Exception:
+                        return
             # v0.10.0: the real velocity field, so the renderer can build its
             # flow map from physics instead of inventing one. Throttled to
             # config.VELOCITY_STREAM_EVERY frames: a flow map is a low-frequency
@@ -582,7 +595,6 @@ class SimulationManager:
             # lava flow that freezes into a levee is physically real on the
             # backend and never seen on screen, the same bug class this project
             # already caught twice (with water itself, and again with erosion).
-            lava_active = bool(getattr(self.fluid, "_lava_enabled", False))
             if (self.status == self.RUNNING
                     and (self.world.water.erosion_enabled or lava_active)
                     and hasattr(self.fluid, "get_terrain_heights")

@@ -25,6 +25,7 @@ export class SceneManager {
   private gridHelper: THREE.GridHelper;
   private waterFlow = new Float32Array(0);
   private waterDepth = new Float32Array(0);
+  private waterLavaTemp = new Float32Array(0);
   private sprayPoints: THREE.Points | null = null;
   private sprayPositions = new Float32Array(0);
   private sprayPhase = 0;
@@ -187,6 +188,18 @@ export class SceneManager {
       || terrain.cellSize !== this.terrain.cellSize;
     this.terrain = terrain;
     if (resized) this.rebuildGridGeometry();
+    // A loaded world may not be a volcano; a stale glow from the previous one
+    // would otherwise linger since LAVA_TEMPERATURE frames simply stop
+    // arriving rather than sending zeros (see simulation.py's lava_active
+    // gate). rebuildGridGeometry already zeroes this via attachWaterAttributes
+    // when the grid resizes, so this only has work to do on same-size reloads.
+    if (!resized) {
+      const attribute = this.waterMesh.geometry.attributes.aLavaTemp as THREE.BufferAttribute;
+      if (attribute) {
+        this.waterLavaTemp.fill(0);
+        attribute.needsUpdate = true;
+      }
+    }
     const geo = this.terrainMesh.geometry as THREE.PlaneGeometry;
     const pos = geo.attributes.position;
     const w = terrain.width, h = terrain.height;
@@ -233,15 +246,18 @@ export class SceneManager {
           #include <common>
           attribute vec2 aFlow;
           attribute float aDepth;
+          attribute float aLavaTemp;
           varying vec2 vFlow;
           varying float vDepth;
           varying float vSpeed;
+          varying float vLavaTemp;
         `)
         .replace('#include <begin_vertex>', `
           #include <begin_vertex>
           vFlow = aFlow;
           vDepth = aDepth;
           vSpeed = length(aFlow);
+          vLavaTemp = aLavaTemp;
         `);
       shader.fragmentShader = shader.fragmentShader
         .replace('#include <common>', `
@@ -250,6 +266,7 @@ export class SceneManager {
           varying vec2 vFlow;
           varying float vDepth;
           varying float vSpeed;
+          varying float vLavaTemp;
 
           // cheap value noise, enough for surface texture at this scale
           float hash(vec2 p) {
@@ -261,6 +278,26 @@ export class SceneManager {
             f = f * f * (3.0 - 2.0 * f);
             return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
                        mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+          }
+
+          // VolcanoLab (v0.13.0): colour AS a function of the streamed
+          // temperature field, not a painted "lava texture" -- the same
+          // principle buildWaterMaterial's docstring states for the flow map.
+          // Thresholds mirror config.py: LAVA_SOLIDUS_TEMP_C = 980,
+          // LAVA_ERUPTION_TEMP_C = 1150. Below ~700C nothing glows (real
+          // basalt stops visibly radiating well before it solidifies), so a
+          // cooling flow darkens itself all the way to black rock -- it is not
+          // faded out or hidden, the temperature field just stops producing
+          // colour for it.
+          vec3 lavaColor(float tC) {
+            vec3 dark   = vec3(0.05, 0.01, 0.01);
+            vec3 cherry = vec3(0.55, 0.07, 0.02);
+            vec3 orange = vec3(0.95, 0.35, 0.05);
+            vec3 white  = vec3(1.00, 0.95, 0.65);
+            vec3 c = mix(dark, cherry, smoothstep(700.0, 980.0, tC));
+            c = mix(c, orange, smoothstep(980.0, 1080.0, tC));
+            c = mix(c, white, smoothstep(1080.0, 1150.0, tC));
+            return c;
           }
         `)
         .replace('#include <dithering_fragment>', `
@@ -284,6 +321,14 @@ export class SceneManager {
           gl_FragColor.rgb *= mix(1.28, 0.82, deep);
           gl_FragColor.rgb += vec3(0.0, 0.05, 0.02) * (1.0 - deep);
           gl_FragColor.a = clamp(gl_FragColor.a + foam * 0.5 + 0.12 * (1.0 - deep), 0.0, 1.0);
+          // Lava overrides the water treatment above entirely rather than
+          // tinting it: foam and blue depth-shading are real-water phenomena
+          // that mean nothing for a viscous melt. vLavaTemp is 0 for every
+          // frame that never received a LAVA_TEMPERATURE stream, so this is a
+          // no-op for every world that isn't a volcano.
+          float lavaMix = smoothstep(650.0, 850.0, vLavaTemp);
+          gl_FragColor.rgb = mix(gl_FragColor.rgb, lavaColor(vLavaTemp), lavaMix);
+          gl_FragColor.a = mix(gl_FragColor.a, 1.0, lavaMix);
         `);
     };
     return material;
@@ -334,8 +379,10 @@ export class SceneManager {
     const count = geometry.attributes.position.count;
     this.waterFlow = new Float32Array(count * 2);
     this.waterDepth = new Float32Array(count);
+    this.waterLavaTemp = new Float32Array(count);
     geometry.setAttribute('aFlow', new THREE.BufferAttribute(this.waterFlow, 2));
     geometry.setAttribute('aDepth', new THREE.BufferAttribute(this.waterDepth, 1));
+    geometry.setAttribute('aLavaTemp', new THREE.BufferAttribute(this.waterLavaTemp, 1));
   }
 
   /**
@@ -403,6 +450,20 @@ export class SceneManager {
     (this.sprayPoints.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
     this.sprayPoints.geometry.setDrawRange(0, emitted);
     this.sprayPoints.visible = this.tracersVisible && emitted > 0;
+  }
+
+  /**
+   * Apply a streamed LAVA_TEMPERATURE frame (degrees C, terrain-vertex order,
+   * same grid as WATER_HEIGHT). Never sent for a lava-less world, so a river
+   * or dam scene simply never calls this and the shader's ramp stays at its
+   * cold default -- see buildWaterMaterial.
+   */
+  setLavaTemperature(values: Float32Array, count: number): boolean {
+    const attribute = this.waterMesh.geometry.attributes.aLavaTemp as THREE.BufferAttribute;
+    if (!attribute || count !== attribute.count) return false;
+    this.waterLavaTemp.set(values.subarray(0, count));
+    attribute.needsUpdate = true;
+    return true;
   }
 
   setWater(level: number, visible: boolean): void {
