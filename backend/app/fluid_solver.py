@@ -18,7 +18,7 @@ if WARP_IMPORTED:
                        next_u: wp.array(dtype=float), next_v: wp.array(dtype=float),
                        inlet_q: wp.array(dtype=float),
                        width: int, height: int, dx: float, dt: float,
-                       gravity: float, dry: float, manning_n: float,
+                       gravity: float, dry: float, manning: wp.array(dtype=float),
                        friction_min_depth: float,
                        max_velocity: float, outflow_columns: int,
                        outflow_row_lo: int, outflow_row_hi: int):
@@ -71,7 +71,8 @@ if WARP_IMPORTED:
             # harder than diagonal flow and quietly bend the river toward the grid.
             speed = wp.sqrt(ux * ux + vz * vz)
             hf = wp.max(h[idx], friction_min_depth)
-            drag = gravity * manning_n * manning_n * speed * dt / wp.pow(hf, 1.3333333)
+            n = manning[idx]
+            drag = gravity * n * n * speed * dt / wp.pow(hf, 1.3333333)
             ux = ux / (1.0 + drag)
             vz = vz / (1.0 + drag)
             if i == 0:
@@ -693,6 +694,279 @@ if WARP_IMPORTED:
             next_sediment[idx] = sediment[idx]
 
 
+    # ------------------------------------------------------------ VolcanoLab (v0.13.0)
+    # Physical constants (basalt-order), not tuning knobs -- the tunable part of
+    # the cooling law lives in config.py as LAVA_EMISSIVITY / LAVA_COOLING_ENHANCEMENT.
+    _LAVA_SIGMA = 5.670374419e-8   # Stefan-Boltzmann, W/(m^2 K^4)
+    _LAVA_RHO = 2700.0             # kg/m^3
+    _LAVA_CP = 1200.0              # J/(kg K)
+
+    @wp.kernel
+    def _advect_lava_energy(old_h: wp.array(dtype=float), new_h: wp.array(dtype=float),
+                            temperature: wp.array(dtype=float),
+                            next_temperature: wp.array(dtype=float),
+                            u: wp.array(dtype=float), v: wp.array(dtype=float),
+                            bed: wp.array(dtype=float), solid: wp.array(dtype=wp.int32),
+                            width: int, height: int, dx: float, dt: float, dry: float,
+                            ambient_k: float):
+        """Temperature transport by face flux, not by `_advect_sediment`'s back-trace.
+
+        The plan's item 2 asked for the sediment kernel reused as-is ("the same
+        kernel, a different field"), and that was tried first. It fails
+        specifically at a wetting front: `_advect_sediment` back-traces using
+        the DESTINATION cell's own u/v, and a cell that is dry at the start of
+        a substep has u=v=0 there (`_velocity_step` zeroes a dry cell before
+        `_depth_step` gives it any water) -- so the instant it receives its
+        first inflow this substep, the back-trace distance is exactly zero and
+        it resamples itself, keeping its old (ambient) temperature instead of
+        the hot value flowing in. Measured directly (docs/08_volcano_plan.md,
+        the vent-flow measurement): every newly-wetted cell along the front
+        read exactly ambient every substep, `_lava_manning` read it as already
+        below the solidus, and `_solidify_lava` converted the first trickle to
+        reach it straight into bed -- forever, at the very edge of the vent,
+        which is why nothing ever got further than a few metres.
+
+        This kernel instead moves T*h (a depth-integrated heat proxy) across
+        the SAME faces with the SAME upwind face velocities `_depth_step`
+        already used to move `h` for this substep -- literally the flux that
+        just carried water into the cell also carries the temperature that
+        water had. `old_h` is the depth `_depth_step` computed FROM (its
+        `_face_flux` inputs), `new_h` is what it produced; both are cheaply
+        available as the two sides of the swap `advance()` just performed.
+        """
+        idx = wp.tid()
+        if solid[idx] != 0:
+            next_temperature[idx] = temperature[idx]
+            return
+        i = idx % width
+        j = idx // width
+        q_right = float(0.0)
+        q_left = float(0.0)
+        q_up = float(0.0)
+        q_down = float(0.0)
+        t_right = temperature[idx]
+        t_left = temperature[idx]
+        t_up = temperature[idx]
+        t_down = temperature[idx]
+        if i < width - 1 and solid[idx + 1] == 0:
+            face = 0.5 * (u[idx] + u[idx + 1])
+            if face >= 0.0:
+                q_right = _face_flux(face, old_h[idx], bed[idx], bed[idx + 1])
+            else:
+                q_right = _face_flux(face, old_h[idx + 1], bed[idx + 1], bed[idx])
+                t_right = temperature[idx + 1]
+        if i > 0 and solid[idx - 1] == 0:
+            face = 0.5 * (u[idx - 1] + u[idx])
+            if face >= 0.0:
+                q_left = _face_flux(face, old_h[idx - 1], bed[idx - 1], bed[idx])
+                t_left = temperature[idx - 1]
+            else:
+                q_left = _face_flux(face, old_h[idx], bed[idx], bed[idx - 1])
+        if j < height - 1 and solid[idx + width] == 0:
+            face = 0.5 * (v[idx] + v[idx + width])
+            if face >= 0.0:
+                q_up = _face_flux(face, old_h[idx], bed[idx], bed[idx + width])
+            else:
+                q_up = _face_flux(face, old_h[idx + width], bed[idx + width], bed[idx])
+                t_up = temperature[idx + width]
+        if j > 0 and solid[idx - width] == 0:
+            face = 0.5 * (v[idx - width] + v[idx])
+            if face >= 0.0:
+                q_down = _face_flux(face, old_h[idx - width], bed[idx - width], bed[idx])
+                t_down = temperature[idx - width]
+            else:
+                q_down = _face_flux(face, old_h[idx], bed[idx], bed[idx - width])
+        energy_old = old_h[idx] * temperature[idx]
+        energy_new = energy_old - dt * ((q_right * t_right - q_left * t_left)
+                                        + (q_up * t_up - q_down * t_down)) / dx
+        hn = new_h[idx]
+        if hn > dry:
+            next_temperature[idx] = wp.max(ambient_k, energy_new / hn)
+        else:
+            next_temperature[idx] = temperature[idx]
+
+
+    @wp.kernel
+    def _apply_lava_vents(h: wp.array(dtype=float), u: wp.array(dtype=float),
+                          v: wp.array(dtype=float), temperature: wp.array(dtype=float),
+                          solid: wp.array(dtype=wp.int32),
+                          centres: wp.array(dtype=wp.vec3),
+                          radii: wp.array(dtype=float),
+                          discharges: wp.array(dtype=float),
+                          temps: wp.array(dtype=float),
+                          count: int, width: int, height: int, dx: float, dt: float,
+                          dry: float, max_velocity: float,
+                          area: float, added: wp.array(dtype=float)):
+        """A vent: a prescribed-discharge point source, not a level-held one.
+
+        `_apply_point_sources` (`SOURCE`) computes `target = level - bed`, which
+        would starve a lava vent as solidified flow raises the bed around it --
+        the vent burying itself, at which point "how much has erupted" stops
+        being a control at all. A prescribed Q cannot be starved that way, so
+        this is modelled on `_apply_drains` instead (a sink run backwards):
+        volume is added over a smooth disc profile, and the radial velocity
+        needed to carry exactly that volume outward past the disc's rim is
+        derived from continuity -- `strength` is picked so that the enclosed
+        flow at r = radius equals the requested Q, the same relation
+        `_apply_drains` already proved for a sink. Without an imposed outward
+        velocity the fresh volume would sit as a mound with no momentum, ring,
+        and read as a reservoir rather than an eruption -- the same failure
+        `_apply_river_inlet`'s own docstring warns about.
+
+        Writes `temperature` unconditionally inside the disc, every call: a
+        vent that wrote `h` and not `T` would erupt lava at ambient temperature
+        forever, which is the 0.3989 bug from v0.11.0 reproduced exactly
+        (docs/07_river_plan.md) -- a source must fill every field it creates.
+        """
+        idx = wp.tid()
+        if solid[idx] != 0:
+            return
+        i = idx % width
+        j = idx // width
+        x = (float(i) - float(width - 1) * 0.5) * dx
+        z = (float(j) - float(height - 1) * 0.5) * dx
+        for n in range(count):
+            radius = radii[n]
+            discharge = discharges[n]
+            if radius <= 0.0 or discharge <= 0.0:
+                continue
+            centre = centres[n]
+            dxc = x - centre[0]
+            dzc = z - centre[2]
+            r = wp.sqrt(dxc * dxc + dzc * dzc)
+            if r > radius:
+                continue
+            ratio = r / radius
+            falloff = 1.0 - ratio * ratio
+            # strength (m/s of depth, disc-wide) such that the enclosed flow at
+            # the rim (r=radius) equals the requested Q: Q = strength*pi*R^2*0.5
+            strength = 2.0 * discharge / (3.14159265 * radius * radius)
+            gain = strength * falloff * dt
+            wp.atomic_add(added, 0, gain * area)
+            h[idx] = h[idx] + gain
+            temperature[idx] = temps[n]
+            r_safe = wp.max(r, radius * 0.25)
+            nx = dxc / r_safe
+            nz = dzc / r_safe
+            enclosed = strength * 3.14159265 * r_safe * r_safe * (
+                1.0 - r_safe * r_safe / (2.0 * radius * radius))
+            hf = wp.max(h[idx], dry)
+            radial = enclosed / (2.0 * 3.14159265 * r_safe * hf)
+            # Deliberately NOT Froude-capped the way `_apply_river_inlet` caps
+            # its edge velocity: that cap desynchronises mass from momentum here
+            # -- `gain` above already added the full requested volume this
+            # substep regardless of the cap, so capping only the velocity that
+            # is supposed to carry it back out leaves mass arriving faster than
+            # it can leave, and the vent pools instead of flowing. Measured
+            # directly: with the cap in place a 20 m3/s vent reached 15.6 m
+            # deep and 0.10 m/s in 30 s (a lake), not a flow. `max_velocity`
+            # below is the same hard ceiling every other kernel in this file
+            # already clamps to, which is what actually bounds a near-dry disc.
+            u[idx] = wp.clamp(nx * radial, -max_velocity, max_velocity)
+            v[idx] = wp.clamp(nz * radial, -max_velocity, max_velocity)
+
+
+    @wp.kernel
+    def _lava_manning(temperature: wp.array(dtype=float), h: wp.array(dtype=float),
+                      solid: wp.array(dtype=wp.int32), manning: wp.array(dtype=float),
+                      min_n: float, max_n: float, solidus_k: float, erupt_k: float,
+                      dry: float):
+        """mu(T), mapped onto the existing Manning-friction slot in `_velocity_step`.
+
+        Linear between the two calibration points the plan asks for -- fluid at
+        eruption temperature (`min_n`), almost stopped at the solidus (`max_n`)
+        -- rather than a real viscosity law, for the same reason the plan gives
+        for choosing (a) over (b) in docs/08_volcano_plan.md: it reuses the
+        proven SWE solver and is honest about what it is not.
+
+        Dry or solid cells are left at `min_n`, not `max_n`: `_velocity_step`
+        already zeroes their velocity outright, so the value is inert there, but
+        a cell that is about to be wetted by an advancing front should start
+        fluid rather than pre-frozen by whatever this array last held.
+        """
+        idx = wp.tid()
+        if solid[idx] != 0 or h[idx] <= dry:
+            manning[idx] = min_n
+            return
+        span = wp.max(erupt_k - solidus_k, 1.0)
+        frac = wp.clamp((temperature[idx] - solidus_k) / span, 0.0, 1.0)
+        manning[idx] = max_n + frac * (min_n - max_n)
+
+
+    @wp.kernel
+    def _cool_lava(temperature: wp.array(dtype=float),
+                   next_temperature: wp.array(dtype=float),
+                   h: wp.array(dtype=float), solid: wp.array(dtype=wp.int32),
+                   dt: float, k0: float, ambient_k: float, min_depth: float,
+                   dry: float):
+        """Radiative cooling of a well-mixed column: dT/dt = -(k0/h)*T^4.
+
+        Closed-form (not integrated step by step), so it is unconditionally
+        stable and cannot overshoot past ambient the way an explicit subtraction
+        would -- see docs/08_volcano_plan.md's trap 2, and compare with how
+        `_velocity_step` treats friction semi-implicitly for the same reason.
+        Ambient's own T^4 is dropped from the balance (under 0.2% of erupting
+        T^4, and this is a bulk-column model already, not a calibrated one);
+        the `wp.max(ambient_k, ...)` floor below is what puts back the one
+        physical fact that omission would otherwise lose -- radiative cooling
+        approaches ambient asymptotically, it does not run past it.
+
+        `min_depth` is `LAVA_COOLING_MIN_DEPTH`, a physics knob and not a
+        divide-by-zero guard: `k0/h` is the entire "thin cools faster than
+        thick" mechanism (h in the denominator), so this floor alone decides how
+        fast the leading edge of a flow can freeze relative to its interior.
+        """
+        idx = wp.tid()
+        if solid[idx] != 0 or h[idx] <= dry:
+            next_temperature[idx] = temperature[idx]
+            return
+        hh = wp.max(h[idx], min_depth)
+        t0 = temperature[idx]
+        growth = 1.0 + 3.0 * k0 * t0 * t0 * t0 * dt / hh
+        cooled = t0 / wp.pow(growth, 0.3333333)
+        next_temperature[idx] = wp.max(ambient_k, cooled)
+
+
+    @wp.kernel
+    def _solidify_lava(h: wp.array(dtype=float), temperature: wp.array(dtype=float),
+                       bed_terrain: wp.array(dtype=float),
+                       solid: wp.array(dtype=wp.int32), solidus_k: float,
+                       dry: float, area: float, solidified: wp.array(dtype=float)):
+        """Below the solidus, lava stops being flow and becomes ground.
+
+        Literal item 5 of the plan: `bed += h; h = 0`, unconditional and
+        irreversible in one substep, with NO limiter pre-applied -- the
+        v0.11.0 lesson (docs/07_river_plan.md) was that a clamp shipped before
+        anything measured what it binds against gets read back as physics.
+        `solidified` accumulates the volume this removes from the fluid, so the
+        volume ledger (`diagnostics()`) can account for where it went instead
+        of reporting it as an unexplained conservation error.
+
+        Freezing into `bed_terrain` and not the rock-dome mask keeps solidified
+        lava overflowable by the next hot pulse, for the same reason a ROCK is
+        never rasterized as a solid wall: the mask is an infinitely tall wall,
+        right for a house and wrong for terrain, and a lava levee is terrain.
+        """
+        idx = wp.tid()
+        if solid[idx] != 0 or h[idx] <= dry:
+            return
+        if temperature[idx] < solidus_k:
+            amount = h[idx]
+            bed_terrain[idx] = bed_terrain[idx] + amount
+            wp.atomic_add(solidified, 0, amount * area)
+            h[idx] = 0.0
+
+
+    @wp.kernel
+    def _reduce_lava_diagnostics(temperature: wp.array(dtype=float),
+                                 h: wp.array(dtype=float),
+                                 solid: wp.array(dtype=wp.int32), dry: float,
+                                 stats: wp.array(dtype=float)):
+        idx = wp.tid()
+        if solid[idx] == 0 and h[idx] > dry:
+            wp.atomic_max(stats, 6, temperature[idx])
+
+
     @wp.kernel
     def _advect_flow_tracers(particles: wp.array(dtype=wp.vec3),
                              h: wp.array(dtype=float), u: wp.array(dtype=float),
@@ -740,11 +1014,15 @@ if WARP_IMPORTED:
     # they ended at, and those are not the same state.
     STAT_DEPTH, STAT_SPEED, STAT_WAVE = 0, 1, 2
     STAT_VOLUME, STAT_WET, STAT_INLET = 3, 4, 5
-    STAT_COUNT = 6
+    # v0.13.0: the hottest wet cell this frame, in Kelvin -- gated on lava being
+    # enabled at all (see `_measure`), same pattern as STAT_INLET being gated on
+    # `_inlet_enabled`.
+    STAT_LAVA_TEMP_MAX = 6
+    STAT_COUNT = 7
 
     @wp.kernel
     def _clear_diagnostics(stats: wp.array(dtype=float)):
-        for k in range(6):
+        for k in range(7):
             stats[k] = 0.0
 
 
@@ -1009,6 +1287,21 @@ class WarpShallowWaterSolver(FluidSolver):
         self._drain_centres = self._drain_radii = None
         self._drain_strengths = self._drain_circulation = None
         self._drain_samples = None
+        # VolcanoLab (v0.13.0). Lava mode is DERIVED from whether any VENT is
+        # placed, the same way a placed SOURCE takes over from the edge inflow
+        # entirely (v0.8.0) -- no separate toggle, so there is exactly one
+        # answer to "is this world simulating lava". The consequence, named
+        # here rather than left implicit: dropping a VENT onto a river world
+        # turns all of its water into lava, because water/lava coexistence is
+        # explicitly out of scope until v0.14.0 (docs/08_volcano_plan.md).
+        self._lava_enabled = False
+        self._temperature = self._next_temperature = None
+        self._manning = None
+        self._vent_count = 0
+        self._vent_centres = self._vent_radii = None
+        self._vent_discharges = self._vent_temps = None
+        self._solidified_m3 = 0.0
+        self._diag_solidified = None
         self._level = 0.5
         self._source_enabled = True
         self._seen_terrain_revision = -1
@@ -1057,10 +1350,27 @@ class WarpShallowWaterSolver(FluidSolver):
         self._sediment = wp.zeros(self._count, dtype=float, device=self.device)
         self._next_sediment = wp.empty(self._count, dtype=float, device=self.device)
         self._obstacles = wp.array(self._obstacle_host, dtype=wp.int32, device=self.device)
-        self._diag_stats = wp.zeros(6, dtype=float, device=self.device)
+        self._diag_stats = wp.zeros(STAT_COUNT, dtype=float, device=self.device)
         self._diag_added = wp.zeros(1, dtype=float, device=self.device)
         self._diag_removed = wp.zeros(1, dtype=float, device=self.device)
         self._diag_sediment_out = wp.zeros(1, dtype=float, device=self.device)
+        self._diag_solidified = wp.zeros(1, dtype=float, device=self.device)
+        self._solidified_m3 = 0.0
+        # VolcanoLab (v0.13.0). Manning friction defaults to the constant every
+        # non-lava world already ran with, filled ONCE here from
+        # `config.FLUID_MANNING_N` -- `advance()` never re-reads that module
+        # constant itself any more, so a probe or test that patches it must do
+        # so before `initialize()`, same as it already had to for every other
+        # value this method bakes into a GPU array at start-up.
+        self._manning = wp.array(
+            np.full(self._count, config.FLUID_MANNING_N, dtype=np.float32),
+            dtype=float, device=self.device)
+        self._temperature = wp.array(
+            np.full(self._count, config.LAVA_AMBIENT_TEMP_C + 273.15, dtype=np.float32),
+            dtype=float, device=self.device)
+        self._next_temperature = wp.empty(self._count, dtype=float, device=self.device)
+        self._lava_enabled = False
+        self._vent_count = 0
         self._inlet_q_host = np.zeros(self._height, dtype=np.float32)
         self._inlet_q = wp.zeros(self._height, dtype=float, device=self.device)
         self._inlet_normal_depth = wp.zeros(self._height, dtype=float,
@@ -1433,6 +1743,37 @@ class WarpShallowWaterSolver(FluidSolver):
                 self._drain_samples = wp.zeros(len(drains), dtype=float,
                                                device=self.device)
 
+    def set_lava_vents(self, vents: list) -> None:
+        """Upload placeable VENT objects; their presence IS the lava toggle.
+
+        `vents` is (centre_xyz, radius_m, discharge_m3s, temperature_c) tuples,
+        read live every tick like SOURCE/DRAIN so a vent can be dragged while
+        RUNNING. An empty list turns lava mode off -- and, because `_manning`
+        would otherwise be left holding whatever spatially-varying mu(T) the
+        last lava run computed, this explicitly refills it back to the plain
+        constant so a world with lava removed behaves exactly like one that
+        never had any, rather than keeping stale per-cell friction forever.
+        """
+        was_enabled = self._lava_enabled
+        self._vent_count = len(vents)
+        self._lava_enabled = bool(vents)
+        if vents:
+            self._vent_centres = wp.array(
+                np.array([item[0] for item in vents], dtype=np.float32),
+                dtype=wp.vec3, device=self.device)
+            self._vent_radii = wp.array(
+                np.array([item[1] for item in vents], dtype=np.float32),
+                dtype=float, device=self.device)
+            self._vent_discharges = wp.array(
+                np.array([item[2] for item in vents], dtype=np.float32),
+                dtype=float, device=self.device)
+            self._vent_temps = wp.array(
+                np.array([float(item[3]) + 273.15 for item in vents], dtype=np.float32),
+                dtype=float, device=self.device)
+        elif was_enabled and self._manning is not None:
+            self._manning.assign(
+                np.full(self._count, config.FLUID_MANNING_N, dtype=np.float32))
+
     def set_erosion(self, enabled: bool) -> None:
         """RiverLab erosion on/off, read live each tick by SimulationManager.
 
@@ -1468,6 +1809,11 @@ class WarpShallowWaterSolver(FluidSolver):
                               self._inlet_q, self._width,
                               float(self._terrain.cell_size),
                               self._diag_stats], device=self.device)
+        if self._lava_enabled:
+            wp.launch(_reduce_lava_diagnostics, dim=self._count,
+                      inputs=[self._temperature, self._h, self._obstacles,
+                              config.FLUID_DRY_DEPTH, self._diag_stats],
+                      device=self.device)
         stats = self._diag_stats.numpy()          # the frame's one device sync
         max_wave = float(stats[2])
         cfl_dt = (config.FIXED_DT if max_wave <= 1.0e-8 else
@@ -1479,6 +1825,7 @@ class WarpShallowWaterSolver(FluidSolver):
             "max_velocity": float(stats[1]),
             "wet_cells": int(stats[4]),
             "volume_m3": float(stats[3]),
+            "lava_temp_max_c": (float(stats[6]) - 273.15) if self._lava_enabled else None,
         })
 
     def advance(self, global_dt: float, max_substeps: int, stability_dt: float) -> int:
@@ -1500,11 +1847,23 @@ class WarpShallowWaterSolver(FluidSolver):
         gravity = float(self._world.environment.gravity)
         area = float(self._terrain.cell_size ** 2)
         for _ in range(substeps):
+            if self._lava_enabled:
+                # mu(T) from the PREVIOUS substep's temperature, written into the
+                # same array `_velocity_step` already reads -- so the array swap
+                # this replaced (a scalar `config.FLUID_MANNING_N`) costs nothing
+                # extra on the non-lava path, which never launches this kernel.
+                wp.launch(_lava_manning, dim=self._count,
+                          inputs=[self._temperature, self._h, self._obstacles,
+                                  self._manning, config.LAVA_MANNING_MIN,
+                                  config.LAVA_MANNING_MAX,
+                                  config.LAVA_SOLIDUS_TEMP_C + 273.15,
+                                  config.LAVA_ERUPTION_TEMP_C + 273.15,
+                                  config.FLUID_DRY_DEPTH], device=self.device)
             wp.launch(_velocity_step, dim=self._count, inputs=[self._h, self._u,
                       self._v, self._bed, self._obstacles, self._next_u,
                       self._next_v, self._inlet_q, self._width, self._height,
                       float(self._terrain.cell_size), dt, gravity,
-                      config.FLUID_DRY_DEPTH, config.FLUID_MANNING_N,
+                      config.FLUID_DRY_DEPTH, self._manning,
                       config.FLUID_FRICTION_MIN_DEPTH,
                       config.FLUID_MAX_VELOCITY, self._outflow_columns,
                       self._outflow_rows[0], self._outflow_rows[1]],
@@ -1517,6 +1876,22 @@ class WarpShallowWaterSolver(FluidSolver):
                       self._width, self._height, float(self._terrain.cell_size), dt],
                       device=self.device)
             self._h, self._next_h = self._next_h, self._h
+            if self._lava_enabled:
+                # Right after the swap, `_next_h` is exactly the pre-depth-step
+                # depth `_depth_step` computed its faces from, and `_h` is what
+                # it produced -- the two ends of the same flux this substep
+                # already moved. See `_advect_lava_energy` for why this replaces
+                # a back-trace of the sediment kernel's kind at a wetting front.
+                wp.launch(_advect_lava_energy, dim=self._count,
+                          inputs=[self._next_h, self._h, self._temperature,
+                                  self._next_temperature, self._u, self._v,
+                                  self._bed, self._obstacles, self._width,
+                                  self._height, float(self._terrain.cell_size), dt,
+                                  config.FLUID_DRY_DEPTH,
+                                  config.LAVA_AMBIENT_TEMP_C + 273.15],
+                          device=self.device)
+                self._temperature, self._next_temperature = (
+                    self._next_temperature, self._temperature)
             if self._inlet_enabled:
                 # A local discharge inlet is the river's own boundary and takes
                 # over from the edge-level source, for the same reason a placed
@@ -1549,6 +1924,17 @@ class WarpShallowWaterSolver(FluidSolver):
                                   float(self._terrain.cell_size), area,
                                   self._diag_added],
                           device=self.device)
+            if self._vent_count:
+                wp.launch(_apply_lava_vents, dim=self._count,
+                          inputs=[self._h, self._u, self._v, self._temperature,
+                                  self._obstacles, self._vent_centres,
+                                  self._vent_radii, self._vent_discharges,
+                                  self._vent_temps, self._vent_count,
+                                  self._width, self._height,
+                                  float(self._terrain.cell_size), dt,
+                                  config.FLUID_DRY_DEPTH,
+                                  config.FLUID_MAX_VELOCITY, area,
+                                  self._diag_added], device=self.device)
             if self._drain_count:
                 self._drain_circulation.zero_()
                 self._drain_samples.zero_()
@@ -1607,6 +1993,27 @@ class WarpShallowWaterSolver(FluidSolver):
                                   config.FLUID_DRY_DEPTH], device=self.device)
                 self._sediment, self._next_sediment = self._next_sediment, self._sediment
                 self._recombine_bed()
+            if self._lava_enabled:
+                # Transport already ran right after `_depth_step` (see
+                # `_advect_lava_energy`); here: cool, then freeze -- checked
+                # against the solidus only after this substep's heat loss.
+                k0 = (config.LAVA_EMISSIVITY * config.LAVA_COOLING_ENHANCEMENT
+                      * _LAVA_SIGMA / (_LAVA_RHO * _LAVA_CP))
+                wp.launch(_cool_lava, dim=self._count,
+                          inputs=[self._temperature, self._next_temperature,
+                                  self._h, self._obstacles, dt, k0,
+                                  config.LAVA_AMBIENT_TEMP_C + 273.15,
+                                  config.LAVA_COOLING_MIN_DEPTH,
+                                  config.FLUID_DRY_DEPTH], device=self.device)
+                self._temperature, self._next_temperature = (
+                    self._next_temperature, self._temperature)
+                wp.launch(_solidify_lava, dim=self._count,
+                          inputs=[self._h, self._temperature, self._bed_terrain,
+                                  self._obstacles,
+                                  config.LAVA_SOLIDUS_TEMP_C + 273.15,
+                                  config.FLUID_DRY_DEPTH, area,
+                                  self._diag_solidified], device=self.device)
+                self._recombine_bed()
             wp.launch(_advect_flow_tracers, dim=config.FLOW_TRACER_COUNT,
                       inputs=[self._flow_particles, self._h, self._u, self._v,
                               self._bed, self._obstacles, self._width, self._height,
@@ -1636,6 +2043,13 @@ class WarpShallowWaterSolver(FluidSolver):
         self._diag_added.zero_()
         self._diag_removed.zero_()
         self._diag_sediment_out.zero_()
+        if self._diag_solidified is not None:
+            # Solidified lava leaves the fluid domain the same way outflow or a
+            # drain does, so it belongs in the same ledger the volume-error
+            # check reads -- otherwise a working solidification step would show
+            # up as an unexplained conservation error, not as a feature.
+            self._solidified_m3 += float(self._diag_solidified.numpy()[0])
+            self._diag_solidified.zero_()
 
     def _host_fields(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self._h is None:
@@ -1761,9 +2175,17 @@ class WarpShallowWaterSolver(FluidSolver):
                 # conservation error and should stay at numerical noise.
                 "added_m3": self._added_m3,
                 "removed_m3": self._removed_m3,
+                # Solidified lava leaves `h` exactly like outflow or a drain
+                # does, so it is added on the same side of the equation as
+                # `removed_m3` -- otherwise a correctly working solidification
+                # step reads as a conservation bug rather than as a feature.
                 "volume_error_m3": (self._diag["volume_m3"] - self._volume_at_start
-                                    - self._added_m3 + self._removed_m3),
+                                    - self._added_m3 + self._removed_m3
+                                    + self._solidified_m3),
                 "sediment_out_m3": self._sediment_out_m3,
+                "lava_enabled": self._lava_enabled,
+                "vents": self._vent_count,
+                "solidified_m3": self._solidified_m3,
                 "inlet_enabled": self._inlet_enabled,
                 "inlet_request_m3s": self._inlet_request["discharge_m3s"],
                 "outflow_rows": list(self._outflow_rows),

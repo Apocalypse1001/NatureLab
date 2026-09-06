@@ -50,6 +50,7 @@ class ObjectType(str, enum.Enum):
     SOURCE = "SOURCE"
     DRAIN = "DRAIN"
     GAUGE = "GAUGE"
+    VENT = "VENT"
 
     @classmethod
     def register(cls, name: str) -> "ObjectType":
@@ -164,6 +165,24 @@ OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
                        "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
                        "is_static": True,
                        "foundation_height": 0.0, "damage_resistance": 1.0},
+    # VolcanoLab (v0.13.0). Placeable vent: a PRESCRIBED-DISCHARGE point source,
+    # not a level-held one like SOURCE -- deliberately. A level-held vent would
+    # compute `target = level - bed`, and solidified lava piling up around the
+    # vent raises `bed`, which would starve the vent of its own eruption and
+    # eventually stop it delivering anything at all -- the vent burying itself.
+    # A prescribed Q cannot be starved that way (see fluid_solver._apply_lava_vents).
+    # Every vent writes h AND temperature every tick it is active: a vent that
+    # only wrote h would erupt lava at ambient temperature forever, reproducing
+    # the exact "source never writes what it should" bug measured in v0.11.0
+    # (the 0.3989 datum, docs/07_river_plan.md).
+    ObjectType.VENT: {"mass": 1.0, "friction": 0.0, "buoyancy": 0.0,
+                      "volume_m3": 1.0, "drag_coefficient": 1.0,
+                      "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
+                      "is_static": True,
+                      "vent_radius": config.LAVA_VENT_RADIUS_M,
+                      "vent_discharge_m3s": config.LAVA_VENT_DISCHARGE_M3S,
+                      "vent_temperature_c": config.LAVA_ERUPTION_TEMP_C,
+                      "foundation_height": 0.0, "damage_resistance": 1.0},
 }
 
 
@@ -185,6 +204,7 @@ def default_properties(obj_type: str) -> Dict[str, float]:
             "inflow_level": 0.0, "inflow_radius": 0.0,
             "pier_count": 0.0, "pier_radius": 0.0, "deck_height": 0.0,
             "drain_radius": 0.0, "drain_strength": 0.0,
+            "vent_radius": 0.0, "vent_discharge_m3s": 0.0, "vent_temperature_c": 0.0,
             "foundation_height": 0.0, "damage_resistance": 0.5}
     base.update(OBJECT_DEFAULTS.get(ObjectType.register(obj_type), {}))
     return base

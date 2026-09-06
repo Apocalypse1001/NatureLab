@@ -18,7 +18,7 @@ from .events import EventLog, EventType
 from .fluid_solver import SOLID_OBSTACLE_TYPES, FluidSolver, create_fluid_solver
 from .persistence import load_world, save_world
 from .rigid_body import PlaceholderRigidBodySystem, RigidBodySystem
-from .terrain_gen import river_valley
+from .terrain_gen import river_valley, volcano_cone
 from .world_state import WorldState, finite_number, vector3
 
 SendText = Callable[[str], Coroutine[None, None, None]]
@@ -110,6 +110,18 @@ class SimulationManager:
                  float(obj.metadata.get("drain_radius", 0.0)) * float(obj.scale[0]),
                  float(obj.metadata.get("drain_strength", 0.0)))
                 for obj in self.world.objects.values() if obj.type == "DRAIN"]
+
+    def _vent_snapshot(self) -> list:
+        """(centre, radius, discharge_m3s, temperature_c) for every VENT.
+
+        Its presence in this list is the only lava toggle there is -- see
+        `WarpShallowWaterSolver.set_lava_vents`.
+        """
+        return [(list(obj.position),
+                 float(obj.metadata.get("vent_radius", 0.0)) * float(obj.scale[0]),
+                 float(obj.metadata.get("vent_discharge_m3s", 0.0)),
+                 float(obj.metadata.get("vent_temperature_c", 0.0)))
+                for obj in self.world.objects.values() if obj.type == "VENT"]
 
     def apply_water_outflow(self, enabled: bool) -> None:
         """Open/close the downstream map edge. Read live each tick."""
@@ -276,6 +288,16 @@ class SimulationManager:
                 "checksum": self.world.terrain.checksum(),
                 "river": effective}
 
+    def apply_terrain_volcano(self, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        """Replace the terrain with a generated volcano cone (v0.13.0)."""
+        if self.status == self.RUNNING:
+            raise ValueError("terrain editing is disabled while simulation is RUNNING")
+        effective = volcano_cone(self.world.terrain, params)
+        self.terrain_revision += 1
+        return {"heights": self.world.terrain.to_list(),
+                "checksum": self.world.terrain.checksum(),
+                "volcano": effective}
+
     def apply_water_level(self, level: float) -> None:
         self.world.water.level = finite_number(level, "water.level")
         if hasattr(self.fluid, "set_level"):
@@ -394,6 +416,8 @@ class SimulationManager:
             # at once -- the reason they are objects and not settings.
             self.fluid.set_water_features(self._source_snapshot(),
                                           self._drain_snapshot())
+        if hasattr(self.fluid, "set_lava_vents"):
+            self.fluid.set_lava_vents(self._vent_snapshot())
         if self._obstacle_snapshot is None:
             self._obstacle_snapshot = self.rigid.obstacle_snapshot()
         self.fluid.set_boundaries(self.world.terrain, self._obstacle_snapshot,
@@ -553,7 +577,14 @@ class SimulationManager:
             # principle in docs/04_TZ_v0.3_roadmap.md). Reuses the terrain_patch
             # message the frontend already applies, throttled because it is JSON
             # on the text channel plus a full device-to-host readback.
-            if (self.status == self.RUNNING and self.world.water.erosion_enabled
+            # v0.13.0: solidified lava mutates `bed_terrain` on the GPU exactly
+            # like erosion does, so this gate widens to match -- otherwise a
+            # lava flow that freezes into a levee is physically real on the
+            # backend and never seen on screen, the same bug class this project
+            # already caught twice (with water itself, and again with erosion).
+            lava_active = bool(getattr(self.fluid, "_lava_enabled", False))
+            if (self.status == self.RUNNING
+                    and (self.world.water.erosion_enabled or lava_active)
                     and hasattr(self.fluid, "get_terrain_heights")
                     and self.sim_time - self._last_terrain_resync
                     >= config.TERRAIN_RESYNC_INTERVAL_S):

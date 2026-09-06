@@ -263,3 +263,89 @@ def dam_ridge(terrain, river_params: Dict[str, Any] | None = None,
     effective["channel_bed_at_dam"] = float(channel_bed_at_dam)
     effective["reservoir_volume_m3"] = volume
     return effective
+
+
+# -------------------------------------------------------------------- volcano
+
+# v0.13.0, item 7 of docs/08_volcano_plan.md. `peak_height`/`base_radius` are
+# chosen so the flank's steepest gradient lands inside the slope range
+# `docs/probe_lava_v013.py` actually measured (10-20%), not for visual drama --
+# a taller cone is future work once a steeper flank has been measured to still
+# freeze in a visible window, the same caution `river_valley`'s own default
+# slope already documents for the same reason.
+#
+# No separate flat crater platform: an earlier version blended a flat summit
+# disc into the cone with the same smoothstep-notch technique `dam_ridge` uses
+# for its spillway, and measured out to be an actual bug rather than a
+# realistic crater rim -- the blend overshoots between the flat plateau and a
+# cone that is ITSELF nearly flat near its own apex (a smoothstep has zero
+# gradient at r=0), producing a real ring-shaped dam around the vent. A Q-vent
+# then has to fill that bowl before anything can descend the flank, and fast
+# cooling froze the bowl's rim faster than eruption could fill it: 20 m3/s for
+# 30 s reached 15.6 m deep and 0.10 m/s -- a lake, not a flow, never leaving
+# the summit. The cone's own smoothstep already gives a vent placed at r=0 a
+# gentle-enough platform (zero gradient right at the apex) without adding a
+# second shape on top of it.
+VOLCANO_DEFAULTS: Dict[str, float] = {
+    "centre_x": 0.0,
+    "centre_z": 0.0,
+    "peak_height": 9.0,         # summit above the surrounding plain (m)
+    "base_radius": 70.0,        # where the flank blends back into flat ground (m)
+    "base_elevation": 0.0,      # plain elevation away from the cone (m)
+}
+
+_VOLCANO_LIMITS: Dict[str, tuple] = {
+    "centre_x": (-config.WORLD_SIZE_M * 0.5, config.WORLD_SIZE_M * 0.5),
+    "centre_z": (-config.WORLD_SIZE_M * 0.5, config.WORLD_SIZE_M * 0.5),
+    "peak_height": (1.0, 40.0),
+    "base_radius": (10.0, config.WORLD_SIZE_M * 0.5),
+    "base_elevation": (config.HEIGHT_MIN + 1.0, config.HEIGHT_MAX - 20.0),
+}
+
+
+def validate_volcano(params: Dict[str, Any] | None) -> Dict[str, float]:
+    out = dict(VOLCANO_DEFAULTS)
+    for key, value in (params or {}).items():
+        if key not in VOLCANO_DEFAULTS:
+            raise ValueError(f"unknown volcano parameter: {key!r}")
+        number = float(value)
+        if not np.isfinite(number):
+            raise ValueError(f"volcano.{key} must be finite")
+        low, high = _VOLCANO_LIMITS[key]
+        if not low <= number <= high:
+            raise ValueError(f"volcano.{key} out of range [{low}, {high}]: {number}")
+        out[key] = number
+    return out
+
+
+def volcano_cone(terrain, params: Dict[str, Any] | None = None) -> Dict[str, float]:
+    """Write a volcano cone into `terrain.heights` in place.
+
+    A single smoothstepped radial profile: zero gradient at the apex (r=0)
+    AND where the flank meets the plain (r=base_radius), so there is no
+    slope-discontinuity anywhere for a lava front to stand a wave on -- the
+    same reasoning as the river's smoothstepped banks. Deliberately one shape,
+    not two blended together -- see the module comment above for the bug that
+    came from doing that.
+
+    Returns the effective parameters plus `vent_position`, where a VENT should
+    be placed to sit on the (already gentle) summit.
+    """
+    p = validate_volcano(params)
+    rows, cols = terrain.heights.shape
+    cell = terrain.cell_size
+
+    x = (np.arange(cols, dtype=np.float64) - (cols - 1) * 0.5) * cell
+    z = (np.arange(rows, dtype=np.float64) - (rows - 1) * 0.5) * cell
+    r = np.sqrt((x[None, :] - p["centre_x"]) ** 2 + (z[:, None] - p["centre_z"]) ** 2)
+
+    rn = np.clip(r / p["base_radius"], 0.0, 1.0)
+    shape = 1.0 - rn * rn * (3.0 - 2.0 * rn)          # 1 at the apex, 0 at base_radius
+    heights = p["base_elevation"] + p["peak_height"] * shape
+
+    terrain.heights[:, :] = np.clip(heights, config.HEIGHT_MIN,
+                                    config.HEIGHT_MAX).astype(np.float32)
+
+    p = dict(p)
+    p["vent_position"] = [p["centre_x"], 0.0, p["centre_z"]]
+    return p

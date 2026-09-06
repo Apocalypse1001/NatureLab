@@ -18,7 +18,8 @@ from app.simulation import SimulationManager  # noqa: E402
 from app.world_state import WorldState  # noqa: E402
 from app.compute_engine import create_engine  # noqa: E402
 from app.fluid_solver import create_fluid_solver  # noqa: E402
-from app.terrain_gen import dam_ridge, river_valley  # noqa: E402
+from app.terrain_gen import dam_ridge, river_valley, volcano_cone  # noqa: E402
+from app.world_state import default_properties  # noqa: E402
 
 # Grid geometry is derived, never hard-coded: these tests used to spell out
 # "101" and column literals like [col(0.0), 8], which silently became wrong the first
@@ -2096,6 +2097,169 @@ class DamAndScenarioTests(unittest.IsolatedAsyncioTestCase):
                              f"{road.id} was rasterized into the solid mask")
             self.assertAlmostEqual(float(fluid._bed_offset_host[index]), 0.0, places=6,
                                    msg=f"{road.id} raised the bed under itself")
+
+
+class VolcanoLabTests(unittest.IsolatedAsyncioTestCase):
+    """v0.13.0: temperature, mu(T), solidification, the vent, and the cone.
+
+    Isolates the same way FrictionLawTests does: flat terrain, uniform
+    starting fields, no vent -- so the only thing driving a difference between
+    two runs is the one mechanism under test.
+    """
+
+    @staticmethod
+    def _flat_solver(slope: float = 0.0) -> tuple:
+        world = WorldState()
+        world.water.level = 0.0
+        if slope:
+            fall = np.arange(N, dtype=np.float32) * config.TERRAIN_CELL_SIZE * slope
+            world.terrain.heights[:, :] = (fall[-1] - fall)[None, :]
+        solver = create_fluid_solver(create_engine().device)
+        solver.initialize(world)
+        solver._source_enabled = False
+        solver.set_boundaries(world.terrain, {}, 0, 0)
+        return world, solver
+
+    async def test_lava_is_off_by_default_and_friction_is_the_plain_constant(self) -> None:
+        _, solver = self._flat_solver()
+        self.assertFalse(solver.diagnostics()["lava_enabled"])
+        manning = np.asarray(solver._manning.numpy())
+        self.assertTrue(np.all(manning == config.FLUID_MANNING_N))
+
+    async def test_a_vent_writes_temperature_not_just_depth(self) -> None:
+        """Trap 1 from docs/08_volcano_plan.md: a source that fills `h` and
+        never writes what it should reproduces the 0.3989 bug from v0.11.0 --
+        a boundary that looks like it is erupting while the fluid stays cold."""
+        _, solver = self._flat_solver()
+        solver.set_lava_vents([([0.0, 0.0, 0.0], 3.0, 20.0, config.LAVA_ERUPTION_TEMP_C)])
+        for _ in range(120):
+            solver.advance(1.0 / 60.0, 8, 1.0 / 120.0)
+        centre = N // 2
+        T = np.asarray(solver._temperature.numpy()).reshape(N, N) - 273.15
+        h = np.asarray(solver._h.numpy()).reshape(N, N)
+        self.assertGreater(h[centre, centre], 0.0, "the vent did not fill its own disc")
+        self.assertGreater(T[centre, centre], config.LAVA_ERUPTION_TEMP_C - 5.0,
+                           "the vent erupted lava that was not actually hot")
+
+    def _cool(self, depth: float, seconds: float = 5.0) -> float:
+        """Mean temperature left after `seconds` of pure radiative cooling.
+
+        No vent, no slope, uniform starting depth and temperature: with no
+        surface gradient and no discharge, nothing moves, so cooling is
+        isolated from transport and friction exactly the way FrictionLawTests
+        isolates friction from gravity.
+        """
+        _, solver = self._flat_solver()
+        solver._lava_enabled = True   # no vent needed to exercise cooling itself
+        solver._h.assign(np.full(solver._count, depth, dtype=np.float32))
+        solver._temperature.assign(np.full(
+            solver._count, config.LAVA_ERUPTION_TEMP_C + 273.15, dtype=np.float32))
+        for _ in range(int(seconds * 60)):
+            solver.advance(1.0 / 60.0, 8, 1.0 / 120.0)
+        return float(np.asarray(solver._temperature.numpy()).mean()) - 273.15
+
+    async def test_a_thin_lava_sheet_cools_faster_than_a_thick_one(self) -> None:
+        """Same causal principle bed friction already reads depth for: the
+        same radiating surface serves less mass underneath it when the sheet
+        is thin, so it cools faster -- docs/08_volcano_plan.md item 3."""
+        thick = self._cool(1.0)
+        thin = self._cool(0.2)
+        self.assertLess(thin, thick,
+                        f"thin sheet ({thin:.1f}C) did not cool faster than "
+                        f"thick ({thick:.1f}C)")
+
+    async def test_below_the_solidus_lava_becomes_ground_and_the_ledger_records_it(self) -> None:
+        """Item 5, literal: `bed += h; h = 0`, and the volume it removes from
+        the fluid must be accounted for rather than read as a leak."""
+        _, solver = self._flat_solver()
+        solver._lava_enabled = True
+        depth = 0.3
+        solver._h.assign(np.full(solver._count, depth, dtype=np.float32))
+        solver._temperature.assign(np.full(
+            solver._count, config.LAVA_SOLIDUS_TEMP_C + 273.15 - 1.0, dtype=np.float32))
+        bed_before = np.asarray(solver._bed_terrain.numpy(), dtype=np.float32).reshape(N, N).copy()
+        solver.advance(1.0 / 60.0, 1, 1.0 / 120.0)
+        bed_after = np.asarray(solver._bed_terrain.numpy(), dtype=np.float32).reshape(N, N)
+        h_after = np.asarray(solver._h.numpy(), dtype=np.float32).reshape(N, N)
+        interior = slice(4, N - 4)
+        self.assertTrue(np.allclose((bed_after - bed_before)[interior, interior],
+                                    depth, atol=1.0e-4),
+                        "the frozen depth was not moved into the bed 1-for-1")
+        self.assertLess(float(h_after[interior, interior].max()), 1.0e-6,
+                        "solidified lava was still reported as fluid")
+        self.assertGreater(solver.diagnostics()["solidified_m3"], 0.0,
+                           "the volume ledger did not record where the lava went")
+
+    def _terminal_speed(self, temp_c: float, seconds: float = 10.0) -> float:
+        _, solver = self._flat_solver(slope=0.15)
+        solver._lava_enabled = True
+        solver._h.assign(np.full(solver._count, 0.5, dtype=np.float32))
+        solver._temperature.assign(np.full(
+            solver._count, temp_c + 273.15, dtype=np.float32))
+        for _ in range(int(seconds * 60)):
+            solver.advance(1.0 / 60.0, 8, 1.0 / 120.0)
+        u = np.asarray(solver._u.numpy(), dtype=np.float32).reshape(N, N)
+        return float(np.abs(u[N // 4:3 * N // 4, N // 4:3 * N // 4]).mean())
+
+    async def test_friction_reads_temperature_hot_flows_cold_almost_stops(self) -> None:
+        """mu(T) mapped onto Manning (item 4): fluid at eruption temperature,
+        almost stopped near the solidus -- the same slope, only T differs.
+        `cold` is kept just above the solidus so this measures friction, not
+        item 5's solidification."""
+        hot = self._terminal_speed(config.LAVA_ERUPTION_TEMP_C)
+        cold = self._terminal_speed(config.LAVA_SOLIDUS_TEMP_C + 20.0)
+        self.assertGreater(hot, cold * 3.0,
+                           f"hot ({hot:.2f} m/s) was not clearly faster than "
+                           f"near-solidus ({cold:.2f} m/s)")
+
+    async def test_vent_object_defaults_come_from_config(self) -> None:
+        props = default_properties("VENT")
+        self.assertEqual(props["vent_radius"], config.LAVA_VENT_RADIUS_M)
+        self.assertEqual(props["vent_discharge_m3s"], config.LAVA_VENT_DISCHARGE_M3S)
+        self.assertEqual(props["vent_temperature_c"], config.LAVA_ERUPTION_TEMP_C)
+
+    async def test_volcano_cone_falls_monotonically_from_the_apex(self) -> None:
+        """Regression for a real bug this version measured: an earlier cone
+        blended a flat crater platform into the flank and overshot, building a
+        RING-shaped rim around the vent. A Q-prescribed vent had to fill that
+        bowl before anything could reach the flank, and the rim froze faster
+        than the bowl could fill -- a lake that never became a flow. One
+        smoothstepped shape, checked here to never rise again once it falls."""
+        world = WorldState()
+        volcano_cone(world.terrain, {"peak_height": 9.0, "base_radius": 70.0})
+        centre = N // 2
+        profile = world.terrain.heights[centre, centre:].astype(np.float64)
+        self.assertLessEqual(float(np.diff(profile).max()), 1.0e-6,
+                             "the cone rose again somewhere past the apex")
+        self.assertAlmostEqual(float(profile[0]), 9.0, places=3)
+
+    async def test_a_vent_produces_a_flowing_front_not_a_self_dammed_pool(self) -> None:
+        """End-to-end regression for two measured failures on the way here: the
+        crater-rim bug above, and a wetting-front bug where `_advect_sediment`'s
+        back-trace read every newly-wetted cell as ambient (a dry cell's own
+        velocity is zero, so the back-trace samples itself) and froze the first
+        trickle to reach it on contact. Both looked identical from outside: the
+        front stopped a few metres from the vent and the pool just deepened
+        (measured before the fix: 20 m3/s for 30 s reached 15.6 m deep and
+        0.10 m/s). This is the number that must not regress back to that.
+        """
+        manager = SimulationManager()
+        info = manager.apply_terrain_volcano({"peak_height": 9.0, "base_radius": 70.0})
+        manager.apply_water_level(0.0)
+        manager.apply_object_add({"type": "VENT", "position": info["volcano"]["vent_position"]})
+        manager.start()
+        for _ in range(3600):        # 60 simulated seconds
+            manager._step_once()
+        centre = N // 2
+        h_row = np.asarray(manager.fluid._h.numpy(), dtype=np.float32).reshape(N, N)[centre]
+        wet = np.flatnonzero(h_row > config.FLUID_DRY_DEPTH)
+        front_m = ((int(wet.max()) - centre) * config.TERRAIN_CELL_SIZE) if len(wet) else 0.0
+        diag = manager.fluid.diagnostics()
+        manager.stop()
+        self.assertGreater(front_m, 15.0,
+                           f"the flow front only reached {front_m:.1f} m from the vent")
+        self.assertGreater(diag["max_velocity"], 0.3,
+                           "the flow is pooling at the vent rather than moving")
 
 
 if __name__ == "__main__":

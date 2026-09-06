@@ -128,3 +128,62 @@ DRAIN_SWIRL_GAIN = 0.35      # how strongly measured circulation is fed back as 
 
 BED_DOME_EXPONENT = 0.5      # 0.5 = hemispherical profile; 1.0 would be a cone
 BED_EROSION_SHIELD = 0.05    # bed offset (m) above which the terrain under a rock is unerodible
+
+# --------------------------------------------------------------- VolcanoLab (v0.13.0)
+# Bulk (single-T-through-depth) lava model on the same Warp SWE solver as water:
+# causal, not engineering-grade -- see docs/08_volcano_plan.md for the honest
+# limitation this implies (no insulating crust). `docs/probe_lava_v013.py`
+# (2026-09-06) measured a starting bracket against a CONSTANT friction on a
+# planar slope; these values are the RE-measurement against the actual kernels
+# (mu(T), the real vent, the real cone) that the plan and that probe's own
+# docstring both said would be needed before taking anything as final -- see
+# the plan doc's second "Замер" section. The two measurements disagree by
+# more than an order of magnitude on the cooling knob (see below), which is
+# itself the headline finding: a constant-friction probe cannot stand in for
+# the coupled mu(T) system, because radial spreading from a point vent thins
+# the flow, and thus cools it, far faster than the planar probe's geometry did.
+LAVA_ERUPTION_TEMP_C = 1150.0
+LAVA_SOLIDUS_TEMP_C = 980.0
+LAVA_AMBIENT_TEMP_C = 20.0
+LAVA_EMISSIVITY = 0.9            # physical blackbody value, bounded 0-1
+# Stand-in for everything a single-layer bulk model cannot represent directly --
+# crust insulation breaking down under motion, heat lost to the ground -- rather
+# than one physical number for each. Measured against the real vent + mu(T) +
+# generated cone (not the constant-friction planar probe, see above) to need
+# roughly 10x the pure-blackbody cooling rate of a well-mixed slab to land the
+# solidification front at 45-52 m across a base_radius 55-80 m / peak_height
+# 6-13 m range of cones and a 20-35 m3/s range of vent discharge -- comfortably
+# inside the 40-150 m target and not sharply sensitive to either. Named for
+# what it is (an unresolved lump), not dressed up as a second material
+# constant with a precision it doesn't have.
+LAVA_COOLING_ENHANCEMENT = 10.0
+# Depth floor for the cooling law (dT/dt = -(k0/h)*T^4): a physics knob exactly
+# like FLUID_FRICTION_MIN_DEPTH, not a divide-by-zero guard. It alone decides
+# how much faster the thin leading edge of a flow freezes than its thick
+# interior -- which is the entire visible "cooled -> slowed -> stopped" effect,
+# so treat a change here as a physics decision, never as a numerical tweak.
+# Raised from an initial 0.05 after measurement: at the dry-depth floor a
+# genuinely near-zero h drove the cooling law to an unbounded rate regardless
+# of `LAVA_COOLING_ENHANCEMENT`, freezing the very first trickle to cross any
+# cell before it could thicken into a real flow -- see the plan doc's
+# discussion of the wetting-front bug this measurement run also found.
+LAVA_COOLING_MIN_DEPTH = 0.15    # m
+# mu(T) is not modelled directly; instead it is mapped onto the existing
+# Manning-friction slot linearly between these two points (fluid at eruption
+# temperature, almost stopped at the solidus) -- see `_lava_manning`. Held
+# fixed while LAVA_COOLING_ENHANCEMENT was calibrated above; not itself
+# re-swept, so treat this pair as plausible rather than optimized.
+LAVA_MANNING_MIN = 0.05          # s/m^(1/3) at eruption temperature
+LAVA_MANNING_MAX = 1.0           # s/m^(1/3) at the solidus
+# A VENT's own per-object radius/discharge/temperature (see world_state.py)
+# default here so a freshly placed vent already sits in the measured window
+# rather than at an arbitrary zero.
+LAVA_VENT_RADIUS_M = 3.0
+LAVA_VENT_DISCHARGE_M3S = 20.0
+# No LAVA_MAX_BED_CHANGE-style clamp on solidification: item 5 of the plan is
+# literal (`bed += h; h = 0`, unconditional, the instant T crosses the solidus).
+# v0.11.0's lesson about SEDIMENT_MAX_BED_CHANGE was that shipping a limiter
+# before measuring what it actually binds against gets read back as physics.
+# `solidified_m3` and the per-frame max bed step are instrumented instead
+# (fluid_solver.diagnostics()); if that measurement ever shows a shock to the
+# surface-gradient term, a limiter gets added on the strength of that number.
