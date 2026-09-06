@@ -12,12 +12,14 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
+import numpy as np
+
 from . import config, protocol
 from .compute_engine import ComputeEngine, create_engine
 from .events import EventLog, EventType
 from .fluid_solver import SOLID_OBSTACLE_TYPES, FluidSolver, create_fluid_solver
 from .persistence import load_world, save_world
-from .rigid_body import PlaceholderRigidBodySystem, RigidBodySystem
+from .rigid_body import PlaceholderRigidBodySystem, RigidBodySystem, footprint_half_extents
 from .terrain_gen import river_valley, volcano_cone
 from .world_state import WorldState, finite_number, vector3
 
@@ -61,6 +63,10 @@ class SimulationManager:
         self._obstacle_snapshot: Optional[dict] = None
         self._last_terrain_resync = 0.0
         self._flooded_decks: set = set()
+        # VolcanoLab v0.14.0: which combustion stage has already been
+        # reported per object, so OBJECT_DAMAGED/OBJECT_BROKEN fire once each
+        # -- same role _flooded_decks plays for BRIDGE_DECK_FLOODED.
+        self._combustion_emitted: Dict[str, str] = {}
         self._velocity_frame = 0
         self._gauges: Dict[str, GaugeRuntime] = {}
         self.selftest_result: Dict[str, Any] = {}
@@ -320,6 +326,7 @@ class SimulationManager:
         self.fluid.initialize(self.world)
         self.rigid.initialize(self.world, self.fluid, self.events)
         self._reset_gauges()
+        self._reset_combustion()
         self._obstacle_snapshot = self.rigid.obstacle_snapshot()
         self.fluid.set_boundaries(self.world.terrain, self._obstacle_snapshot,
                                   self.terrain_revision, self.obstacle_revision)
@@ -348,6 +355,7 @@ class SimulationManager:
         self.fluid.initialize(self.world)
         self.rigid.initialize(self.world, self.fluid, self.events)
         self._reset_gauges()
+        self._reset_combustion()
         self._obstacle_snapshot = self.rigid.obstacle_snapshot()
         self.fluid.set_boundaries(self.world.terrain, self._obstacle_snapshot,
                                   self.terrain_revision, self.obstacle_revision)
@@ -380,6 +388,7 @@ class SimulationManager:
         self.fluid.initialize(self.world)
         self.rigid.initialize(self.world, self.fluid, self.events)
         self._reset_gauges()
+        self._reset_combustion()
         self.terrain_revision += 1
         self.obstacle_revision += 1
         self._obstacle_snapshot = self.rigid.obstacle_snapshot()
@@ -432,6 +441,7 @@ class SimulationManager:
         self.sim_time += dt
         self._update_gauges(self.sim_time)
         self._check_bridge_decks(self.sim_time)
+        self._check_lava_ignition(dt, self.sim_time)
         self._steps_in_window += 1
 
     def _check_bridge_decks(self, sample_time: float) -> None:
@@ -461,6 +471,103 @@ class SimulationManager:
                                    object_id=oid, cause="water_reached_deck",
                                    deck_height_m=round(deck, 3),
                                    water_surface_m=round(surface, 3))
+
+    # A house 2 m from 1100 C lava would burn in reality without touching it,
+    # but modelling that means inventing a radiative heat-transfer term this
+    # project has no measurement to calibrate -- so contact is the whole rule,
+    # the same honesty docs/08_volcano_plan.md already applied to the cooling
+    # law's own well-mixed-column simplification. See config.py's
+    # LAVA_DAMAGE_RATE_PER_S comment for why.
+    BURNABLE_OBJECT_TYPES = frozenset({"HOUSE", "TREE", "CAR", "PERSON", "BOX", "DEBRIS"})
+
+    def _check_lava_ignition(self, dt: float, sample_time: float) -> None:
+        """Accumulate heat damage on burnable objects standing in molten lava.
+
+        A separate pass from RigidBodySystem.step() on purpose: that class's
+        state machine (STATE_CODES/STATE_NAMES, round-tripped through a GPU
+        buffer in _step_device) is about buoyancy and sliding, and every
+        object it tracks gets its `.state` overwritten from that machine every
+        tick. Running this pass AFTER rigid.step() and re-asserting
+        DAMAGED/BROKEN from `obj.damage` (not only on the tick damage first
+        crosses a threshold) is what keeps a burning object's state from being
+        silently reverted to MOVING/SETTLED the next time rigid_body runs --
+        `obj.damage` is the single source of truth, `obj.state` a derived
+        overlay applied last.
+        """
+        if not hasattr(self.fluid, "sample_lava_contact"):
+            return
+        candidates = [(oid, obj) for oid, obj in self.world.objects.items()
+                     if obj.type in self.BURNABLE_OBJECT_TYPES]
+        if not candidates:
+            return
+        # HOUSE (the only burnable type also in SOLID_OBSTACLE_TYPES) is
+        # rasterized into the fluid's own obstacle mask as an infinitely tall
+        # wall -- so its CENTRE cell can never be wet by construction, lava
+        # flows around it exactly like water already does. Sampling only the
+        # centre would mean a house can never ignite at all. Instead sample a
+        # small ring just past its own footprint (the cells the flow is
+        # actually diverted into) and take whichever point is wettest.
+        margin = config.LAVA_IGNITION_OBSTACLE_MARGIN_M
+        sample_positions: list = []
+        owner: list = []
+        for idx, (oid, obj) in enumerate(candidates):
+            if obj.type in SOLID_OBSTACLE_TYPES:
+                hx, hz = footprint_half_extents(obj)
+                hx, hz = float(hx) + margin, float(hz) + margin
+                for dx, dz in ((hx, 0.0), (-hx, 0.0), (0.0, hz), (0.0, -hz)):
+                    sample_positions.append((obj.position[0] + dx, 0.0, obj.position[2] + dz))
+                    owner.append(idx)
+            else:
+                sample_positions.append(tuple(obj.position))
+                owner.append(idx)
+        positions = np.asarray(sample_positions, dtype=np.float32)
+        depths_raw, temps_raw = self.fluid.sample_lava_contact(positions)
+        owner_idx = np.asarray(owner)
+        # Reduce multi-point candidates (HOUSE's ring) down to one (depth,
+        # temperature) pair each, picking the wettest sample point -- the one
+        # most likely touching lava rather than still-dry ground on the far
+        # side of the footprint.
+        depths = np.zeros(len(candidates), dtype=np.float32)
+        temps_c = np.zeros(len(candidates), dtype=np.float32)
+        for idx in range(len(candidates)):
+            mask = owner_idx == idx
+            local_depths = depths_raw[mask]
+            best = int(np.argmax(local_depths))
+            depths[idx] = local_depths[best]
+            temps_c[idx] = temps_raw[mask][best]
+        # Every burnable object is re-processed every tick, even one already
+        # at LAVA_BROKEN_THRESHOLD with no more damage to add: `obj.state` is
+        # re-asserted from `obj.damage` unconditionally below, which is the
+        # only thing stopping RigidBodySystem.step() -- which runs earlier in
+        # _step_once and knows nothing about combustion -- from silently
+        # reverting a BROKEN house back to SETTLED/MOVING on the very next
+        # tick. Skipping already-maxed objects here would reintroduce exactly
+        # that bug.
+        for (oid, obj), depth, temp_c in zip(candidates, depths, temps_c):
+            in_contact = depth > config.FLUID_DRY_DEPTH and temp_c >= config.LAVA_SOLIDUS_TEMP_C
+            if in_contact and obj.damage < config.LAVA_BROKEN_THRESHOLD:
+                resistance = max(float(obj.metadata.get("damage_resistance", 1.0)), 0.05)
+                obj.damage = min(config.LAVA_BROKEN_THRESHOLD,
+                                 obj.damage + config.LAVA_DAMAGE_RATE_PER_S * dt / resistance)
+            if obj.damage >= config.LAVA_BROKEN_THRESHOLD:
+                obj.state = "BROKEN"
+                if self._combustion_emitted.get(oid) != "BROKEN":
+                    self._combustion_emitted[oid] = "BROKEN"
+                    self.events.record(sample_time, EventType.OBJECT_BROKEN, oid,
+                                       cause="lava_contact",
+                                       damage=round(obj.damage, 3),
+                                       lava_temperature_c=round(float(temp_c), 1))
+            elif obj.damage >= config.LAVA_DAMAGED_THRESHOLD:
+                obj.state = "DAMAGED"
+                if self._combustion_emitted.get(oid) != "DAMAGED":
+                    self._combustion_emitted[oid] = "DAMAGED"
+                    self.events.record(sample_time, EventType.OBJECT_DAMAGED, oid,
+                                       cause="lava_contact",
+                                       damage=round(obj.damage, 3),
+                                       lava_temperature_c=round(float(temp_c), 1))
+
+    def _reset_combustion(self) -> None:
+        self._combustion_emitted = {}
 
     def _reset_gauges(self) -> None:
         self._flooded_decks = set()
@@ -613,7 +720,7 @@ class SimulationManager:
                         }, separators=(",", ":")))
                     except Exception:
                         return
-        moved = [(oid, obj.position, obj.state)
+        moved = [(oid, obj.position, obj.state, obj.damage)
                  for oid, obj in self.world.objects.items()
                  if obj.state != "INTACT"]
         message = {
@@ -628,7 +735,8 @@ class SimulationManager:
             "gauges": self._serialize_gauges(),
             "events": self.events.take_pending(),
             "moved_objects": [{"id": oid, "position": [float(round(p, 3)) for p in pos],
-                                "state": state} for oid, pos, state in moved],
+                                "state": state, "damage": round(float(damage), 3)}
+                               for oid, pos, state, damage in moved],
             "fluid": self.fluid.diagnostics(),
         }
         try:

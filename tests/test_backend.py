@@ -2408,5 +2408,155 @@ class VolcanoLabTests(unittest.IsolatedAsyncioTestCase):
                            "the flow is pooling at the vent rather than moving")
 
 
+class LavaCombustionTests(unittest.IsolatedAsyncioTestCase):
+    """VolcanoLab v0.14.0 part 2 (docs/10_volcano2_plan.md): objects burn.
+
+    `ObjectState.DAMAGED`/`BROKEN` and `EventType.OBJECT_DAMAGED`/`OBJECT_BROKEN`
+    were declared from the project's very first version and never wired to
+    anything -- this is a new subsystem, not an extension of an existing one.
+    """
+
+    def _volcano(self, near: tuple, far: tuple | None = None) -> tuple:
+        """A vent-topped cone with a HOUSE near enough to be doused in lava
+        and, optionally, a second far enough to never be reached -- the
+        control every ignition test needs, the same reason
+        test_a_vent_writes_temperature_not_just_depth needed a solver with no
+        vent at all to know its assertion meant something."""
+        manager = SimulationManager()
+        info = manager.apply_terrain_volcano({"peak_height": 36.0, "base_radius": 90.0})
+        vx, _, vz = info["volcano"]["vent_position"]
+        manager.apply_object_add({"type": "VENT", "position": info["volcano"]["vent_position"]})
+        near_obj = manager.apply_object_add(
+            {"type": "HOUSE", "position": [vx + near[0], 0.0, vz + near[1]]})
+        far_obj = None
+        if far is not None:
+            far_obj = manager.apply_object_add(
+                {"type": "HOUSE", "position": [vx + far[0], 0.0, vz + far[1]]})
+        manager.start()
+        return manager, near_obj, far_obj
+
+    async def test_a_house_in_lava_takes_damage_and_eventually_breaks(self) -> None:
+        manager, near, _ = self._volcano(near=(5.0, 5.0))
+        for _ in range(10 * 60):
+            manager._step_once()
+        house = manager.world.objects[near["id"]]
+        manager.stop()
+        self.assertGreater(house.damage, 0.0, "no damage accumulated despite lava contact")
+        self.assertEqual(house.state, "BROKEN")
+        kinds = [e["type"] for e in manager.events.all()]
+        self.assertEqual(kinds.count("OBJECT_DAMAGED"), 1,
+                         "OBJECT_DAMAGED must fire exactly once, not once per tick")
+        self.assertEqual(kinds.count("OBJECT_BROKEN"), 1)
+
+    async def test_a_house_far_from_the_vent_is_never_touched(self) -> None:
+        """Docs/10's measured run-out is ~48 m; 60 m in every direction is
+        safely past it. The control for every other test in this class."""
+        manager, _, far = self._volcano(near=(5.0, 5.0), far=(60.0, 60.0))
+        for _ in range(10 * 60):
+            manager._step_once()
+        house = manager.world.objects[far["id"]]
+        manager.stop()
+        self.assertEqual(house.damage, 0.0)
+        self.assertEqual(house.state, "INTACT")
+
+    async def test_a_house_ignites_via_its_footprint_ring_not_its_masked_centre(self) -> None:
+        """HOUSE is in fluid_solver.SOLID_OBSTACLE_TYPES -- rasterized as an
+        infinitely tall wall, so its own centre cell can never be wet by
+        construction (lava flows around it exactly as water already does).
+        Regression for the bug this found during development: sampling only
+        the centre point meant a house could NEVER register contact, however
+        close it stood or however long the lava had been flowing.
+        """
+        manager, near, _ = self._volcano(near=(5.0, 5.0))
+        for _ in range(5 * 60):
+            manager._step_once()
+        house = manager.world.objects[near["id"]]
+        centre_depth, centre_temp = manager.fluid.sample_lava_contact(
+            np.array([house.position], dtype=np.float32))
+        manager.stop()
+        self.assertLessEqual(float(centre_depth[0]), config.FLUID_DRY_DEPTH,
+                             "test assumption broken: the centre cell is wet, "
+                             "so this is no longer exercising the ring fix")
+        self.assertGreater(house.damage, 0.0,
+                           "the house never ignited despite its footprint ring "
+                           "standing in lava -- only its (always-dry) centre was sampled")
+
+    async def test_a_broken_objects_state_survives_rigid_body_stepping(self) -> None:
+        """Regression for the bug this found during development: RigidBodySystem
+        .step() runs earlier in _step_once and knows nothing about combustion,
+        and unconditionally overwrites obj.state from its own buoyancy/sliding
+        machine for every non-static body it tracks -- a CAR, unlike a static
+        HOUSE, goes through that machine every tick. Skipping already-maxed
+        objects in _check_lava_ignition (so it only re-asserted BROKEN on the
+        tick damage first crossed 1.0) let CAR flicker back to MOVING/SETTLED
+        the very next tick, which this catches by checking many ticks after
+        the object first broke, not just the one where it did.
+        """
+        manager = SimulationManager()
+        info = manager.apply_terrain_volcano({"peak_height": 36.0, "base_radius": 90.0})
+        vx, _, vz = info["volcano"]["vent_position"]
+        manager.apply_object_add({"type": "VENT", "position": info["volcano"]["vent_position"]})
+        car = manager.apply_object_add(
+            {"type": "CAR", "position": [vx + 6.0, 0.0, vz - 5.0]})
+        manager.start()
+        first_broken_step = None
+        for step in range(1, 20 * 60 + 1):
+            manager._step_once()
+            if manager.world.objects[car["id"]].state == "BROKEN" and first_broken_step is None:
+                first_broken_step = step
+            if first_broken_step is not None and step >= first_broken_step + 5 * 60:
+                break
+        state_at_end = manager.world.objects[car["id"]].state
+        manager.stop()
+        self.assertIsNotNone(first_broken_step, "the car never broke")
+        self.assertEqual(state_at_end, "BROKEN",
+                         "state reverted after breaking -- rigid_body overwrote it")
+
+    async def test_damage_resistance_sets_relative_burn_time(self) -> None:
+        """config.py reuses the flood-physics damage_resistance rather than
+        inventing a fire-specific value -- PERSON (0.15) must burn faster than
+        HOUSE (0.8), the same ordering flood fragility already uses.
+
+        The house sits FARTHER from the vent than the person on purpose: a
+        HOUSE is sampled on a ring around its footprint (it is a
+        SOLID_OBSTACLE_TYPES wall, see test_a_house_ignites_via_its_footprint_
+        ring_not_its_masked_centre), and that ring's near side can reach
+        closer to the vent than the house's own centre -- placing both
+        objects at the same radius would let that ring geometry, not
+        damage_resistance, decide which one is wetter first.
+        """
+        manager, near, _ = self._volcano(near=(8.0, 0.0))
+        vx, vz = near["position"][0] - 8.0, near["position"][2]
+        person = manager.apply_object_add(
+            {"type": "PERSON", "position": [vx + 4.0, 0.0, vz]})
+        for _ in range(2 * 60):
+            manager._step_once()
+        house = manager.world.objects[near["id"]]
+        person_obj = manager.world.objects[person["id"]]
+        manager.stop()
+        self.assertGreater(person_obj.damage, house.damage,
+                           f"person ({person_obj.damage:.2f}) did not burn faster than "
+                           f"house ({house.damage:.2f}) despite lower damage_resistance")
+
+    async def test_non_burnable_types_are_never_damaged(self) -> None:
+        """VENT and GAUGE sit right at/near the vent by construction and must
+        never take damage -- they are instruments and geology, not the town."""
+        manager = SimulationManager()
+        info = manager.apply_terrain_volcano({"peak_height": 36.0, "base_radius": 90.0})
+        vent = manager.apply_object_add(
+            {"type": "VENT", "position": info["volcano"]["vent_position"]})
+        vx, _, vz = info["volcano"]["vent_position"]
+        gauge = manager.apply_object_add({"type": "GAUGE", "position": [vx + 3.0, 0.0, vz]})
+        manager.start()
+        for _ in range(5 * 60):
+            manager._step_once()
+        vent_obj = manager.world.objects[vent["id"]]
+        gauge_obj = manager.world.objects[gauge["id"]]
+        manager.stop()
+        self.assertEqual(vent_obj.damage, 0.0)
+        self.assertEqual(gauge_obj.damage, 0.0)
+        self.assertEqual(gauge_obj.state, "INTACT")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

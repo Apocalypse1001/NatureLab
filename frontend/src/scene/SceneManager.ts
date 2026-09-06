@@ -32,6 +32,8 @@ export class SceneManager {
   private static readonly MAX_SPRAY = 4000;
   // (1.4 m/s)^2 -- below this the surface stays unbroken
   private static readonly SPRAY_SPEED_SQ = 1.96;
+  private static readonly CHAR_COLOR = new THREE.Color(0x0a0806);
+  private static readonly EMBER_COLOR = new THREE.Color(0xff4010);
   private waterTime = { value: 0 };
   private _clockStart = performance.now();
   private tracersVisible = true;
@@ -548,9 +550,52 @@ export class SceneManager {
       this.objectsRoot.add(group);
     }
     applyTransform(group, obj);
+    this.applyDamageVisual(group, obj);
     if (this._selectionHelper && this._selectionHelper.userData.owner === obj.id) {
       this._selectionHelper.update();
     }
+  }
+
+  /**
+   * VolcanoLab v0.14.0: charring driven by `obj.damage` (0..1, from lava
+   * contact -- see SimulationManager._check_lava_ignition), not a separate
+   * "burnt" mesh swapped in. Every material on the object darkens toward
+   * char and embers along the way, because that is the physical consequence
+   * of the fire the backend already measured, not a decoration layered on
+   * top of it -- the same "colour AS a function of the field" principle
+   * buildWaterMaterial's lava ramp uses for T.
+   *
+   * Recomputed from a CACHED base colour every call, not the material's
+   * current (possibly already-darkened) one: `setObject` runs every stream
+   * tick, and blending toward char from whatever colour is already on screen
+   * would compound every frame instead of tracking `obj.damage` as an
+   * absolute value.
+   */
+  private applyDamageVisual(group: THREE.Group, obj: ObjectData): void {
+    const damage = THREE.MathUtils.clamp(obj.damage, 0, 1);
+    group.traverse((node) => {
+      const mesh = node as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const material = mesh.material as THREE.MeshStandardMaterial;
+      if (!material || !(material as { isMeshStandardMaterial?: boolean }).isMeshStandardMaterial) return;
+      if (!mesh.userData.baseColor) {
+        mesh.userData.baseColor = material.color.clone();
+        mesh.userData.baseEmissive = material.emissive.clone();
+        mesh.userData.baseEmissiveIntensity = material.emissiveIntensity;
+      }
+      const base = mesh.userData.baseColor as THREE.Color;
+      const baseEmissive = mesh.userData.baseEmissive as THREE.Color;
+      const baseEmissiveIntensity = mesh.userData.baseEmissiveIntensity as number;
+      material.color.copy(base).lerp(SceneManager.CHAR_COLOR, damage);
+      // Embers peak partway through burning and fade again as the surface
+      // finishes going to cold char -- a bump, not a straight ramp to zero.
+      const ember = damage > 0 ? Math.sin(Math.min(damage, 1) * Math.PI) : 0;
+      material.emissive.copy(baseEmissive).lerp(SceneManager.EMBER_COLOR, ember);
+      material.emissiveIntensity = baseEmissiveIntensity + ember * 1.4;
+    });
+    // BROKEN collapses the object -- a consequence read off the object's own
+    // scale, not new geometry: a house that burned down is not a house.
+    group.scale.y = obj.scale[1] * (obj.state === 'BROKEN' ? 0.12 : 1.0);
   }
 
   removeObject(id: string): void {

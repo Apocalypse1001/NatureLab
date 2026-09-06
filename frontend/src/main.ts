@@ -37,7 +37,8 @@ const net = new BackendClient(wsUrl, {
     ui.setSimStats(state);
     store.applyGaugeStates(state.gauges ?? [], state.gauge_history_capacity ?? 600);
     for (const moved of state.moved_objects) {
-      store.updateObject(moved.id, { position: moved.position, state: moved.state });
+      store.updateObject(moved.id,
+        { position: moved.position, state: moved.state, damage: moved.damage });
       const obj = store.objects.get(moved.id);
       if (obj) {
         sceneManager.setObject(obj);

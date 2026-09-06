@@ -1188,6 +1188,7 @@ class FluidSolver:
     def get_velocity_field(self) -> Optional[np.ndarray]: ...
     def get_water_height_field(self) -> np.ndarray: ...
     def get_lava_temperature_field(self) -> np.ndarray: ...
+    def sample_lava_contact(self, positions: np.ndarray) -> tuple: ...
     def get_flow_particles(self) -> np.ndarray: ...
     def diagnostics(self) -> dict: ...
 
@@ -1239,6 +1240,9 @@ class PlaceholderFluidSolver(FluidSolver):
         return (np.full(self._terrain.heights.size, self._level, dtype=np.float32)
                  if self._terrain is not None else np.zeros(0, dtype=np.float32))
     def get_lava_temperature_field(self) -> np.ndarray: return np.zeros(0, dtype=np.float32)
+    def sample_lava_contact(self, positions: np.ndarray) -> tuple:
+        n = len(positions)
+        return np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.float32)
     def get_flow_particles(self) -> np.ndarray: return np.zeros((0, 3), dtype=np.float32)
     def diagnostics(self) -> dict:
         return {"solver": "placeholder", "substeps": self.last_substeps}
@@ -2169,6 +2173,32 @@ class WarpShallowWaterSolver(FluidSolver):
             return np.zeros(0, dtype=np.float32)
         return (np.asarray(self._temperature.numpy(), dtype=np.float32)
                 - 273.15).astype(np.float32)
+
+    def sample_lava_contact(self, positions: np.ndarray) -> tuple:
+        """(depth_m, temperature_c) at each world (x, _, z) position, indexed
+        into the same grid `get_water_height`/`get_lava_temperature_field`
+        use. Deliberately separate from `sample_for_bodies`: that vectorized
+        path runs for every rigid body every step to drive buoyancy/collision,
+        while combustion (SimulationManager._check_lava_ignition) only needs
+        this for the small, independent set of burnable objects -- folding it
+        into sample_for_bodies would make every non-lava world pay for lava
+        fields it never has.
+        """
+        n = len(positions)
+        if not self._lava_enabled or self._h is None or not n:
+            return np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.float32)
+        depth_field = np.asarray(self._h.numpy(), dtype=np.float32)
+        temp_field = (np.asarray(self._temperature.numpy(), dtype=np.float32)
+                      - 273.15).astype(np.float32)
+        positions = np.asarray(positions, dtype=np.float64)
+        i = np.clip(np.round(positions[:, 0] / self._terrain.cell_size
+                             + self._terrain.width / 2).astype(np.int64),
+                    0, self._width - 1)
+        j = np.clip(np.round(positions[:, 2] / self._terrain.cell_size
+                             + self._terrain.height / 2).astype(np.int64),
+                    0, self._height - 1)
+        idx = j * self._width + i
+        return depth_field[idx], temp_field[idx]
 
     def get_flow_particles(self) -> np.ndarray:
         if self._flow_particles is None:

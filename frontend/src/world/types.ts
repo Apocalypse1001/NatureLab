@@ -65,7 +65,7 @@ export interface SimStateMessage {
   objects: number;
   particles: number;
   events: SimEvent[];
-  moved_objects: { id: string; position: number[]; state: ObjectState }[];
+  moved_objects: { id: string; position: number[]; state: ObjectState; damage: number }[];
   gauge_history_capacity: number;
   gauges: GaugeState[];
   fluid?: { solver: string; device?: string; grid?: number[]; substeps: number;

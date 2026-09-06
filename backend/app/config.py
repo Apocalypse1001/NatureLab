@@ -180,6 +180,27 @@ LAVA_MANNING_MAX = 1.0           # s/m^(1/3) at the solidus
 # rather than at an arbitrary zero.
 LAVA_VENT_RADIUS_M = 3.0
 LAVA_VENT_DISCHARGE_M3S = 20.0
+# VolcanoLab v0.14.0: object combustion (docs/10_volcano2_plan.md part 2).
+# Contact-only, not radiative-at-a-distance -- a house 2 m from a 1100 C flow
+# would burn in reality without touching it, but modelling that means
+# inventing a heat-transfer term this project has no measurement to calibrate,
+# the same reason the lava cooling law itself declares its own well-mixed-
+# column simplification honestly rather than silently. Ignition needs BOTH a
+# minimum depth of genuinely molten fluid (FLUID_DRY_DEPTH -- a dry cell that
+# merely remembers a past high T cannot ignite anything) AND that fluid at or
+# above the solidus (LAVA_SOLIDUS_TEMP_C already defined above).
+# damage/second at damage_resistance=1.0 (ROCK/BRIDGE-grade); an object's own
+# damage_resistance divides this, so a PERSON (0.15) burns in ~1 s of contact
+# and a HOUSE (0.8) in ~5 s -- reusing the resistance value flood physics
+# already assigned per type rather than inventing a second, fire-specific one.
+LAVA_DAMAGE_RATE_PER_S = 0.15
+LAVA_DAMAGED_THRESHOLD = 0.4     # obj.damage at which ObjectState.DAMAGED fires
+LAVA_BROKEN_THRESHOLD = 1.0      # obj.damage at which ObjectState.BROKEN fires; damage stops growing
+# How far past a SOLID_OBSTACLE_TYPES object's own footprint to sample for
+# ignition. Its centre cell is rasterized as an infinitely tall wall (fluid
+# cannot occupy it, by the same rule water already obeys), so sampling only
+# the centre would mean that object could never register lava contact at all.
+LAVA_IGNITION_OBSTACLE_MARGIN_M = 0.75
 # No LAVA_MAX_BED_CHANGE-style clamp on solidification: item 5 of the plan is
 # literal (`bed += h; h = 0`, unconditional, the instant T crosses the solidus).
 # v0.11.0's lesson about SEDIMENT_MAX_BED_CHANGE was that shipping a limiter
