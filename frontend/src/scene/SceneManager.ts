@@ -34,6 +34,15 @@ export class SceneManager {
   private static readonly SPRAY_SPEED_SQ = 1.96;
   private static readonly CHAR_COLOR = new THREE.Color(0x0a0806);
   private static readonly EMBER_COLOR = new THREE.Color(0xff4010);
+  // Flow-tracer colours: the ordinary water droplet tint, and what it turns
+  // into when the same tracer is riding over lava instead -- see
+  // setParticles/lavaTempAt. Below LAVA_TRACER_MIN_C nothing changes, so a
+  // river or dam world (aLavaTemp always 0) never pays for this or sees it.
+  private static readonly TRACER_WATER_COLOR = new THREE.Color(0xbde9ff);
+  private static readonly TRACER_SPARK_COLOR = new THREE.Color(0xffb347);
+  private static readonly LAVA_TRACER_MIN_C = 650.0;
+  private static readonly LAVA_TRACER_MAX_C = 1100.0;
+  private tracerColors = new Float32Array(0);
   private waterTime = { value: 0 };
   private _clockStart = performance.now();
   private tracersVisible = true;
@@ -114,9 +123,16 @@ export class SceneManager {
     const positions = new Float32Array(1024 * 3);
     const pgeo = new THREE.BufferGeometry();
     pgeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    // VolcanoLab v0.14.0: per-particle colour, so a tracer riding the flow
+    // over hot lava reads as a spark rather than a water droplet -- driven by
+    // aLavaTemp's own grid (see setParticles/lavaTempAt), never a second
+    // "is this a volcano" flag. Material colour is plain white so the vertex
+    // colour attribute IS the colour, not a tint on top of one.
+    this.tracerColors = new Float32Array(1024 * 3).fill(1);
+    pgeo.setAttribute('color', new THREE.BufferAttribute(this.tracerColors, 3));
     pgeo.setDrawRange(0, 0);
     this.points = new THREE.Points(pgeo, new THREE.PointsMaterial({
-      color: 0xbde9ff, size: 0.14, sizeAttenuation: true,
+      color: 0xffffff, vertexColors: true, size: 0.14, sizeAttenuation: true,
       transparent: true, opacity: 0.8, depthWrite: false,
     }));
     this.points.frustumCulled = false;
@@ -329,7 +345,19 @@ export class SceneManager {
           // frame that never received a LAVA_TEMPERATURE stream, so this is a
           // no-op for every world that isn't a volcano.
           float lavaMix = smoothstep(650.0, 850.0, vLavaTemp);
-          gl_FragColor.rgb = mix(gl_FragColor.rgb, lavaColor(vLavaTemp), lavaMix);
+          vec3 hotColor = lavaColor(vLavaTemp);
+          // Crust cracks: thin dark veins, visible only in the crusting band
+          // just below the solidus -- a real flow's surface only fractures
+          // once it starts hardening, so fully molten (>1040C) and already-
+          // cold (<920C) read smooth. Built from the same value noise as the
+          // water ripples above rather than screen-space derivatives, which
+          // this software-rendered target cannot be relied on to support.
+          float crustBand = smoothstep(920.0, 980.0, vLavaTemp)
+                           * (1.0 - smoothstep(980.0, 1040.0, vLavaTemp));
+          float crackNoise = noise(gl_FragCoord.xy * 0.22 + vLavaTemp * 0.015);
+          float crack = smoothstep(0.47, 0.5, crackNoise) * crustBand;
+          hotColor = mix(hotColor, vec3(0.03, 0.01, 0.01), crack);
+          gl_FragColor.rgb = mix(gl_FragColor.rgb, hotColor, lavaMix);
           gl_FragColor.a = mix(gl_FragColor.a, 1.0, lavaMix);
         `);
     };
@@ -507,16 +535,65 @@ export class SceneManager {
     return true;
   }
 
+  /**
+   * Lava temperature (C) at a world (x, z), same grid `aLavaTemp`/`waterDepth`
+   * use. 0 (below every ignition/spark threshold) whenever no LAVA_TEMPERATURE
+   * frame has ever arrived, off the map, or outside the terrain -- a river or
+   * dam world never sees a spark-coloured tracer.
+   */
+  private lavaTempAt(x: number, z: number): number {
+    if (!this.waterLavaTemp.length) return 0;
+    const grid = this.terrain.width + 1;
+    const half = this.terrain.sizeM / 2;
+    const gx = Math.round((x + half) / this.terrain.cellSize);
+    const gz = Math.round((z + half) / this.terrain.cellSize);
+    if (gx < 0 || gx >= grid || gz < 0 || gz >= grid) return 0;
+    return this.waterLavaTemp[gz * grid + gx];
+  }
+
+  private static readonly _scratchColor = new THREE.Color();
+
   setParticles(buffer: Float32Array, count: number): void {
     let attr = this.points.geometry.attributes.position as THREE.BufferAttribute;
+    let colorAttr = this.points.geometry.attributes.color as THREE.BufferAttribute;
     if (attr.count < count) {
       let capacity = Math.max(1024, attr.count);
       while (capacity < count) capacity *= 2;
       attr = new THREE.BufferAttribute(new Float32Array(capacity * 3), 3);
       this.points.geometry.setAttribute('position', attr);
+      this.tracerColors = new Float32Array(capacity * 3).fill(1);
+      colorAttr = new THREE.BufferAttribute(this.tracerColors, 3);
+      this.points.geometry.setAttribute('color', colorAttr);
     }
     attr.array.set(buffer.subarray(0, count * 3));
+    // VolcanoLab v0.14.0: a tracer riding the flow over hot lava becomes a
+    // spark, not a water droplet -- driven by the same aLavaTemp grid the
+    // surface shader reads, so this is a genuine physics readout (where is
+    // it hot) rather than a decorative particle system bolted on separately.
+    const positions = attr.array as Float32Array;
+    const colors = this.tracerColors;
+    const time = this.waterTime.value;
+    for (let i = 0; i < count; i++) {
+      const px = positions[i * 3], pz = positions[i * 3 + 2];
+      const tempC = this.lavaTempAt(px, pz);
+      const mix = THREE.MathUtils.clamp(
+        (tempC - SceneManager.LAVA_TRACER_MIN_C)
+          / (SceneManager.LAVA_TRACER_MAX_C - SceneManager.LAVA_TRACER_MIN_C), 0, 1);
+      SceneManager._scratchColor.copy(SceneManager.TRACER_WATER_COLOR)
+        .lerp(SceneManager.TRACER_SPARK_COLOR, mix);
+      colors[i * 3] = SceneManager._scratchColor.r;
+      colors[i * 3 + 1] = SceneManager._scratchColor.g;
+      colors[i * 3 + 2] = SceneManager._scratchColor.b;
+      // A spark also rises: a small time-varying lift on top of the real
+      // advected position, recomputed fresh from the authoritative backend
+      // Y every frame (never accumulated), so still water stays exactly
+      // where the solver put it.
+      if (mix > 0) {
+        positions[i * 3 + 1] += (0.4 + 0.5 * Math.sin(time * 2.3 + i)) * mix;
+      }
+    }
     attr.needsUpdate = true;
+    colorAttr.needsUpdate = true;
     this.receivedTracerCount = count;
     this.applyTracerDisplay();
   }

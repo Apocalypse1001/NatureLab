@@ -2407,6 +2407,64 @@ class VolcanoLabTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(diag["max_velocity"], 0.3,
                            "the flow is pooling at the vent rather than moving")
 
+    async def test_flow_tracers_respawn_at_the_vent_not_the_dry_west_edge(self) -> None:
+        """VolcanoLab v0.14.0 part 3 (docs/10_volcano2_plan.md): found while
+        wiring up ember-coloured tracers for the lava shader. The pre-existing
+        `_advect_flow_tracers` kernel's respawn rule assumes water always
+        enters at FLUID_SOURCE_COLUMNS on the west edge -- true for every
+        world before this one, but a volcano scenario never wets that edge at
+        all (water.level = 0, no inlet), so every one of the 36 000 tracers
+        sat forever at y = -100 (never drawn) in ANY lava world, not just this
+        session's -- the bug predates this test, it was just never exercised
+        by anything that reads the tracer buffer back. The screen looked fine
+        anyway because the UNRELATED velocity-driven spray system still shows
+        motion near the vent, which is exactly the kind of thing that lets a
+        broken system hide behind a working one.
+        """
+        manager = SimulationManager()
+        info = manager.apply_terrain_volcano({"peak_height": 36.0, "base_radius": 90.0})
+        manager.apply_object_add({"type": "VENT", "position": info["volcano"]["vent_position"]})
+        manager.start()
+        for _ in range(20 * 60):
+            manager._step_once()
+        particles = manager.fluid.get_flow_particles()
+        manager.stop()
+        alive = particles[particles[:, 1] > -50.0]
+        self.assertGreater(len(alive), config.FLOW_TRACER_COUNT * 0.5,
+                           f"only {len(alive)}/{config.FLOW_TRACER_COUNT} tracers ever "
+                           f"left the dry west edge")
+        vx, _, vz = info["volcano"]["vent_position"]
+        radius = np.hypot(alive[:, 0] - vx, alive[:, 2] - vz)
+        self.assertLess(float(np.median(radius)), 60.0,
+                        "revived tracers are not actually clustered near the vent")
+
+    async def test_flow_tracers_still_spawn_at_the_west_edge_without_a_vent(self) -> None:
+        """The other half of the same regression: a plain river/dam world
+        (lava_active == 0 in the kernel) must keep the original west-edge
+        respawn behaviour byte-for-byte.
+
+        Checked on the INITIAL seed (right after start(), before any steps)
+        rather than after a long run: once a batch of tracers is advecting
+        downstream in a steady current, none may happen to sit exactly at the
+        spawn column at an arbitrary later instant, which is a property of
+        continuous advection and not evidence the respawn rule changed --
+        the deterministic thing this regression actually needs to check is
+        where get_flow_particles() puts them at t = 0, which is the same
+        west-edge construction this file's other tests already build on
+        (test_warp_shallow_water_stability_and_stream reads the identical
+        `initial_depth[:, :FLUID_SOURCE_COLUMNS]` column).
+        """
+        manager = SimulationManager()
+        manager.apply_water_level(1.0)
+        manager.start()
+        particles = manager.fluid.get_flow_particles()
+        manager.stop()
+        expected_x = (min(N - 2, max(1, config.FLUID_SOURCE_COLUMNS - 1))
+                     - (N - 1) / 2.0) * config.TERRAIN_CELL_SIZE
+        self.assertEqual(particles.shape[0], config.FLOW_TRACER_COUNT)
+        np.testing.assert_allclose(particles[:, 0], expected_x, atol=1e-3,
+                                   err_msg="tracers no longer seed at the west source column")
+
 
 class LavaCombustionTests(unittest.IsolatedAsyncioTestCase):
     """VolcanoLab v0.14.0 part 2 (docs/10_volcano2_plan.md): objects burn.

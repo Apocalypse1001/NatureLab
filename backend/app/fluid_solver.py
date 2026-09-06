@@ -972,7 +972,8 @@ if WARP_IMPORTED:
                              h: wp.array(dtype=float), u: wp.array(dtype=float),
                              v: wp.array(dtype=float), bed: wp.array(dtype=float),
                              solid: wp.array(dtype=wp.int32), width: int, height: int,
-                             source_columns: int, dx: float, dt: float, dry: float):
+                             source_columns: int, dx: float, dt: float, dry: float,
+                             lava_active: int, vent_x: float, vent_z: float):
         n = wp.tid()
         p = particles[n]
         i = int(wp.floor(p.x / dx + float(width - 1) * 0.5 + 0.5))
@@ -992,6 +993,28 @@ if WARP_IMPORTED:
                     particles[n] = wp.vec3(nx, bed[next_idx] + h[next_idx] + 0.08, nz)
                 else:
                     particles[n] = wp.vec3(p.x, bed[idx] + h[idx] + 0.08, p.z)
+        elif lava_active != 0:
+            # VolcanoLab v0.14.0: a dead tracer respawns at the vent's own
+            # disc, not the west edge -- the pre-existing respawn rule below
+            # assumes water always enters from FLUID_SOURCE_COLUMNS, which a
+            # volcano world never wets at all. Without this every one of the
+            # 36 000 tracers sat forever at the dry west edge (y = -100,
+            # literally never drawn) in ANY lava world, found only by reading
+            # the actual tracer buffer back client-side -- the screen looked
+            # fine because a SEPARATE system (the velocity-driven spray
+            # points) happened to still show something moving near the vent.
+            angle = float(n % 360) * 0.017453292519943295
+            radius = 1.0 + float((n // 360) % 10) * 0.3
+            sx = vent_x + radius * wp.cos(angle)
+            sz = vent_z + radius * wp.sin(angle)
+            si = int(wp.floor(sx / dx + float(width - 1) * 0.5 + 0.5))
+            sj = int(wp.floor(sz / dx + float(height - 1) * 0.5 + 0.5))
+            sy = -100.0
+            if si > 0 and si < width - 1 and sj > 0 and sj < height - 1:
+                spawn_idx = sj * width + si
+                if solid[spawn_idx] == 0 and h[spawn_idx] > dry:
+                    sy = bed[spawn_idx] + h[spawn_idx] + 0.08
+            particles[n] = wp.vec3(sx, sy, sz)
         else:
             rows = wp.max(1, height - 2)
             si = wp.min(width - 2, wp.max(1, source_columns - 1))
@@ -1306,6 +1329,7 @@ class WarpShallowWaterSolver(FluidSolver):
         self._vent_count = 0
         self._vent_centres = self._vent_radii = None
         self._vent_discharges = self._vent_temps = None
+        self._tracer_vent_x = self._tracer_vent_z = 0.0
         self._solidified_m3 = 0.0
         self._diag_solidified = None
         self._level = 0.5
@@ -1377,6 +1401,7 @@ class WarpShallowWaterSolver(FluidSolver):
         self._next_temperature = wp.empty(self._count, dtype=float, device=self.device)
         self._lava_enabled = False
         self._vent_count = 0
+        self._tracer_vent_x = self._tracer_vent_z = 0.0
         self._inlet_q_host = np.zeros(self._height, dtype=np.float32)
         self._inlet_q = wp.zeros(self._height, dtype=float, device=self.device)
         self._inlet_normal_depth = wp.zeros(self._height, dtype=float,
@@ -1764,6 +1789,13 @@ class WarpShallowWaterSolver(FluidSolver):
         self._vent_count = len(vents)
         self._lava_enabled = bool(vents)
         if vents:
+            # Representative spawn point for the flow tracers (see
+            # _advect_flow_tracers) -- the average of every vent rather than
+            # just the first, so two vents both get some tracer traffic
+            # instead of one being visually silent.
+            centres = np.array([item[0] for item in vents], dtype=np.float32)
+            self._tracer_vent_x = float(centres[:, 0].mean())
+            self._tracer_vent_z = float(centres[:, 2].mean())
             self._vent_centres = wp.array(
                 np.array([item[0] for item in vents], dtype=np.float32),
                 dtype=wp.vec3, device=self.device)
@@ -2025,7 +2057,10 @@ class WarpShallowWaterSolver(FluidSolver):
                               self._bed, self._obstacles, self._width, self._height,
                               config.FLUID_SOURCE_COLUMNS,
                               float(self._terrain.cell_size), dt,
-                              config.FLUID_DRY_DEPTH], device=self.device)
+                              config.FLUID_DRY_DEPTH,
+                              1 if self._lava_enabled else 0,
+                              self._tracer_vent_x, self._tracer_vent_z],
+                      device=self.device)
             self._time += dt
         self._fold_ledger()
         self._measure()
