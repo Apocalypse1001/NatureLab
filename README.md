@@ -15,7 +15,7 @@ The backend is authoritative. The frontend draws, edits and measures — it neve
 motion. That distinction is the whole project: a prettier picture that hid the physics
 would defeat the point, so if the simulation is wrong, the screen shows it.
 
-Version 0.12.2. Backend suite 87/87, browser E2E 20/20, on an RTX 5090.
+Version 0.14.0. Backend suite 114/114, browser E2E 20/20, on an RTX 5090.
 
 ---
 
@@ -37,25 +37,30 @@ drag coefficient and a friction coefficient, and the car moves when the numbers 
 
 ## Scenarios
 
-Two prepared worlds ship with it, in the **Scenarios** panel. Both drop you into the same
-small town — ten houses, a street, figures, a wood and a rubbish dump — and both stay
-completely editable: brush the terrain, move objects, change the discharge, press PLAY.
+Four prepared worlds ship with it, in the **Scenarios** panel. All stay completely
+editable: brush the terrain, move objects, change the discharge, press PLAY. River and
+Dam share the same small town — ten houses, a street, figures, a wood and a rubbish dump.
 
 | | |
 |---|---|
 | **River** | The town on the bank of a running river, fed by a prescribed discharge of 12 m³/s, at which the channel runs about a metre deep and the town stays dry. At the discharge slider's maximum of 80 m³/s the channel goes bankfull at 2.1 m and about 13 cm of water stands in the street from roughly 200 s. |
 | **Dam** | The same town, below a dam holding a reservoir. At the discharge it ships with, the spillway carries the river and the dam holds. Push Q past about 60 m³/s and the crest is overtopped after roughly six minutes of simulated time — or cut the crest with the terrain brush and watch it go at once. |
+| **Volcano** | A settlement on the flank of a generated cone, 36 m high on a 90 m base. Lava leaves the summit vent at 20 m³/s and 1150 °C, cools, thickens as it cools, and stops — the front settles at 48 m, measured on the real solver across three slopes. What it stops as is new ground the next flow runs over. Buildings inside the flow take damage; the village just past the measured front does not, until you raise the discharge. |
+| **Tsunami** | A beach, seeded with a real wave rather than a rising flood front. The sea recedes to nearly dry at the shore gauge around 7 s, and only then does the wave arrive, around 8.5 s. Cars, people, crates, debris and trees are carried off. The houses stand and split the flow — they are static bodies, and water does not damage anything in this build. |
 
 The dam is **terrain, not an object**, and that is a physics decision. Solid obstacles are
 rasterized as infinitely tall walls, so an object dam could never be overtopped — and
 overtopping is the entire lesson. A ridge written into the heightfield spills correctly
 and can be breached with the ordinary brush.
 
-Every number above is measured, not chosen. `docs/probe_dam_v0121.py` runs the real solver
-on the real generated terrain and prints the reservoir surface against the crest; the river
-figures come from the same headless path on the shipped world.
+Every number above is measured, not chosen, and each has a probe that produced it:
+`docs/probe_dam_v0121.py` runs the real solver on the real generated terrain and prints
+the reservoir surface against the crest, `docs/probe_lava_v013.py` the lava run-out, and
+`docs/probe_tsunami_v1.py` sweeps wave depth, amplitude and half-width for the one point
+where the drawback genuinely precedes the wave. The river figures come from the same
+headless path on the shipped world.
 
-Both worlds are ordinary saved worlds, rebuilt with:
+All four are ordinary saved worlds, rebuilt with:
 
 ```bat
 python tools\make_scenarios.py
@@ -152,7 +157,7 @@ cd backend && python -m uvicorn app.main:app --host 127.0.0.1 --port 8756
 Node.js ≥ 22.12 and Chrome/Edge.
 
 ```bat
-python tests\test_backend.py     # 87 CUDA/Warp physics and regression tests
+python tests\test_backend.py     # 114 CUDA/Warp physics and regression tests
 node tests\e2e.mjs               # 20 browser + WebSocket checks, own backend on 8756
 ```
 
@@ -169,7 +174,7 @@ delivered Q, the drain's measured circulation, and the scenarios' layout rules.
 
 ```bat
 cd frontend && npm run build && cd ..
-python tools\make_release.py 0.12.2
+python tools\make_release.py 0.14.0
 ```
 
 Writes `releases\NatureLab_v<version>.zip` and records its SHA-256 in
@@ -185,8 +190,11 @@ build always reports which one it is.
 | [`docs/01_vision.md`](docs/01_vision.md) | What the project is for, and what it refuses to be |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Data flow and coupling |
 | [`docs/07_river_plan.md`](docs/07_river_plan.md) | The river, its measurements, and one unresolved solver defect |
-| [`docs/08_volcano_plan.md`](docs/08_volcano_plan.md) | **Current entry point** — v0.13.0, lava that flows and solidifies |
+| [`docs/08_volcano_plan.md`](docs/08_volcano_plan.md) | The volcano: lava that flows, cools and solidifies, and the run-out measurement that came before the code |
 | [`docs/09_debris_flow_plan.md`](docs/09_debris_flow_plan.md) | Mountain debris flow: the same solver as the volcano, with concentration in place of temperature |
+| [`docs/10_volcano2_plan.md`](docs/10_volcano2_plan.md) | The volcano's second pass: the scenario, burning objects, sparks and crust |
+| [`docs/11_permaculture_plan.md`](docs/11_permaculture_plan.md) | **Current entry point** — soil moisture, swales and roots, with the probe that says which soils can show anything at all |
+| [`docs/12_tsunami_plan.md`](docs/12_tsunami_plan.md) | The tsunami: why an N-wave draws back before it hits, and the sweep that calibrated it |
 | [`README.ru.md`](README.ru.md) | Russian, with the full per-version history |
 
 `CONTINUATION.md` is a historical document and describes a different source tree.
@@ -195,9 +203,11 @@ build always reports which one it is.
 
 ## Roadmap
 
-- **v0.13.0 — Volcano I.** Lava that flows, cools, thickens and solidifies into terrain
-  the next flow runs over. The first task is a measurement, not code: the run-out length
-  before solidification has to land in a range that fits on the map.
+- **Lava meets water.** The one part of the volcano still unbuilt, and deliberately not
+  rushed: two fields sharing a cell rather than one, quenching, steam, and evaporation.
+- **River and flood.** The 2Δx sawtooth mode still latent in the solver, erosion
+  calibration, a Q(t) hydrograph, and a gauging section with a Froude number.
+- **Soil moisture.** Swales, infiltration and roots — planned in full, not yet built.
 - **Debris flow.** A mountain valley, a cloudburst, and a mudflow that carries everything
   away. It shares the volcano's shape exactly — a transported scalar that drives viscosity
   and density, and a threshold at which the flow stops and becomes ground. Both need the
@@ -214,7 +224,8 @@ Stated plainly, because a teaching tool that overstates itself teaches the wrong
 - Rigid bodies use a translational force model; there is no angular dynamics, so a car
   carried by the flow does not yaw or tumble.
 - Collision correction uses 2D footprints and radii, not a full contact solver.
-- `damage` exists in the schema and is never computed yet.
+- `damage` is driven by lava contact only. Nothing hydrodynamic damages anything:
+  a wave sweeps loose objects away, but it cannot break a house.
 - The evolved `h/u/v` field is not serialized by SAVE — a saved world restores its
   terrain, objects and boundary settings, not the water in flight.
 - No rain, no destruction, no vegetation physics, no replay.
