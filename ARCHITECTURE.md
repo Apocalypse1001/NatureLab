@@ -1,4 +1,4 @@
-# NatureLab 0.11.0 - Architecture
+# NatureLab 0.14.0 - Architecture
 
 Проектная документация, которая объясняет *почему* архитектура такая, живёт в `docs/`:
 [`01_vision.md`](docs/01_vision.md) (цели и критерий качества),
@@ -122,29 +122,52 @@ Three different answers, chosen from data rather than from a type name:
 
 ```text
 HOUSE     full yaw-oriented OBB rasterized solid          -- a wall
+BUILDING  the same, but its footprint grows with `floors` -- a wall
 BRIDGE    piers only, as discs along the span             -- water passes under
 ROCK      not solid at all; raises the effective bed      -- water passes over
 ```
 
 `_is_solid()` excludes anything carrying a positive `bed_height` regardless of type,
 and `SimulationManager._affects_fluid_boundary()` uses the same rule to decide when a
-world edit must bump `obstacle_revision`. Adding a fourth kind means adding a branch in
-`_build_obstacle_mask` and nothing else.
+world edit must bump `obstacle_revision`.
+
+This section used to end "adding a fourth kind means adding a branch in
+`_build_obstacle_mask` and nothing else". Adding `BUILDING` in v0.14.0 proved that
+wrong, and the correction is worth keeping rather than quietly deleting. The mask had
+been deriving every solid body's half-extent as `2.0 * scale` -- `HOUSE`'s own
+constant, correct only while `HOUSE` was the sole type on that path. A type whose
+footprint is not house-sized needs its real extent carried through
+`obstacle_snapshot()` as `half_extents`, so the size the mask rasterizes is the size
+`rigid_body.footprint_half_extents` computed. **A new solid type touches two places,
+not one.**
+
+Note what a solid type deliberately cannot express: every one of them is an infinitely
+tall wall. The solver is depth-averaged, so no amount of `floors` lets water overtop a
+short building and not a tall one. `BUILDING`'s floor count changes footprint and
+visible height, and that is the whole of what it honestly changes.
 
 A bridge's `deck_height` is deliberately NOT part of the mask. It exists only to answer
 "has the river reached the deck yet", which is reported once per run as a
 `BRIDGE_DECK_FLOODED` event.
 
-## Water sources, sinks and boundaries (v0.8.0)
+## Water sources, sinks and boundaries (v0.8.0, extended through v0.14.0)
 
-Three separate mechanisms, deliberately not merged:
+Separate mechanisms, deliberately not merged:
 
 ```text
 edge inflow      west columns, h = max(0, level - bed)   -- default, config-driven
 SOURCE object    disc, same rule, live position          -- overrides the edge inflow
 DRAIN object     radial sink + measured swirl            -- removes water anywhere
 open outlet      east columns, q = u*h leaves the map    -- toggleable, on by default
+river inlet      west edge, prescribed Q -- the level is the answer, not the input
+VENT object      disc, prescribed discharge of hot lava  -- modelled on the drains
+tsunami seed     ONE-SHOT initial surface at t=0         -- not a per-tick boundary
 ```
+
+The last one is the odd member and is listed here so it is not mistaken for a boundary
+condition. `tsunami_enabled` does its entire work inside `initialize()`, seeding an
+N-wave across the whole grid once; after t=0 nothing in the solver knows a tsunami
+happened. That is why it needed no new kernel.
 
 A world with no `SOURCE` behaves exactly as 0.7.0 did, which is what keeps the older
 suite valid. A world with one turns the edge inflow off entirely, so "where does the
