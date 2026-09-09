@@ -1458,8 +1458,14 @@ class WarpShallowWaterSolver(FluidSolver):
         # constant itself any more, so a probe or test that patches it must do
         # so before `initialize()`, same as it already had to for every other
         # value this method bakes into a GPU array at start-up.
+        # A tsunami world is a sea bed, not a river channel -- see config's
+        # SEABED_MANNING_N for the measured difference this makes to how far the
+        # sea can withdraw. Chosen by what the surface IS, not by which number
+        # looked better.
+        self._base_manning = (config.SEABED_MANNING_N if tsunami_wanted
+                              else config.FLUID_MANNING_N)
         self._manning = wp.array(
-            np.full(self._count, config.FLUID_MANNING_N, dtype=np.float32),
+            np.full(self._count, self._base_manning, dtype=np.float32),
             dtype=float, device=self.device)
         self._temperature = wp.array(
             np.full(self._count, config.LAVA_AMBIENT_TEMP_C + 273.15, dtype=np.float32),
@@ -1900,8 +1906,12 @@ class WarpShallowWaterSolver(FluidSolver):
                 np.array([float(item[3]) + 273.15 for item in vents], dtype=np.float32),
                 dtype=float, device=self.device)
         elif was_enabled and self._manning is not None:
+            # Back to this WORLD's baseline, not unconditionally to the river
+            # channel's -- a tsunami world's bed is a sea bed and stays one.
             self._manning.assign(
-                np.full(self._count, config.FLUID_MANNING_N, dtype=np.float32))
+                np.full(self._count,
+                        getattr(self, "_base_manning", config.FLUID_MANNING_N),
+                        dtype=np.float32))
 
     def set_erosion(self, enabled: bool) -> None:
         """RiverLab erosion on/off, read live each tick by SimulationManager.

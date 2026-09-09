@@ -245,3 +245,26 @@ def building_height_m(floors: float) -> float:
     """Visible height (m) for a BUILDING with this many floors. See building_half_extent_m."""
     floors = max(1.0, float(floors))
     return floors * BUILDING_FLOOR_HEIGHT_M + BUILDING_ROOF_HEIGHT_M
+
+
+# --------------------------------------------------------------- SEA BED ROUGHNESS
+# `FLUID_MANNING_N` describes a natural river channel. A sea bed is not one, and
+# the difference is not cosmetic: it is what limits how far the sea can withdraw
+# before the wave returns, because drawdown is a slow flow over shallow water and
+# slow shallow flow is exactly what Manning friction damps hardest.
+#
+# Measured on the tsunami coast (docs/13_tsunami2_plan.md), holding everything
+# else fixed:
+#
+#     n = 0.030 (river channel)   sea out  62 m,  flood 258 m
+#     n = 0.025                   sea out  82 m,  flood 278 m
+#     n = 0.020 (sand sea bed)    sea out 102 m,  flood 308 m
+#     n = 0.015                   sea out 102 m,  flood 348 m
+#
+# 0.020 is the standard table value for a flat sand bed, against 0.030 for a
+# natural stream with vegetation and bedforms -- so this is the correct constant
+# for the surface being modelled, not a knob turned until the picture improved.
+# The plan doc originally recorded 62 m as "the ceiling for this geometry" on the
+# evidence of a period sweep, which tests duration and not friction; that claim
+# was wrong and this is what replaced it.
+SEABED_MANNING_N = 0.020

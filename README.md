@@ -15,7 +15,7 @@ The backend is authoritative. The frontend draws, edits and measures — it neve
 motion. That distinction is the whole project: a prettier picture that hid the physics
 would defeat the point, so if the simulation is wrong, the screen shows it.
 
-Version 0.14.1. Backend suite 116/116, browser E2E 20/20, on an RTX 5090.
+Version 0.14.2. Backend suite 117/117, browser E2E 20/20, on an RTX 5090.
 
 ---
 
@@ -46,7 +46,7 @@ Dam share the same small town — ten houses, a street, figures, a wood and a ru
 | **River** | The town on the bank of a running river, fed by a prescribed discharge of 12 m³/s, at which the channel runs about a metre deep and the town stays dry. At the discharge slider's maximum of 80 m³/s the channel goes bankfull at 2.1 m and about 13 cm of water stands in the street from roughly 200 s. |
 | **Dam** | The same town, below a dam holding a reservoir. At the discharge it ships with, the spillway carries the river and the dam holds. Push Q past about 60 m³/s and the crest is overtopped after roughly six minutes of simulated time — or cut the crest with the terrain brush and watch it go at once. |
 | **Volcano** | A settlement on the flank of a generated cone, 36 m high on a 90 m base. Lava leaves the summit vent at 20 m³/s and 1150 °C, cools, thickens as it cools, and stops — the front settles at 48 m, measured on the real solver across three slopes. What it stops as is new ground the next flow runs over. Buildings inside the flow take damage; the village just past the measured front does not, until you raise the discharge. |
-| **Tsunami** | The one kilometre-scale world: 2 km across at 10 m cells, because how far the sea goes out is the drawdown divided by the beach slope, and a real gentle shore does not fit in 200 m. The wave is not seeded on the map — it arrives through the seaward edge. The sea withdraws 62 m and bares the sea bed, the shore gauge reading bone dry at 387 s, and then the wave floods 258 m inland and stands 7.8 m deep where it was dry. Water damages nothing in this build, so things are carried, not broken. |
+| **Tsunami** | The one kilometre-scale world: 2 km across at 10 m cells, because how far the sea goes out is the drawdown divided by the beach slope, and a real gentle shore does not fit in 200 m. The wave is not seeded on the map — it arrives through the seaward edge. The sea withdraws 102 m and bares the sea bed, the shore gauge reading bone dry, and then the wave floods 308 m inland and stands metres deep where it was dry. Water damages nothing in this build, so things are carried, not broken. |
 
 The dam is **terrain, not an object**, and that is a physics decision. Solid obstacles are
 rasterized as infinitely tall walls, so an object dam could never be overtopped — and
@@ -157,7 +157,7 @@ cd backend && python -m uvicorn app.main:app --host 127.0.0.1 --port 8756
 Node.js ≥ 22.12 and Chrome/Edge.
 
 ```bat
-python tests\test_backend.py     # 116 CUDA/Warp physics and regression tests
+python tests\test_backend.py     # 117 CUDA/Warp physics and regression tests
 node tests\e2e.mjs               # 20 browser + WebSocket checks, own backend on 8756
 ```
 
@@ -174,7 +174,7 @@ delivered Q, the drain's measured circulation, and the scenarios' layout rules.
 
 ```bat
 cd frontend && npm run build && cd ..
-python tools\make_release.py 0.14.1
+python tools\make_release.py 0.14.2
 ```
 
 Writes `releases\NatureLab_v<version>.zip` and records its SHA-256 in

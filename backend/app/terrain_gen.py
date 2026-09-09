@@ -359,8 +359,8 @@ def volcano_cone(terrain, params: Dict[str, Any] | None = None) -> Dict[str, flo
 # to `-ocean_depth_m` at and east of `land_edge_x + beach_run_m`, with genuine
 # zero-gradient flats on both sides because a smoothstep has zero derivative
 # at both its own endpoints -- no clamping needed to make the flats flat.
-# Measured on the real solver, docs/13_tsunami2_plan.md: sea out 62 m, then
-# 258 m of flood inland. Kilometre-scale on purpose -- see _coastline_limits.
+# Measured on the real solver, docs/13_tsunami2_plan.md: sea out 102 m, then
+# 308 m of flood inland. Kilometre-scale on purpose -- see _coastline_limits.
 COASTLINE_DEFAULTS: Dict[str, float] = {
     "ocean_depth_m": 30.0,      # flat sea floor depth east of the beach
     "inland_height_m": 12.0,    # flat land elevation west of the beach; high

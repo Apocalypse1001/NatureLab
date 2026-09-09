@@ -2765,13 +2765,38 @@ class TsunamiLabTests(unittest.IsolatedAsyncioTestCase):
                 flood, t_flood = shore_x - x, manager.sim_time
         manager.stop()
 
-        self.assertGreater(retreat, 20.0,
+        self.assertGreater(retreat, 60.0,
                             f"the sea must visibly leave the beach; it moved {retreat:.1f} m")
-        self.assertGreater(flood, 20.0,
+        self.assertGreater(flood, 150.0,
                             f"the wave must then run up the land; it reached {flood:.1f} m")
         self.assertLess(t_retreat, t_flood,
                          f"the sea must go OUT (t={t_retreat:.0f}s) before the wave comes "
                          f"IN (t={t_flood:.0f}s) -- that ordering is the whole signature")
+
+    async def test_a_tsunami_world_uses_sea_bed_roughness(self) -> None:
+        """A sea bed is not a river channel, and the difference is measurable
+        rather than cosmetic: at the river channel's n = 0.030 the sea withdraws
+        62 m, at a sand bed's 0.020 it withdraws 102 m. Drawdown is slow flow
+        over shallow water, which is exactly what Manning friction damps
+        hardest, so getting this constant wrong shows up directly in the
+        signature the scenario exists to show."""
+        manager = SimulationManager()
+        self._coast(manager)
+        manager.world.water.level = 0.0
+        manager.world.water.tsunami_enabled = True
+        manager.start()
+        n = np.asarray(manager.fluid._manning.numpy())
+        manager.stop()
+        self.assertAlmostEqual(float(n.min()), config.SEABED_MANNING_N, places=6)
+        self.assertAlmostEqual(float(n.max()), config.SEABED_MANNING_N, places=6)
+
+        plain = SimulationManager()
+        plain.start()
+        n_plain = np.asarray(plain.fluid._manning.numpy())
+        plain.stop()
+        self.assertAlmostEqual(float(n_plain.max()), config.FLUID_MANNING_N, places=6,
+                               msg="a non-tsunami world must keep the river channel's "
+                                   "roughness untouched")
 
     async def test_wavemaker_owns_the_east_edge_alone(self) -> None:
         """The outlet must be forced off, not merely expected to be off.

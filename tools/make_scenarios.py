@@ -328,8 +328,8 @@ TSUNAMI_PERIOD_S = 200.0
 # 5 m/s. Amplitude 9, or period 100, drives it to the
 # FLUID_MAX_VELOCITY = 20 clamp exactly, where a numerical guard rather
 # than the physics is shaping what you would see.
-TSUNAMI_MEASURED_RETREAT_M = 62.0
-TSUNAMI_MEASURED_FLOOD_M = 258.0
+TSUNAMI_MEASURED_RETREAT_M = 102.0
+TSUNAMI_MEASURED_FLOOD_M = 308.0
 
 
 def _coastline_params() -> Dict[str, float]:
