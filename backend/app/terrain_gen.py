@@ -359,29 +359,54 @@ def volcano_cone(terrain, params: Dict[str, Any] | None = None) -> Dict[str, flo
 # to `-ocean_depth_m` at and east of `land_edge_x + beach_run_m`, with genuine
 # zero-gradient flats on both sides because a smoothstep has zero derivative
 # at both its own endpoints -- no clamping needed to make the flats flat.
+# Measured on the real solver, docs/13_tsunami2_plan.md: sea out 62 m, then
+# 258 m of flood inland. Kilometre-scale on purpose -- see _coastline_limits.
 COASTLINE_DEFAULTS: Dict[str, float] = {
-    "ocean_depth_m": 15.0,      # flat sea floor depth east of the beach
-    "inland_height_m": 5.0,     # flat land elevation west of the beach
-    "land_edge_x": -40.0,       # where the flat land ends and the beach begins
-    "beach_run_m": 60.0,        # horizontal span of the smoothstep beach face
-}
-_COASTLINE_LIMITS: Dict[str, tuple] = {
-    "ocean_depth_m": (2.0, 40.0),
-    "inland_height_m": (1.0, 30.0),
-    "land_edge_x": (-config.WORLD_SIZE_M * 0.5 + 5.0, config.WORLD_SIZE_M * 0.5 - 20.0),
-    "beach_run_m": (10.0, config.WORLD_SIZE_M),
+    "ocean_depth_m": 30.0,      # flat sea floor depth east of the beach
+    "inland_height_m": 12.0,    # flat land elevation west of the beach; high
+                                # enough that the flood stops ON the plain
+                                # rather than against the map's west wall
+    "land_edge_x": -950.0,      # where the flat land ends and the beach begins
+    "beach_run_m": 900.0,       # horizontal span of the smoothstep beach face
 }
 
 
-def validate_coastline(params: Dict[str, Any] | None) -> Dict[str, float]:
+def _coastline_limits(world_size_m: float) -> Dict[str, tuple]:
+    """Bounds scaled to the world the coastline is being written into.
+
+    These used to be fixed against `config.WORLD_SIZE_M`. That is the size of
+    the DEFAULT world, not of this one: `TerrainGrid.cell_size` is per-world
+    and serialized, so a tsunami scenario can be kilometres across while the
+    river and the volcano stay at 1 m cells. Fixed bounds rejected every
+    kilometre-scale coast outright.
+
+    Why a tsunami wants that scale, measured in docs/probe_tsunami_v2.py: how
+    far the sea goes out is the drawdown divided by the beach SLOPE, so the
+    signature needs a genuinely gentle shore -- real tsunami coast runs 1:50 to
+    1:1000. A 200 m map can only hold a 1:2.3 cliff, on which a metre of
+    drawdown moves the waterline two metres and nothing is visible.
+    """
+    half = world_size_m * 0.5
+    return {
+        "ocean_depth_m": (2.0, max(40.0, world_size_m * 0.05)),
+        "inland_height_m": (1.0, max(30.0, world_size_m * 0.02)),
+        "land_edge_x": (-half + world_size_m * 0.02, half - world_size_m * 0.1),
+        "beach_run_m": (world_size_m * 0.05, world_size_m * 4.0),
+    }
+
+
+def validate_coastline(params: Dict[str, Any] | None,
+                       world_size_m: float | None = None) -> Dict[str, float]:
     out = dict(COASTLINE_DEFAULTS)
+    limits = _coastline_limits(float(world_size_m if world_size_m
+                                     else config.WORLD_SIZE_M))
     for key, value in (params or {}).items():
         if key not in COASTLINE_DEFAULTS:
             raise ValueError(f"unknown coastline parameter: {key!r}")
         number = float(value)
         if not np.isfinite(number):
             raise ValueError(f"coastline.{key} must be finite")
-        low, high = _COASTLINE_LIMITS[key]
+        low, high = limits[key]
         if not low <= number <= high:
             raise ValueError(f"coastline.{key} out of range [{low}, {high}]: {number}")
         out[key] = number
@@ -396,7 +421,8 @@ def coastline(terrain, params: Dict[str, Any] | None = None) -> Dict[str, float]
     `WarpShallowWaterSolver.initialize`'s tsunami branch) smoothsteps down
     over `beach_run_m` metres to a flat ocean floor at `-ocean_depth_m`, along
     x only -- uniform in z, a straight-line shore matching the straight-line
-    wavefront `WaterState.tsunami_*` seeds. Returns the effective parameters
+    wavefront `_apply_tsunami_edge` drives in through the east edge. Returns
+    the effective parameters
     plus `shore_x`, the world x where the bed crosses 0 -- found the same way
     docs/probe_tsunami_v1.py's find_shore_x() does (linear interpolation
     between the two straddling grid columns), so a scenario builder can seat
@@ -404,8 +430,8 @@ def coastline(terrain, params: Dict[str, Any] | None = None) -> Dict[str, float]
     earlier draft of the probe guessed x=-2 for this and was off by nearly
     20 m -- see the plan's "Замер" for what that produced).
     """
-    p = validate_coastline(params)
     rows, cols = terrain.heights.shape
+    p = validate_coastline(params, cols * terrain.cell_size)
     cell = terrain.cell_size
     x = (np.arange(cols, dtype=np.float64) - (cols - 1) * 0.5) * cell
 

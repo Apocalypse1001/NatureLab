@@ -381,21 +381,25 @@ class WaterState:
     inlet_discharge_m3s: float = 12.0  # prescribed Q -- the level is the answer
     outlet_centre_z: float = 0.0
     outlet_width_m: float = 0.0      # 0 = the whole edge, as before v0.12.0
-    # TsunamiLab (docs/probe_tsunami_v1.py). A ONE-SHOT initial condition, not
-    # a per-tick boundary like inlet/outlet above: an N-wave (trough on the
-    # shore side, crest on the ocean side, riding on top of ordinary still
-    # water) seeded across the whole grid the moment the solver initializes,
-    # uniform in z -- a straight-line wavefront, not a point source. Zero
-    # initial velocity, not the "textbook" travelling-wave u=-c*eta/H: the
-    # probe measured that relation driving max|u| to the FLUID_MAX_VELOCITY
-    # clamp and producing a messy multi-hump shore trace, where u=0 gave the
-    # clean single drawback-then-wave signature on the first try -- see the
-    # probe's seed_pulse() docstring for the measured comparison. Off by
-    # default, so every world that predates this behaves exactly as before.
+    # TsunamiLab (docs/13_tsunami2_plan.md). A per-tick BOUNDARY, unlike the
+    # one-shot seed this replaced in v0.14.1: the east edge is held at the sea
+    # level outside the map, an N-shape in time -- the sea withdraws, then
+    # surges. The map is a window onto a coast, not a container for a whole
+    # wave, which is what lets the period be long enough to matter: v0.14.0
+    # seeded the wave inside the grid, and a wave long enough to draw the sea
+    # back does not fit there. Measured consequence of that, in
+    # docs/probe_tsunami_v2.py: the sea retreated 1.4 m and the land flooded
+    # 4.6 m, which is not a tsunami, it is a ripple.
+    #
+    # `tsunami_period_s` is the shape's own time scale, NOT the full wave
+    # period: the trough bottoms out one period before the centre and the
+    # crest peaks one period after it, so the whole event lasts roughly four
+    # of them. Peak height is amplitude*exp(-0.5) = 0.607*amplitude, not
+    # amplitude. Off by default, so every world that predates this is
+    # untouched.
     tsunami_enabled: bool = False
-    tsunami_amplitude_m: float = 2.0
-    tsunami_half_width_m: float = 15.0
-    tsunami_centre_x: float = 0.0     # world x of the pulse's own centre (not the shore)
+    tsunami_amplitude_m: float = 6.0
+    tsunami_period_s: float = 100.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {"level": self.level, "visible": self.visible,
@@ -409,8 +413,7 @@ class WaterState:
                 "outlet_width_m": self.outlet_width_m,
                 "tsunami_enabled": self.tsunami_enabled,
                 "tsunami_amplitude_m": self.tsunami_amplitude_m,
-                "tsunami_half_width_m": self.tsunami_half_width_m,
-                "tsunami_centre_x": self.tsunami_centre_x}
+                "tsunami_period_s": self.tsunami_period_s}
 
 
 @dataclass
@@ -503,12 +506,14 @@ class WorldState:
             outlet_width_m=finite_number(water.get("outlet_width_m", 0.0),
                                          "water.outlet_width_m"),
             tsunami_enabled=bool(water.get("tsunami_enabled", False)),
-            tsunami_amplitude_m=finite_number(water.get("tsunami_amplitude_m", 2.0),
+            tsunami_amplitude_m=finite_number(water.get("tsunami_amplitude_m", 6.0),
                                               "water.tsunami_amplitude_m"),
-            tsunami_half_width_m=finite_number(water.get("tsunami_half_width_m", 15.0),
-                                               "water.tsunami_half_width_m"),
-            tsunami_centre_x=finite_number(water.get("tsunami_centre_x", 0.0),
-                                           "water.tsunami_centre_x"))
+            # A v0.14.0 save carries tsunami_half_width_m/tsunami_centre_x
+            # instead. Those described a shape in SPACE and have no meaning for
+            # a boundary driven in time, so they are dropped rather than
+            # silently reinterpreted into a number they never meant.
+            tsunami_period_s=finite_number(water.get("tsunami_period_s", 100.0),
+                                           "water.tsunami_period_s"))
         env = data.get("environment", {})
         state.environment = EnvironmentState(
             gravity=finite_number(env.get("gravity", 9.81), "environment.gravity"),

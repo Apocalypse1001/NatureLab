@@ -2662,82 +2662,143 @@ class LavaCombustionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TsunamiLabTests(unittest.IsolatedAsyncioTestCase):
-    """docs/probe_tsunami_v1.py's finding, exercised through the real
-    SimulationManager/WorldState/save-load path rather than the probe's own
-    direct solver poking -- the probe proves the physics; this proves the
-    wiring (WaterState.to_dict/from_dict, fluid.initialize's tsunami branch,
-    reset() replaying the seed) actually connects it."""
+    """The wavemaker, exercised through the real SimulationManager rather than
+    by poking the solver directly: docs/probe_tsunami_v2.py proves the physics,
+    these prove the wiring (WaterState round-trip, initialize's calm-sea
+    branch, the per-substep boundary launch) actually connects it.
+
+    The measurement that matters here is the WATERLINE, not the depth at a
+    fixed point. v0.14.0's tests asked only whether depth at one cell fell and
+    then rose; it did, which is why they passed while the scene showed the sea
+    retreating 1.4 m -- a ripple, not a tsunami. Asking where the wet/dry
+    boundary is instead is what makes these tests able to fail for the right
+    reason."""
+
+    CELL = 10.0            # this scenario, and only this one, is kilometre-scale
+
+    def _coast(self, manager):
+        from app.terrain_gen import coastline
+        manager.world.terrain.cell_size = self.CELL
+        return coastline(manager.world.terrain)
+
+    def _waterline_x(self, manager) -> float:
+        """World x of the wet/dry boundary along the centre row, scanning from
+        the western (land) side -- the thing a person actually watches."""
+        cell = manager.world.terrain.cell_size
+        xs = (np.arange(N) - (N - 1) * 0.5) * cell
+        row = np.asarray(manager.fluid._h.numpy()).reshape(N, N)[N // 2]
+        wet = np.flatnonzero(row > config.FLUID_DRY_DEPTH)
+        return float(xs[wet[0]]) if len(wet) else float(xs[-1])
 
     async def test_tsunami_fields_survive_a_save_load_round_trip(self) -> None:
         manager = SimulationManager()
-        from app.terrain_gen import coastline
-        coastline(manager.world.terrain, {"ocean_depth_m": 15.0})
+        self._coast(manager)
         manager.world.water.tsunami_enabled = True
-        manager.world.water.tsunami_amplitude_m = 2.0
-        manager.world.water.tsunami_half_width_m = 15.0
-        manager.world.water.tsunami_centre_x = 60.0
+        manager.world.water.tsunami_amplitude_m = 6.0
+        manager.world.water.tsunami_period_s = 100.0
         manager.save("tsunamitest")
         manager.load("tsunamitest")
         water = manager.world.water
         self.assertTrue(water.tsunami_enabled)
-        self.assertEqual(water.tsunami_amplitude_m, 2.0)
-        self.assertEqual(water.tsunami_half_width_m, 15.0)
-        self.assertEqual(water.tsunami_centre_x, 60.0)
+        self.assertEqual(water.tsunami_amplitude_m, 6.0)
+        self.assertEqual(water.tsunami_period_s, 100.0)
+        self.assertEqual(manager.world.terrain.cell_size, self.CELL,
+                          "cell_size must round-trip: it is what makes this one "
+                          "scenario kilometre-scale while the others stay at 1 m")
 
     async def test_tsunami_default_world_is_unaffected(self) -> None:
-        """tsunami_enabled defaults False -- every world that predates this
-        feature, and every non-tsunami scenario, must seed exactly as before:
-        the level-held west SOURCE columns fill (water.level defaults 0.5),
-        everything else stays bone dry. Only the tsunami branch would touch
-        the rest of the grid."""
+        """tsunami_enabled defaults False, so every world that predates this
+        feature seeds exactly as before: the level-held west SOURCE columns
+        fill, everything else stays dry."""
         manager = SimulationManager()
         manager.start()
         h = np.asarray(manager.fluid._h.numpy()).reshape(N, N)
         self.assertEqual(float(h[N // 2, col(0.0)]), 0.0,
-                          "a default (non-tsunami) flat world must stay dry away from the "
-                          "west edge -- the tsunami branch must not fire when disabled")
+                          "a default (non-tsunami) flat world must stay dry away from "
+                          "the west edge -- the tsunami branch must not fire when off")
 
-    async def test_tsunami_pulse_gives_drawback_then_wave(self) -> None:
-        """The actual deliverable: loaded through SimulationManager (not the
-        probe's direct solver access), the shore point recedes to nearly dry
-        BEFORE a big wave arrives -- the same (depth=15m, amp=2.0m, hw=15m)
-        point docs/probe_tsunami_v1.py's summary sweep measured as
-        dry_at=7.2s, wave_at=8.5s."""
-        from app.terrain_gen import coastline
-
+    async def test_tsunami_starts_as_a_calm_sea_not_a_seeded_wave(self) -> None:
+        """v0.14.0 put an N-wave into the grid at t=0, so the scene began
+        mid-event. The wave now arrives through the east edge instead, which
+        means the initial state must be flat: still water everywhere the bed is
+        below datum, and nothing else."""
         manager = SimulationManager()
-        effective = coastline(manager.world.terrain, {"ocean_depth_m": 15.0})
+        self._coast(manager)
         manager.world.water.level = 0.0
         manager.world.water.tsunami_enabled = True
-        manager.world.water.tsunami_amplitude_m = 2.0
-        manager.world.water.tsunami_half_width_m = 15.0
-        manager.world.water.tsunami_centre_x = 60.0
         manager.start()
-
-        centre_j = N // 2
-        shore_i = col(effective["shore_x"] + 2.0)
-        baseline = float(np.asarray(manager.fluid._h.numpy())
-                          .reshape(N, N)[centre_j, shore_i])
-        self.assertGreater(baseline, 0.1, "shore gauge must start in real water, not on land")
-
-        dry_at = wave_at = None
-        for step in range(int(40.0 / config.FIXED_DT)):
-            manager._step_once()
-            t = manager.sim_time
-            shore_h = float(np.asarray(manager.fluid._h.numpy())
-                             .reshape(N, N)[centre_j, shore_i])
-            if dry_at is None and shore_h <= 0.05:
-                dry_at = t
-            if wave_at is None and shore_h >= baseline * 1.5:
-                wave_at = t
-            if dry_at is not None and wave_at is not None:
-                break
+        bed = np.asarray(manager.world.terrain.heights, dtype=np.float64)
+        h = np.asarray(manager.fluid._h.numpy()).reshape(N, N)
+        still = np.maximum(-bed, 0.0)
+        self.assertLess(float(np.abs(h - still).max()), 1.0e-3,
+                         "the sea must start flat -- any departure means a wave was "
+                         "seeded into the domain, which is what v0.14.0 did wrong")
         manager.stop()
 
-        self.assertIsNotNone(dry_at, "shore never went dry -- no drawback")
-        self.assertIsNotNone(wave_at, "shore never saw a wave after the drawback")
-        self.assertLess(dry_at, wave_at,
-                         f"drawback (t={dry_at}) must precede the wave (t={wave_at})")
+    async def test_the_sea_goes_out_before_the_wave_comes_in(self) -> None:
+        """The actual deliverable, and the one v0.14.0 could not have passed:
+        the WATERLINE must move seaward by a visible distance, and only then
+        must the wave carry it inland past where it started."""
+        manager = SimulationManager()
+        effective = self._coast(manager)
+        shore_x = effective["shore_x"]
+        manager.world.water.level = 0.0
+        manager.world.water.tsunami_enabled = True
+        manager.world.water.tsunami_amplitude_m = 6.0
+        manager.world.water.tsunami_period_s = 200.0
+        manager.start()
+
+        self.assertAlmostEqual(self._waterline_x(manager), shore_x,
+                               delta=2.0 * self.CELL,
+                               msg="the run must start with the sea at the shoreline")
+
+        retreat = flood = 0.0
+        t_retreat = t_flood = None
+        for step in range(int(680.0 / config.FIXED_DT)):
+            manager._step_once()
+            if step % 120:
+                continue
+            x = self._waterline_x(manager)
+            if x - shore_x > retreat:
+                retreat, t_retreat = x - shore_x, manager.sim_time
+            if shore_x - x > flood:
+                flood, t_flood = shore_x - x, manager.sim_time
+        manager.stop()
+
+        self.assertGreater(retreat, 20.0,
+                            f"the sea must visibly leave the beach; it moved {retreat:.1f} m")
+        self.assertGreater(flood, 20.0,
+                            f"the wave must then run up the land; it reached {flood:.1f} m")
+        self.assertLess(t_retreat, t_flood,
+                         f"the sea must go OUT (t={t_retreat:.0f}s) before the wave comes "
+                         f"IN (t={t_flood:.0f}s) -- that ordering is the whole signature")
+
+    async def test_wavemaker_owns_the_east_edge_alone(self) -> None:
+        """The outlet must be forced off, not merely expected to be off.
+
+        Measured cost of getting this wrong: with the outlet left on, the
+        tsunami floods 0 m inland instead of 258 m. Not because the outlet
+        drains the water -- that kernel is already skipped -- but because
+        `outflow_columns` also makes the edge transmissive for VELOCITY inside
+        `_velocity_step`, so the arriving wave runs straight back out. A user
+        ticking "open downstream edge" would otherwise switch the tsunami off
+        with no error and no clue."""
+        manager = SimulationManager()
+        self._coast(manager)
+        manager.world.water.level = 0.0
+        manager.world.water.tsunami_enabled = True
+        manager.world.water.outflow_enabled = True     # deliberately both on
+        manager.start()
+        for _ in range(120):
+            manager._step_once()
+        columns = int(manager.fluid._outflow_columns)
+        removed = float(manager.fluid.diagnostics().get("removed_m3", 0.0))
+        manager.stop()
+        self.assertEqual(columns, 0,
+                          "the open outlet must be forced off while the wavemaker "
+                          "drives that edge, whatever the world file asks for")
+        self.assertEqual(removed, 0.0,
+                          "and it must therefore remove nothing")
 
 
 if __name__ == "__main__":

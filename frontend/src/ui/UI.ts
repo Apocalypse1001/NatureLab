@@ -56,12 +56,16 @@ const SCENARIOS: { name: string; label: string; hint: string }[] = [
         + '-- raise "Discharge Q" in the vent’s own properties, or just '
         + 'wait, to push the flow further' },
   { name: 'scenario_tsunami', label: 'Tsunami',
-    hint: 'A beach seeded with a real wave (not a rising flood front): the '
-        + 'sea recedes to nearly dry at the shore gauge around t=7s, then a '
-        + 'wave arrives around t=8.5s and sweeps everything loose -- cars, '
-        + 'people, crates, debris, trees. Houses are static and cannot be '
-        + 'damaged or moved by water in this build (only lava contact does '
-        + 'that), so they stand and split the flow instead of falling' },
+    hint: 'The only kilometre-scale world here: 2 km across at 10 m cells, '
+        + 'because how far the sea goes out is the drawdown divided by the '
+        + 'beach slope, and a real gentle shore does not fit in 200 m. The '
+        + 'wave is not seeded on the map -- it arrives through the seaward '
+        + 'edge, so the sea first withdraws and bares the sea bed, then the '
+        + 'wave runs in over the coastal plain. Two things worth knowing: at '
+        + '10 m cells a house is smaller than one cell, so the buildings are '
+        + 'landmarks for scale and do not split the flow the way they do in '
+        + 'the River scenario; and water damages nothing in this build (only '
+        + 'lava does), so what you see is things carried, not broken' },
 ];
 
 export class UI {

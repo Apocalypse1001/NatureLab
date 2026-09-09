@@ -276,6 +276,48 @@ if WARP_IMPORTED:
 
 
     @wp.kernel
+    def _apply_tsunami_edge(h: wp.array(dtype=float), bed: wp.array(dtype=float),
+                            solid: wp.array(dtype=wp.int32),
+                            width: int, height: int, columns: int,
+                            level: float, area: float,
+                            added: wp.array(dtype=float)):
+        """Hold the EAST columns at the sea level outside the map.
+
+        The open ocean beyond the domain draws down and then surges; this is
+        the window onto a coast, not a container for a whole wave. Mechanically
+        identical to `_apply_source` on the west edge -- target depth is
+        `max(0, level - bed)` and the change is booked to the volume ledger --
+        except that `level` is a function of time, supplied per substep by
+        `WarpShallowWaterSolver.advance` from `WaterState.tsunami_*`.
+
+        Why this rather than seeding a wave inside the grid, which is what
+        v0.14.0 did and what docs/probe_tsunami_v2.py measured as wrong: a wave
+        long enough to draw the sea back does not FIT in the domain alongside
+        the shore and the land behind it. Shallow-water theory wants wavelength
+        >> depth, and a pulse short enough to fit gave a ratio of 4, i.e. a
+        wave the solver is not entitled to model in the first place. Driving
+        the boundary moves the wave period into TIME, where the domain size
+        stops constraining it.
+
+        Honest limitation, stated here rather than discovered later: a
+        prescribed level is a REFLECTIVE boundary. Water the shore sends back
+        seaward does not leave through this edge, it bounces. That is harmless
+        for the arrival this scenario is about (the reflection needs a full
+        return trip to matter) and it is why `_apply_outflow` is suppressed on
+        these same columns while the wavemaker owns them -- two mechanisms
+        writing the same cells is the "two sources, no single answer to where
+        the water comes from" problem `_apply_source` already warns about.
+        """
+        idx = wp.tid()
+        if idx < width * height:
+            i = idx % width
+            if i >= width - columns and solid[idx] == 0:
+                target = wp.max(0.0, level - bed[idx])
+                wp.atomic_add(added, 0, (target - h[idx]) * area)
+                h[idx] = target
+
+
+    @wp.kernel
     def _apply_river_inlet(h: wp.array(dtype=float), u: wp.array(dtype=float),
                            v: wp.array(dtype=float),
                            sediment: wp.array(dtype=float),
@@ -1334,6 +1376,9 @@ class WarpShallowWaterSolver(FluidSolver):
         self._diag_solidified = None
         self._level = 0.5
         self._source_enabled = True
+        self._tsunami_enabled = False
+        self._tsunami_amplitude = 0.0
+        self._tsunami_period = 60.0
         self._seen_terrain_revision = -1
         self._seen_obstacle_revision = -1
         self.terrain_gpu_uploads = 0
@@ -1350,6 +1395,12 @@ class WarpShallowWaterSolver(FluidSolver):
         self._world, self._terrain = world, world.terrain
         self._level = float(world.water.level)
         self._source_enabled = True
+        # TsunamiLab wavemaker. Off unless the world asks for it, so every
+        # non-tsunami world behaves exactly as it did before v0.14.1.
+        self._tsunami_enabled = bool(getattr(world.water, "tsunami_enabled", False))
+        self._tsunami_amplitude = float(getattr(world.water, "tsunami_amplitude_m", 0.0))
+        self._tsunami_period = max(1.0e-3, float(
+            getattr(world.water, "tsunami_period_s", 60.0)))
         self._width, self._height = world.terrain.width + 1, world.terrain.height + 1
         self._count = self._width * self._height
         bed_grid = np.ascontiguousarray(world.terrain.heights, dtype=np.float32)
@@ -1360,28 +1411,19 @@ class WarpShallowWaterSolver(FluidSolver):
         inlet_wanted = bool(getattr(water, "inlet_enabled", False))
         tsunami_wanted = bool(getattr(water, "tsunami_enabled", False))
         if tsunami_wanted:
-            # ONE-SHOT initial condition across the WHOLE grid (not just the
-            # source columns): real still water wherever the bed sits below
-            # `self._level` (the sea existing before the wave hits it is a
-            # precondition, not the effect), an N-wave superimposed uniform in
-            # z (a straight wavefront, matching a straight coastline), zero
-            # velocity. See WaterState.tsunami_* for why u=0 and not the
-            # "textbook" travelling-wave relation -- measured, not guessed, in
-            # docs/probe_tsunami_v1.py's seed_pulse(). Supersedes the source-
-            # column prefill below: a tsunami scenario's west edge is built as
-            # dry land (see terrain_gen.coastline), so that prefill would
-            # contribute nothing there anyway.
-            amplitude = float(getattr(water, "tsunami_amplitude_m", 2.0))
-            half_width = max(1.0e-6, float(getattr(water, "tsunami_half_width_m", 15.0)))
-            centre_x = float(getattr(water, "tsunami_centre_x", 0.0))
-            xs = (np.arange(self._width, dtype=np.float64)
-                  - world.terrain.width / 2.0) * world.terrain.cell_size
-            still = np.maximum(self._level - bed_grid.astype(np.float64), 0.0)
-            eta_row = amplitude * ((xs - centre_x) / half_width) \
-                * np.exp(-0.5 * ((xs - centre_x) / half_width) ** 2)
-            eta_grid = np.tile(eta_row[None, :], (self._height, 1))
-            eta_grid = np.where(still > config.FLUID_DRY_DEPTH, eta_grid, 0.0)
-            depth_grid = np.maximum(still + eta_grid, 0.0).astype(np.float32)
+            # A CALM SEA, everywhere the bed sits below `self._level` -- the
+            # ocean existing before the wave reaches it is a precondition, not
+            # the effect. No wave is seeded here at all: it arrives through the
+            # east edge, driven per substep by `_apply_tsunami_edge`. v0.14.0
+            # seeded an N-wave into the grid instead, and
+            # docs/probe_tsunami_v2.py measured what that produced -- the sea
+            # retreated 1.4 m and the land flooded 4.6 m, because a wave long
+            # enough to draw the sea back cannot fit in the domain alongside
+            # the shore and the land behind it. This branch still supersedes
+            # the source-column prefill below, for the same reason as before: a
+            # tsunami world's west edge is dry land (terrain_gen.coastline).
+            depth_grid = np.maximum(
+                self._level - bed_grid.astype(np.float64), 0.0).astype(np.float32)
         elif not inlet_wanted:
             # A river inlet owns the west edge; pre-filling it from the level
             # control as well would put a wall of water across the floodplain at
@@ -1475,6 +1517,8 @@ class WarpShallowWaterSolver(FluidSolver):
             # telling them a loaded scenario would erode its bed when it would
             # not, and that its river could not leave the map when it could.
             self.set_erosion(bool(getattr(water, "erosion_enabled", False)))
+            # set_outflow forces this shut under the tsunami wavemaker; see
+            # its docstring for why that belongs there and not here.
             self.set_outflow(
                 config.FLUID_OUTFLOW_COLUMNS
                 if bool(getattr(water, "outflow_enabled", True)) else 0,
@@ -1708,7 +1752,20 @@ class WarpShallowWaterSolver(FluidSolver):
         `centre_z`, so a valley drains through its channel instead of through
         its floodplain. Zero (the default) keeps the whole edge open, which is
         what every world before this expects.
+
+        v0.14.1: the tsunami wavemaker OWNS that edge, so the outlet is forced
+        shut here rather than at the call sites. There are two of them --
+        `set_boundaries` at load, and `SimulationManager._step_once` re-reading
+        the toggle live every tick so it can be changed while RUNNING -- and
+        the live one silently undid a fix applied only to the other. Measured
+        cost of the outlet being open under the wavemaker: the wave floods 0 m
+        inland instead of 258 m. Not because `_apply_outflow` drains it (that
+        kernel is already skipped) but because `_velocity_step` reads the same
+        column count and makes the edge transmissive for VELOCITY, so the
+        arriving wave runs straight back out to sea.
         """
+        if getattr(self, "_tsunami_enabled", False):
+            columns = 0
         self._outflow_columns = max(0, int(columns))
         if width_m <= 0.0 or self._height <= 0:
             self._outflow_rows = (0, max(0, self._height - 1))
@@ -2028,7 +2085,25 @@ class WarpShallowWaterSolver(FluidSolver):
                                   config.FLUID_DRY_DEPTH, config.DRAIN_SWIRL_GAIN,
                                   config.FLUID_MAX_VELOCITY, area,
                                   self._diag_removed], device=self.device)
-            if self._outflow_columns:
+            if self._tsunami_enabled:
+                # The sea level outside the map, now. An N-shape in TIME:
+                # negative (the sea withdrawing) before the centre, positive
+                # (the wave) after it, so the trough arrives first because it
+                # is emitted first -- the same "ordering is the whole
+                # mechanism" the in-domain seed used, moved to the boundary.
+                # Peak magnitude is amplitude*exp(-0.5) = 0.607*amplitude, not
+                # amplitude; v0.14.0's plan doc quoted the latter as if it were
+                # the wave height, which it never was.
+                z = (self._time - 2.0 * self._tsunami_period) / self._tsunami_period
+                level = self._tsunami_amplitude * z * math.exp(-0.5 * z * z)
+                wp.launch(_apply_tsunami_edge, dim=self._count,
+                          inputs=[self._h, self._bed, self._obstacles,
+                                  self._width, self._height,
+                                  max(1, self._outflow_columns
+                                      or config.FLUID_OUTFLOW_COLUMNS),
+                                  float(level), area, self._diag_added],
+                          device=self.device)
+            if self._outflow_columns and not self._tsunami_enabled:
                 wp.launch(_apply_outflow, dim=self._count,
                           inputs=[self._h, self._u, self._sediment,
                                   self._obstacles,
