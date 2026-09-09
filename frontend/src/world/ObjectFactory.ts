@@ -151,6 +151,100 @@ const builders: Record<string, Builder> = {
     return g;
   },
 
+  // Parametric house-to-tower: `obj.metadata.floors` drives both footprint and
+  // height. The formula below MIRRORS backend/app/config.py's
+  // building_half_extent_m/building_height_m exactly (same constants, same
+  // names in the comments there) -- that Python function is what
+  // rigid_body.footprint_half_extents and the fluid solver's obstacle mask
+  // actually use, so drifting from it here would draw a building whose visible
+  // size the water doesn't agree with. See that file for why floors changes
+  // footprint (real) but not "water overtops a short one, not a tall one"
+  // (the solver is depth-averaged; every SOLID_OBSTACLE_TYPES body is an
+  // infinitely tall wall regardless of floors).
+  BUILDING: (obj) => {
+    const FLOOR_HEIGHT_M = 3.0;
+    const ROOF_HEIGHT_M = 1.5;
+    const BASE_HALF_EXTENT_M = 2.0;
+    const HALF_EXTENT_PER_FLOOR_M = 0.34;
+
+    const floors = Math.max(1, Math.round(obj.metadata.floors ?? 1));
+    const half = BASE_HALF_EXTENT_M + HALF_EXTENT_PER_FLOOR_M * (floors - 1);
+    const width = half * 2, depth = half * 2;
+    const floorsHeight = floors * FLOOR_HEIGHT_M;
+
+    const g = new THREE.Group();
+    const seed = variant(obj.id);
+    const wall = new THREE.MeshStandardMaterial({
+      color: tinted(OBJECT_COLORS.BUILDING, 0.10, seed), roughness: 0.8,
+    });
+    const trim = new THREE.MeshStandardMaterial({ color: 0xe4e2dc, roughness: 0.75 });
+    const plinthMat = new THREE.MeshStandardMaterial({ color: 0x6f6a62, roughness: 0.9 });
+
+    const plinth = new THREE.Mesh(new THREE.BoxGeometry(width + 0.1, 0.4, depth + 0.1), plinthMat);
+    plinth.position.y = 0.2;
+    const body = new THREE.Mesh(new THREE.BoxGeometry(width, floorsHeight, depth), wall);
+    body.position.y = 0.4 + floorsHeight / 2;
+    const parapet = new THREE.Mesh(
+      new THREE.BoxGeometry(width + 0.2, ROOF_HEIGHT_M * 0.4, depth + 0.2), trim);
+    parapet.position.y = 0.4 + floorsHeight + ROOF_HEIGHT_M * 0.2;
+    g.add(plinth, body, parapet);
+
+    // A small rooftop plant/lift-shaft block reads "tower" from a distance --
+    // only worth drawing once a building is tall enough to be seen from above.
+    if (floors > 4) {
+      const shaft = new THREE.Mesh(
+        new THREE.BoxGeometry(width * 0.35, 1.6, depth * 0.35), plinthMat);
+      shaft.position.set(width * 0.15, 0.4 + floorsHeight + ROOF_HEIGHT_M * 0.4 + 0.8, -depth * 0.15);
+      g.add(shaft);
+    }
+
+    // Entrance on the +z face only, ground floor.
+    const door = new THREE.Mesh(new THREE.BoxGeometry(1.2, 2.1, 0.1),
+      new THREE.MeshStandardMaterial({ color: 0x3a3a40, roughness: 0.6, metalness: 0.2 }));
+    door.position.set(0, 0.4 + 1.05, depth / 2 + 0.02);
+    g.add(door);
+
+    // Windows: one InstancedMesh for the whole facade regardless of floor
+    // count, so a 25-floor tower costs the same handful of draw calls as a
+    // 1-floor house -- see the module comment on why per-window meshes (as
+    // HOUSE uses) don't scale to a city of these.
+    const margin = 0.5, winW = 0.85, gap = 0.75;
+    const windowsOnSide = (length: number) =>
+      Math.max(1, Math.floor(((length - 2 * margin) + gap) / (winW + gap)));
+    const slotPos = (length: number, count: number, k: number) => {
+      const usable = length - 2 * margin;
+      return -usable / 2 + (k + 0.5) * (usable / count);
+    };
+    const nsCount = windowsOnSide(width), ewCount = windowsOnSide(depth);
+    const doorSlot = Math.floor(nsCount / 2);
+    const maxInstances = floors * 2 * nsCount + floors * 2 * ewCount;
+    const windowGeom = new THREE.BoxGeometry(winW, 1.3, 0.08);
+    const windows = new THREE.InstancedMesh(windowGeom, GLASS(), maxInstances);
+    const m = new THREE.Matrix4();
+    let i = 0;
+    for (let f = 0; f < floors; f++) {
+      const y = 0.4 + f * FLOOR_HEIGHT_M + FLOOR_HEIGHT_M * 0.55;
+      for (const z of [depth / 2 + 0.045, -(depth / 2 + 0.045)]) {
+        for (let k = 0; k < nsCount; k++) {
+          if (f === 0 && z > 0 && k === doorSlot) continue;   // leave room for the door
+          m.makeTranslation(slotPos(width, nsCount, k), y, z);
+          windows.setMatrixAt(i++, m);
+        }
+      }
+      for (const x of [width / 2 + 0.045, -(width / 2 + 0.045)]) {
+        for (let k = 0; k < ewCount; k++) {
+          m.makeRotationY(Math.PI / 2);
+          m.setPosition(x, y, slotPos(depth, ewCount, k));
+          windows.setMatrixAt(i++, m);
+        }
+      }
+    }
+    windows.count = i;
+    windows.instanceMatrix.needsUpdate = true;
+    g.add(windows);
+    return g;
+  },
+
   CAR: (obj) => {
     // 4.4 x 2.0 m -- the half-extents the fluid solver samples the body with.
     const g = new THREE.Group();

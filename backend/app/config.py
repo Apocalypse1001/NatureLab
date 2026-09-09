@@ -208,3 +208,40 @@ LAVA_IGNITION_OBSTACLE_MARGIN_M = 0.75
 # `solidified_m3` and the per-frame max bed step are instrumented instead
 # (fluid_solver.diagnostics()); if that measurement ever shows a shock to the
 # surface-gradient term, a limiter gets added on the strength of that number.
+
+# --------------------------------------------------------------- BUILDING (scenario dressing)
+# One parametric type standing in for everything from a 1-2 floor house to a
+# 25-floor tower, driven by a single `floors` metadata value the properties
+# panel exposes -- rather than a fixed type per size, so a scenario author
+# picks a floor count. The solver is depth-averaged and, like every
+# SOLID_OBSTACLE_TYPES body, a BUILDING is rasterized as an infinitely tall
+# wall (see the ROCK note above on the same rule for HOUSE/BRIDGE): floors
+# therefore CANNOT make water overtop a short building and not a tall one --
+# that is a real limitation of this model, not a knob missing from it. What
+# floors legitimately changes is footprint and visible height: a taller real
+# building typically also stands on a wider base, so a 25-floor tower diverts
+# more flow than a cottage, and that is the honest, hydraulically real part of
+# the effect.
+BUILDING_FLOOR_HEIGHT_M = 3.0          # per floor, matches HOUSE's 3 m wall
+BUILDING_ROOF_HEIGHT_M = 1.5           # flat parapet/roof cap on top of the floors
+BUILDING_BASE_HALF_EXTENT_M = 2.0      # footprint at 1 floor -- identical to HOUSE's
+BUILDING_HALF_EXTENT_PER_FLOOR_M = 0.34  # footprint growth per additional floor
+
+
+def building_half_extent_m(floors: float) -> float:
+    """Footprint half-extent (m) for a BUILDING with this many floors.
+
+    The single source of truth for BUILDING's size -- read by
+    `rigid_body.footprint_half_extents` (what the fluid solver's obstacle mask
+    and the rigid-body collision radius both key off) and mirrored in
+    `frontend/src/world/ObjectFactory.ts`'s BUILDING builder so the mesh the
+    user sees is the footprint the water feels.
+    """
+    floors = max(1.0, float(floors))
+    return BUILDING_BASE_HALF_EXTENT_M + BUILDING_HALF_EXTENT_PER_FLOOR_M * (floors - 1.0)
+
+
+def building_height_m(floors: float) -> float:
+    """Visible height (m) for a BUILDING with this many floors. See building_half_extent_m."""
+    floors = max(1.0, float(floors))
+    return floors * BUILDING_FLOOR_HEIGHT_M + BUILDING_ROOF_HEIGHT_M

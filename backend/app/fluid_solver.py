@@ -1178,7 +1178,7 @@ if WARP_IMPORTED:
 # Body types that act as solid walls for the flow. A body carrying a positive
 # `bed_height` is riverbed instead and is excluded regardless of this set --
 # see WarpShallowWaterSolver._is_solid.
-SOLID_OBSTACLE_TYPES = frozenset({"HOUSE", "BRIDGE"})
+SOLID_OBSTACLE_TYPES = frozenset({"HOUSE", "BRIDGE", "BUILDING"})
 
 # A BRIDGE is not a wall: water flows UNDER it. Only its piers obstruct, and
 # only up to the deck. The deck itself is drawn and is what the water is
@@ -1469,6 +1469,7 @@ class WarpShallowWaterSolver(FluidSolver):
         bed_heights = obstacles.get("bed_heights", [])
         piers = obstacles.get("pier_counts", [])
         pier_radii = obstacles.get("pier_radii", [])
+        half_extents = obstacles.get("half_extents", [])
         for n, position in enumerate(positions):
             if n >= len(types) or not self._is_solid(types[n], bed_heights, n):
                 continue
@@ -1481,8 +1482,17 @@ class WarpShallowWaterSolver(FluidSolver):
                                       piers[n] if n < len(piers) else 0.0,
                                       pier_radii[n] if n < len(pier_radii) else 0.0)
                 continue
-            half_x = 2.0 * float(scale[0])
-            half_z = 2.0 * float(scale[2])
+            # Read the real per-type footprint computed by
+            # rigid_body.footprint_half_extents (already scale-multiplied)
+            # rather than assuming HOUSE's own 2.0 m constant -- that
+            # assumption was silently correct only because HOUSE used to be
+            # the sole type on this path; BUILDING's footprint varies with
+            # floors and would otherwise always rasterize at house size.
+            if n < len(half_extents):
+                half_x, half_z = float(half_extents[n][0]), float(half_extents[n][1])
+            else:
+                half_x = 2.0 * float(scale[0])
+                half_z = 2.0 * float(scale[2])
             bound_x = abs(cos_yaw) * half_x + abs(sin_yaw) * half_z
             bound_z = abs(sin_yaw) * half_x + abs(cos_yaw) * half_z
             center_x, center_z = float(position[0]), float(position[2])

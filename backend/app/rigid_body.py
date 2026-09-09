@@ -176,6 +176,15 @@ class RigidStateBuffer:
 
 
 def footprint_half_extents(obj: WorldObject) -> np.ndarray:
+    if obj.type == "BUILDING":
+        # Parametric on `floors`, not a fixed lookup -- see config.py's BUILDING
+        # section for why footprint (rather than a height-blind wall) is the
+        # part of "taller building" this depth-averaged solver can honestly
+        # represent. This is the single source both the fluid solver's obstacle
+        # mask (via obstacle_snapshot's half_extents) and _resolve_collisions
+        # below read, so a floor-count edit reaches both consistently.
+        half = config.building_half_extent_m(obj.metadata.get("floors", 1.0))
+        return np.asarray((half * obj.scale[0], half * obj.scale[2]), dtype=np.float32)
     base = {"HOUSE": (2.0, 2.0), "CAR": (2.2, 1.0), "TREE": (0.25, 0.25),
             "BOX": (0.6, 0.6), "DEBRIS": (0.6, 0.6), "GAUGE": (0.0, 0.0),
             "ROAD": (6.0, 3.5)}
@@ -233,7 +242,12 @@ class PlaceholderRigidBodySystem(RigidBodySystem):
                                 for obj in objects],
                 "pier_radii": [float(obj.metadata.get("pier_radius", 0.0))
                                for obj in objects],
-                 "scales": self.buffer.scales.copy()}
+                 "scales": self.buffer.scales.copy(),
+                 # The obstacle mask's own source of truth for footprint size
+                 # (fluid_solver._build_obstacle_mask), so a BUILDING's
+                 # floors-dependent extent reaches the solver instead of the
+                 # rasterizer recomputing (and duplicating) it from scale alone.
+                 "half_extents": self.buffer.half_extents.copy()}
 
     def _resolve_collisions(self, dynamic: np.ndarray) -> None:
         count = len(self.buffer.ids)
@@ -241,7 +255,18 @@ class PlaceholderRigidBodySystem(RigidBodySystem):
             return
         base = {"HOUSE": 2.8, "CAR": 2.3, "TREE": 0.55,
                 "BOX": 0.85, "DEBRIS": 0.65}
-        radii = np.asarray([base.get(self._world.objects[oid].type, 0.85)
+
+        def radius(oid: str) -> float:
+            obj = self._world.objects[oid]
+            # BUILDING's collision radius has to track its own footprint
+            # (config.building_half_extent_m), the same one footprint_half_extents
+            # gives the fluid solver -- a fixed constant here would under-push a
+            # car away from a 25-floor tower's real edge.
+            if obj.type == "BUILDING":
+                return 1.4 * config.building_half_extent_m(obj.metadata.get("floors", 1.0))
+            return base.get(obj.type, 0.85)
+
+        radii = np.asarray([radius(oid)
                             * max(self._world.objects[oid].scale[0],
                                   self._world.objects[oid].scale[2])
                             for oid in self.buffer.ids], dtype=np.float32)

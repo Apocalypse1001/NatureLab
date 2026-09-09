@@ -1,7 +1,7 @@
 /** Shared data model — mirrors backend/app/world_state.py. */
 
 export type ObjectType = 'HOUSE' | 'CAR' | 'TREE' | 'BOX' | 'DEBRIS' | 'ROCK'
-  | 'BRIDGE' | 'PERSON' | 'ROAD' | 'SOURCE' | 'DRAIN' | 'GAUGE' | 'VENT';
+  | 'BRIDGE' | 'PERSON' | 'ROAD' | 'SOURCE' | 'DRAIN' | 'GAUGE' | 'VENT' | 'BUILDING';
 
 export type ObjectState =
   | 'INTACT' | 'MOVING' | 'FLOATING' | 'COLLIDING'
@@ -101,7 +101,7 @@ export interface SimEvent {
 }
 
 /** Add new object types here (+ backend defaults) without touching the core. */
-export const OBJECT_TYPES: ObjectType[] = ['HOUSE', 'CAR', 'TREE', 'BOX', 'DEBRIS',
+export const OBJECT_TYPES: ObjectType[] = ['HOUSE', 'BUILDING', 'CAR', 'TREE', 'BOX', 'DEBRIS',
   'ROCK', 'BRIDGE', 'PERSON', 'ROAD', 'SOURCE', 'DRAIN', 'GAUGE', 'VENT'];
 
 export const OBJECT_COLORS: Record<string, number> = {
@@ -118,4 +118,5 @@ export const OBJECT_COLORS: Record<string, number> = {
   DRAIN: 0xd85f4f,
   GAUGE: 0x62e6ff,
   VENT: 0xff5a1f,
+  BUILDING: 0x9aa0ab,
 };

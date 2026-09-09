@@ -620,10 +620,30 @@ export class SceneManager {
   }
 
   // ------------------------------------------------------------------ objects
-  setObject(obj: ObjectData): void {
+  /**
+   * Returns true iff a pre-existing group was torn down and replaced (as
+   * opposed to a brand-new object, or an existing one just moved/scaled).
+   * A caller that has a TransformControls gizmo attached by object identity
+   * (EditorController) needs this: `attach()`'d to the old THREE.Object3D
+   * that just got disposed, the gizmo does not silently follow the id to the
+   * new one -- it starts warning every frame that its target has left the
+   * scene graph. See main.ts's updateObject callback.
+   */
+  setObject(obj: ObjectData): boolean {
     let group = this.objectsRoot.getObjectByName(obj.id) as THREE.Group | undefined;
+    let rebuilt = false;
+    // BUILDING's geometry is parametric on obj.metadata.floors, not just its
+    // transform -- unlike every other builder, so a floor-count edit in the
+    // properties panel has to force a real rebuild, not just applyTransform.
+    if (group && obj.type === 'BUILDING' && group.userData.floors !== obj.metadata.floors) {
+      this.objectsRoot.remove(group);
+      SceneManager.disposeSubtree(group);
+      group = undefined;
+      rebuilt = true;
+    }
     if (!group) {
       group = buildObjectMesh(obj);
+      if (obj.type === 'BUILDING') group.userData.floors = obj.metadata.floors;
       this.objectsRoot.add(group);
     }
     applyTransform(group, obj);
@@ -631,6 +651,7 @@ export class SceneManager {
     if (this._selectionHelper && this._selectionHelper.userData.owner === obj.id) {
       this._selectionHelper.update();
     }
+    return rebuilt;
   }
 
   /**

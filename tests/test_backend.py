@@ -431,6 +431,51 @@ class Physics04Tests(unittest.IsolatedAsyncioTestCase):
         depth = np.asarray(self.manager.fluid._h.numpy(), dtype=np.float32)
         self.assertEqual(float(depth[old_solid != 0].max()), 0.0)
 
+    async def test_building_floors_scale_footprint_and_obstacle_mask(self) -> None:
+        """BUILDING is parametric on floors (config.building_half_extent_m): a
+        taller building must claim a wider obstacle mask, not just look
+        taller -- otherwise floors would be metadata the solver never sees.
+        Exercises the same half_extents plumbing (rigid_body.obstacle_snapshot
+        -> fluid_solver._build_obstacle_mask) that used to hard-code HOUSE's
+        2.0 m constant for every SOLID_OBSTACLE_TYPES body."""
+        from app.rigid_body import footprint_half_extents
+
+        cottage = self.manager.apply_object_add(
+            {"type": "BUILDING", "position": [0.0, 0.0, 0.0]})
+        self.assertEqual(cottage["metadata"]["floors"], 1.0)
+        half_1f = footprint_half_extents(self.manager.world.objects[cottage["id"]])
+        self.assertAlmostEqual(float(half_1f[0]), config.BUILDING_BASE_HALF_EXTENT_M, places=5)
+
+        self.manager.apply_object_update(cottage["id"], {"metadata": {"floors": 25.0}})
+        half_25f = footprint_half_extents(self.manager.world.objects[cottage["id"]])
+        self.assertGreater(float(half_25f[0]), float(half_1f[0]) * 3.0)
+
+        self.manager.start()
+        cells_25f = int(np.count_nonzero(self.manager.fluid._obstacle_host))
+
+        manager_1f = SimulationManager()
+        manager_1f.apply_object_add({"type": "BUILDING", "position": [0.0, 0.0, 0.0]})
+        manager_1f.start()
+        cells_1f = int(np.count_nonzero(manager_1f.fluid._obstacle_host))
+
+        self.assertGreater(cells_25f, cells_1f * 3,
+                            "a 25-floor BUILDING must rasterize a much wider wall than "
+                            "a 1-floor one -- floors changed metadata but not the "
+                            "solver's obstacle mask")
+
+    async def test_building_survives_a_save_load_round_trip(self) -> None:
+        """Same check every other placeable type in this suite has -- a new
+        metadata key silently never reaching an object is exactly the bug
+        `default_properties`'s own backfill comment names (`bed_height`)."""
+        manager = SimulationManager()
+        building = manager.apply_object_add(
+            {"type": "BUILDING", "position": [10.0, 0.0, 0.0]})
+        manager.apply_object_update(building["id"], {"metadata": {"floors": 9.0}})
+        manager.save("buildingtest")
+        manager.load("buildingtest")
+        reloaded = next(o for o in manager.world.objects.values() if o.type == "BUILDING")
+        self.assertEqual(float(reloaded.metadata["floors"]), 9.0)
+
     async def test_lake_at_rest_and_adaptive_cfl(self) -> None:
         self.manager.start()
         count = N * N

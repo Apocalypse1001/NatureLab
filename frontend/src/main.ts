@@ -151,7 +151,14 @@ store.on('objects-changed', () => {
 store.on('object-updated', (id) => {
   const obj = store.objects.get(id as string);
   if (obj) {
-    sceneManager.setObject(obj);
+    const rebuilt = sceneManager.setObject(obj);
+    // A rebuild (BUILDING's floors changing) tore down the THREE.Object3D
+    // TransformControls was attached to by identity -- it does not silently
+    // follow the id to the new one, it warns every frame that its target has
+    // left the scene graph. Re-running selection re-attaches it. A no-op for
+    // every non-rebuilding edit (mass, friction, position...), since rebuilt
+    // stays false for those.
+    if (rebuilt && store.selectedId === id) store.select(id as string);
     ui.updatePropertyInputs(obj);
   }
 });

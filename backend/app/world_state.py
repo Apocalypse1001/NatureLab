@@ -51,6 +51,7 @@ class ObjectType(str, enum.Enum):
     DRAIN = "DRAIN"
     GAUGE = "GAUGE"
     VENT = "VENT"
+    BUILDING = "BUILDING"
 
     @classmethod
     def register(cls, name: str) -> "ObjectType":
@@ -183,6 +184,16 @@ OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
                       "vent_discharge_m3s": config.LAVA_VENT_DISCHARGE_M3S,
                       "vent_temperature_c": config.LAVA_ERUPTION_TEMP_C,
                       "foundation_height": 0.0, "damage_resistance": 1.0},
+    # Parametric house-to-tower type: `floors` (metadata) drives both footprint
+    # and height via config.building_half_extent_m/building_height_m -- see the
+    # BUILDING section of config.py for why footprint (not height-blocking
+    # water) is the honest lever. Defaults to 1 floor, i.e. house-sized, same
+    # footprint as HOUSE; edit floors in the properties panel to grow it.
+    ObjectType.BUILDING: {"mass": 20000.0, "friction": 0.7, "buoyancy": 1.0,
+                          "volume_m3": 15.0, "drag_coefficient": 1.2,
+                          "ground_contact_area": 16.0, "cross_sectional_area": 12.0,
+                          "is_static": True, "floors": 1.0,
+                          "foundation_height": 0.3, "damage_resistance": 0.8},
 }
 
 
@@ -205,6 +216,7 @@ def default_properties(obj_type: str) -> Dict[str, float]:
             "pier_count": 0.0, "pier_radius": 0.0, "deck_height": 0.0,
             "drain_radius": 0.0, "drain_strength": 0.0,
             "vent_radius": 0.0, "vent_discharge_m3s": 0.0, "vent_temperature_c": 0.0,
+            "floors": 0.0,
             "foundation_height": 0.0, "damage_resistance": 0.5}
     base.update(OBJECT_DEFAULTS.get(ObjectType.register(obj_type), {}))
     return base

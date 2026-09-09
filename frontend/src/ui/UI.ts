@@ -572,6 +572,16 @@ export class UI {
       ['Eruption temp (°C)', 'vent_temp', obj.metadata.vent_temperature_c ?? 0,
        (v) => this.cb.updateObject(obj.id, { metadata: { ...obj.metadata, vent_temperature_c: v } })],
     );
+    // BUILDING (scenario dressing): floors drives both the mesh (SceneManager
+    // rebuilds on a floors change) and the solver's footprint/collision radius
+    // (backend/app/config.py building_half_extent_m) -- rounded/clamped here
+    // AND on the backend, since this input's generic number handling below
+    // would otherwise happily send 2.7 floors.
+    if (obj.type === 'BUILDING') fields.push(
+      ['Floors', 'floors', obj.metadata.floors ?? 1,
+       (v) => this.cb.updateObject(obj.id,
+         { metadata: { ...obj.metadata, floors: Math.max(1, Math.round(v)) } })],
+    );
     for (const [label, key, value, apply] of fields) {
       const row = el('div', 'prop-row');
       row.innerHTML = `<label>${label}</label>`;
