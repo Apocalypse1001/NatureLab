@@ -1,4 +1,4 @@
-# NatureLab 0.14.0 - Architecture
+# NatureLab 0.14.1 - Architecture
 
 Проектная документация, которая объясняет *почему* архитектура такая, живёт в `docs/`:
 [`01_vision.md`](docs/01_vision.md) (цели и критерий качества),
@@ -161,13 +161,27 @@ DRAIN object     radial sink + measured swirl            -- removes water anywhe
 open outlet      east columns, q = u*h leaves the map    -- toggleable, on by default
 river inlet      west edge, prescribed Q -- the level is the answer, not the input
 VENT object      disc, prescribed discharge of hot lava  -- modelled on the drains
-tsunami seed     ONE-SHOT initial surface at t=0         -- not a per-tick boundary
+tsunami edge     east columns held at the sea level OUTSIDE the map, over time
 ```
 
-The last one is the odd member and is listed here so it is not mistaken for a boundary
-condition. `tsunami_enabled` does its entire work inside `initialize()`, seeding an
-N-wave across the whole grid once; after t=0 nothing in the solver knows a tsunami
-happened. That is why it needed no new kernel.
+The last one is the newest and the one most easily misread. It is not a wave placed on
+the map: it is the open ocean beyond the domain drawing down and then surging, so the
+map is a WINDOW onto a coast rather than a container for a whole wave. That distinction
+is what makes the wave period a quantity in time instead of something that has to fit
+on screen, and v0.14.0 got it wrong in exactly that way -- it seeded an N-wave into the
+grid, and a wave long enough to draw the sea back does not fit alongside the shore and
+the land behind it.
+
+Two rules this boundary carries, both learned by measurement:
+
+- It OWNS the east edge, and `set_outflow` forces the open outlet shut whenever it is
+  running. Not for tidiness: `outflow_columns` is also read by `_velocity_step`, where a
+  non-zero value makes the edge transmissive for velocity and the arriving wave runs
+  straight back out to sea. With the outlet left on, the flood is 0 m instead of 258 m.
+- The override lives in `set_outflow` rather than at its call sites, because there are
+  two -- `set_boundaries` at load, and `SimulationManager._step_once` re-reading the
+  toggle every tick so it can be changed while RUNNING. Fixing only the first is a fix
+  the second silently undoes.
 
 A world with no `SOURCE` behaves exactly as 0.7.0 did, which is what keeps the older
 suite valid. A world with one turns the edge inflow off entirely, so "where does the
@@ -183,8 +197,28 @@ Two invariants worth keeping when this area is touched again:
 
 ## World size
 
-`WORLD_SIZE_M` and `TERRAIN_CELLS` are the only two numbers that define the domain;
-everything else derives from them. That includes the frontend: `SceneManager` rebuilds
+`WORLD_SIZE_M` and `TERRAIN_CELLS` define the DEFAULT domain, and everything else
+derives from them -- but they are the default's numbers, not a global truth.
+`TerrainGrid.cell_size` is per-world and serialized, so a saved world can be at a
+completely different scale without touching any other. v0.14.1 uses that: the tsunami
+scenario is 2 km across at 10 m cells on the same 201x201 grid, while the river, dam and
+volcano stay at 1 m. Nothing about the mesh, the vertex index type or the substep budget
+changes, because the cell COUNT does not.
+
+The frontend already follows this correctly: `SceneManager.rebuildTerrain` treats a
+changed `cellSize` as a resize just as it treats a changed width or height, and camera
+framing, fog, zoom limits and the sun's shadow frustum are all derived from
+`terrain.sizeM` rather than from fixed metres.
+
+Two things worth knowing before writing a world at an unusual scale. Generators that
+validate their parameters must size their bounds from the world they are writing into,
+not from `config.WORLD_SIZE_M` -- `terrain_gen._coastline_limits` does this, and fixed
+bounds rejected every kilometre-scale coast outright until it did. And an object is only
+as solid as the grid can resolve: at 10 m cells a 4 m house is smaller than one cell, so
+it is scenery rather than an obstacle, which the tsunami scenario states in its own hint
+rather than leaving to be discovered.
+
+Everything else derives from the domain numbers. That includes the frontend: `SceneManager` rebuilds
 terrain, water, grid helper, camera framing, fog and zoom limits whenever the grid
 resolution it is handed differs from the one it currently holds, so a resize is a
 config edit rather than a coordinated change across both sides.

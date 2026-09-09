@@ -1,5 +1,12 @@
 """Diagnostic probe: does a seeded offshore pulse give a real drawback-then-wave?
 
+SUPERSEDED by probe_tsunami_v2.py, and kept only as the record of a wrong
+question. This probe asks whether the DEPTH AT A POINT falls and then rises. It
+does, so this passed -- while the scene it validated moved the waterline 1.4 m
+and flooded 4.6 m of land. What a person watching looks for is where the
+water's EDGE is, and nothing here measures that. See docs/13_tsunami2_plan.md.
+
+
 Blocking measurement for a TsunamiLab scenario, requested directly (no plan
 doc yet -- this probe IS the plan's first step, docs/08_volcano_plan.md style,
 compressed into one pass because the mechanism needed is small: a one-shot
