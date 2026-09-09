@@ -110,10 +110,25 @@ export class EditorController {
   }
 
   addObject(type: ObjectType): void {
+    // Auto-place on a grid SIZED TO THE MAP, not a fixed 3 columns. The fixed
+    // version put every object in a 72 m-wide strip (3 * 36 m spacing) down
+    // the map's centre and grew unboundedly in +z with every add: past
+    // roughly a dozen objects the next one landed outside the terrain
+    // entirely, while most of the map's width sat unused -- reported as
+    // "objects start landing in empty space after 3-5 adds". Sizing the grid
+    // to the terrain and wrapping (modulo) once it fills keeps every
+    // auto-placed object on the map, at the cost of new objects eventually
+    // overlapping older ones once the grid is full -- the user can still drag
+    // them apart, which is a far smaller problem than an object placed off
+    // the terrain.
     const idx = this.store.objects.size;
-    const spacing = this.store.terrain.sizeM * 0.18;
-    const x = ((idx % 3) - 1) * spacing;
-    const z = (Math.floor(idx / 3) - 1) * spacing;
+    const size = this.store.terrain.sizeM;
+    const spacing = size * 0.18;
+    const margin = spacing * 0.5;
+    const columns = Math.max(3, Math.floor((size - 2 * margin) / spacing) + 1);
+    const cell = idx % (columns * columns);
+    const x = ((cell % columns) - (columns - 1) / 2) * spacing;
+    const z = (Math.floor(cell / columns) - (columns - 1) / 2) * spacing;
     const y = this.store.terrain.heightAt(x, z);
     this.net.send({ op: 'object_add', object: { type, position: [x, y, z] } });
   }

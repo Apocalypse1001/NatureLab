@@ -75,7 +75,7 @@ ok {"cells":10201,"wet":6329,"min":0,"max":1.5,"mean":0.631,"westMean":1.329,
 |---|---|
 | `status` | ws / sim status / clock / object count+types / edge inflow level / tracer count |
 | `place <TYPE> <x> <z>` | add at an exact position — `HOUSE CAR TREE BOX DEBRIS GAUGE` |
-| `add <TYPE>` | add via the UI button (auto-places on a 3-wide grid) |
+| `add <TYPE>` | add via the UI button (auto-places on a grid sized to the map, wrapping once full) |
 | `start` `pause` `reset` | sim transport, returns the new `status` |
 | `water <m>` | **edge inflow level** — the height held at the west source columns |
 | `gauge` | GAUGE readings: depth, surface elevation, speed, wave arrival time |
