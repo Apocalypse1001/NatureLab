@@ -381,6 +381,21 @@ class WaterState:
     inlet_discharge_m3s: float = 12.0  # prescribed Q -- the level is the answer
     outlet_centre_z: float = 0.0
     outlet_width_m: float = 0.0      # 0 = the whole edge, as before v0.12.0
+    # TsunamiLab (docs/probe_tsunami_v1.py). A ONE-SHOT initial condition, not
+    # a per-tick boundary like inlet/outlet above: an N-wave (trough on the
+    # shore side, crest on the ocean side, riding on top of ordinary still
+    # water) seeded across the whole grid the moment the solver initializes,
+    # uniform in z -- a straight-line wavefront, not a point source. Zero
+    # initial velocity, not the "textbook" travelling-wave u=-c*eta/H: the
+    # probe measured that relation driving max|u| to the FLUID_MAX_VELOCITY
+    # clamp and producing a messy multi-hump shore trace, where u=0 gave the
+    # clean single drawback-then-wave signature on the first try -- see the
+    # probe's seed_pulse() docstring for the measured comparison. Off by
+    # default, so every world that predates this behaves exactly as before.
+    tsunami_enabled: bool = False
+    tsunami_amplitude_m: float = 2.0
+    tsunami_half_width_m: float = 15.0
+    tsunami_centre_x: float = 0.0     # world x of the pulse's own centre (not the shore)
 
     def to_dict(self) -> Dict[str, Any]:
         return {"level": self.level, "visible": self.visible,
@@ -391,7 +406,11 @@ class WaterState:
                 "inlet_width_m": self.inlet_width_m,
                 "inlet_discharge_m3s": self.inlet_discharge_m3s,
                 "outlet_centre_z": self.outlet_centre_z,
-                "outlet_width_m": self.outlet_width_m}
+                "outlet_width_m": self.outlet_width_m,
+                "tsunami_enabled": self.tsunami_enabled,
+                "tsunami_amplitude_m": self.tsunami_amplitude_m,
+                "tsunami_half_width_m": self.tsunami_half_width_m,
+                "tsunami_centre_x": self.tsunami_centre_x}
 
 
 @dataclass
@@ -482,7 +501,14 @@ class WorldState:
             outlet_centre_z=finite_number(water.get("outlet_centre_z", 0.0),
                                           "water.outlet_centre_z"),
             outlet_width_m=finite_number(water.get("outlet_width_m", 0.0),
-                                         "water.outlet_width_m"))
+                                         "water.outlet_width_m"),
+            tsunami_enabled=bool(water.get("tsunami_enabled", False)),
+            tsunami_amplitude_m=finite_number(water.get("tsunami_amplitude_m", 2.0),
+                                              "water.tsunami_amplitude_m"),
+            tsunami_half_width_m=finite_number(water.get("tsunami_half_width_m", 15.0),
+                                               "water.tsunami_half_width_m"),
+            tsunami_centre_x=finite_number(water.get("tsunami_centre_x", 0.0),
+                                           "water.tsunami_centre_x"))
         env = data.get("environment", {})
         state.environment = EnvironmentState(
             gravity=finite_number(env.get("gravity", 9.81), "environment.gravity"),

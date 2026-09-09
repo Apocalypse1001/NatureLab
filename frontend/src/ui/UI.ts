@@ -55,6 +55,13 @@ const SCENARIOS: { name: string; label: string; hint: string }[] = [
         + 'village just past it is safe at the vent’s shipped discharge '
         + '-- raise "Discharge Q" in the vent’s own properties, or just '
         + 'wait, to push the flow further' },
+  { name: 'scenario_tsunami', label: 'Tsunami',
+    hint: 'A beach seeded with a real wave (not a rising flood front): the '
+        + 'sea recedes to nearly dry at the shore gauge around t=7s, then a '
+        + 'wave arrives around t=8.5s and sweeps everything loose -- cars, '
+        + 'people, crates, debris, trees. Houses are static and cannot be '
+        + 'damaged or moved by water in this build (only lava contact does '
+        + 'that), so they stand and split the flow instead of falling' },
 ];
 
 export class UI {

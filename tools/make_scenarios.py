@@ -44,7 +44,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from app import persistence                                    # noqa: E402
-from app.terrain_gen import dam_ridge, river_valley, volcano_cone  # noqa: E402
+from app.terrain_gen import coastline, dam_ridge, river_valley, volcano_cone  # noqa: E402
 from app.world_state import WorldState                         # noqa: E402
 
 # The town sits on the north bank, downstream of the dam station, in both
@@ -299,10 +299,127 @@ def build_volcano_settlement(world: WorldState) -> Dict[str, int]:
     return counts
 
 
+# TsunamiLab. Measured, not picked: docs/probe_tsunami_v1.py swept
+# (ocean_depth, amplitude, half_width) on the real solver and reported this
+# exact point as depth=15m amp=2.0m hw=15m -> dry_at=7.2s, wave_at=8.5s,
+# max|u|=1.8 m/s, run-up to x=-25 (measured on the probe's own bed, which is
+# the same bed coastline() writes -- cross-checked equal to 5e-7 m). Also
+# note what this does NOT do, because a real player will ask "why didn't the
+# house fall over": HOUSE/BUILDING/BRIDGE are `is_static: True`
+# (`_integrate_bodies` gates both floating and sliding on `static[i] == 0`),
+# and `obj.damage` has exactly one driver in this codebase -- lava contact
+# (see `_check_lava_ignition`) -- never hydrodynamic load. So the wave sweeps
+# CAR / PERSON / DEBRIS / BOX / TREE (all dynamic) and the houses stand,
+# splitting the flow around them. That is not a bug in this scenario; it is
+# an honest limit of the physics, stated in the scenario's own hint text the
+# same way the Volcano scenario states its lava run-out limit.
+TSUNAMI_OCEAN_DEPTH_M = 15.0
+TSUNAMI_AMPLITUDE_M = 2.0
+TSUNAMI_HALF_WIDTH_M = 15.0
+TSUNAMI_CENTRE_X = 60.0
+TSUNAMI_MEASURED_RUNUP_X = -25.0
+
+
+def build_tsunami(world: WorldState) -> Dict[str, Any]:
+    effective = coastline(world.terrain, {"ocean_depth_m": TSUNAMI_OCEAN_DEPTH_M})
+    water = world.water
+    water.level = 0.0
+    water.visible = True
+    water.erosion_enabled = False
+    water.outflow_enabled = True          # east edge stays open -- see coastline()'s
+                                           # docstring: the ocean sits there on purpose,
+                                           # so half the seeded pulse that heads back out
+                                           # to sea simply leaves instead of reflecting
+    water.tsunami_enabled = True
+    water.tsunami_amplitude_m = TSUNAMI_AMPLITUDE_M
+    water.tsunami_half_width_m = TSUNAMI_HALF_WIDTH_M
+    water.tsunami_centre_x = TSUNAMI_CENTRE_X
+    return effective
+
+
+def build_beachfront_town(world: WorldState) -> Dict[str, int]:
+    """Place a beach (swept) and a village (stands, splits the flow) relative
+    to the MEASURED shore_x and run-up, not guessed offsets -- the probe's
+    own change log has a bug entry for exactly this mistake (an early draft
+    guessed a shore position and was ~20 m off, silently sampling open ocean)."""
+    rng = np.random.RandomState(20260909)
+    counts: Dict[str, int] = {}
+
+    def tally(kind: str, n: int = 1) -> None:
+        counts[kind] = counts.get(kind, 0) + n
+
+    # `main()` calls build(world) then build_objects(world) -- the latter gets
+    # no access to build_tsunami's own `effective` dict (build_volcano_settlement
+    # has the same shape, and works around it by recomputing from fixed
+    # constants). coastline() is a pure function of these same module
+    # constants, so calling it again here just rewrites terrain.heights with
+    # the identical array it already holds -- cheap, and the one honest way to
+    # get shore_x without either a second scenario-plumbing change or a
+    # hand-copied number that can drift out of sync with the real terrain.
+    shore_x = coastline(world.terrain, {"ocean_depth_m": TSUNAMI_OCEAN_DEPTH_M})["shore_x"]
+
+    # Layout distances below are measured, not guessed, and NOT the same
+    # number as TSUNAMI_MEASURED_RUNUP_X: that constant is an ABSOLUTE world
+    # x (-25), and shore_x is itself ~-20.4, so the run-up is only ~4.6-5.6 m
+    # INLAND of the shoreline -- not the 13-26 m an earlier draft of this
+    # function placed the beach scatter and village at, which put the entire
+    # village and most of the "beach" outside anything the wave could ever
+    # reach. Caught by loading the actual generated scenario in a browser and
+    # reading back where the swept objects actually settled (~4.5-5.6 m
+    # inland) -- the live scene, with a village obstructing the flow, is the
+    # more trustworthy measurement here, not the bare-bed probe alone.
+
+    # --- the beach: loose, light, draggy -- exactly what a wave carries off ---
+    for _ in range(10):
+        z = rng.uniform(-16.0, 16.0)
+        x = shore_x + rng.uniform(-5.0, 3.0)      # a little seaward of the shore
+        seat(world, "DEBRIS", x, z)                # to right at the run-up edge
+        tally("debris")
+    for dx, dz in ((-1.0, -8.0), (-3.0, 4.0), (-4.5, -3.0)):
+        seat(world, "BOX", shore_x + dx, dz)
+        tally("crate")
+    for x, z in ((shore_x + 1.0, -10.0), (shore_x - 2.0, 8.0), (shore_x - 4.0, -2.0)):
+        seat(world, "CAR", x, z, yaw=np.radians(rng.uniform(0.0, 360.0)))
+        tally("car")
+    for x, z in ((shore_x + 1.5, 3.0), (shore_x - 1.0, -6.0), (shore_x - 2.5, 9.0),
+                 (shore_x - 4.0, -9.0), (shore_x - 0.5, 12.0)):
+        seat(world, "PERSON", x, z)
+        tally("person")
+    for _ in range(6):
+        x = shore_x - rng.uniform(0.0, 5.0)
+        z = rng.uniform(-16.0, 16.0)
+        seat(world, "TREE", x, z)
+        tally("tree")
+
+    # --- the village: static, right at the measured run-up edge -------------
+    # Close enough that the wave's leading edge genuinely reaches (or laps
+    # at) the front row -- the flow splits around them, which is the honest
+    # version of "hits the village" this build can actually show (see the
+    # module-level comment on TSUNAMI_* about static bodies and damage).
+    for i, z in enumerate((-14.0, -4.0, 6.0, 16.0)):
+        x = shore_x - 6.0 - (i % 2) * 2.0
+        seat(world, "HOUSE", x, z, yaw=np.pi)     # doors face the sea, on purpose:
+        tally("house")                             # the view of the thing that hits them
+    for x, z in ((shore_x - 8.0, -9.0), (shore_x - 7.5, 11.0)):
+        seat(world, "CAR", x, z)
+        tally("car")
+
+    # --- instruments ----------------------------------------------------
+    # One a couple of metres seaward of the measured shoreline -- this is the
+    # readout for "did it recede, then did a wave arrive" (surface_elevation_m
+    # goes to ~0 during the drawback, then spikes). One at the village's own
+    # front edge -- this is "did the wave actually reach the houses".
+    seat(world, "GAUGE", shore_x + 2.0, 0.0)
+    seat(world, "GAUGE", shore_x - 5.0, 0.0)
+    tally("gauge", 2)
+    return counts
+
+
 SCENARIOS = {
     "river": ("scenario_river", build_river, build_town),
     "dam": ("scenario_dam", build_dam, build_town),
     "volcano": ("scenario_volcano", build_volcano, build_volcano_settlement),
+    "tsunami": ("scenario_tsunami", build_tsunami, build_beachfront_town),
 }
 
 
@@ -330,6 +447,13 @@ def main(argv=None) -> int:
                   f"{effective['base_radius']:.1f} m; measured run-out "
                   f"{VOLCANO_MEASURED_RUNOUT_M:.0f} m at the shipped discharge "
                   f"(docs/10_volcano2_plan.md)")
+        elif "shore_x" in effective:
+            print(f"  {len(world.objects)} objects, shore at x={effective['shore_x']:.1f} m, "
+                  f"ocean depth {TSUNAMI_OCEAN_DEPTH_M:.0f} m")
+            print(f"  seeded pulse: amplitude {TSUNAMI_AMPLITUDE_M:.1f} m, half-width "
+                  f"{TSUNAMI_HALF_WIDTH_M:.0f} m; measured: drawback at t=7.2s, wave at "
+                  f"t=8.5s, run-out to x={TSUNAMI_MEASURED_RUNUP_X:.0f} m "
+                  f"(docs/probe_tsunami_v1.py)")
         else:
             print(f"  {len(world.objects)} objects, "
                   f"inlet Q {world.water.inlet_discharge_m3s:g} m3/s")

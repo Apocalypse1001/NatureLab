@@ -349,3 +349,81 @@ def volcano_cone(terrain, params: Dict[str, Any] | None = None) -> Dict[str, flo
     p = dict(p)
     p["vent_position"] = [p["centre_x"], 0.0, p["centre_z"]]
     return p
+
+
+# TsunamiLab (docs/probe_tsunami_v1.py). One smoothstep, not flat-land plus a
+# glued beach face plus flat-ocean spliced together -- the same discipline
+# volcano_cone's docstring names: a splice leaves a slope-discontinuity that a
+# wave (or lava, or a river bank) stands on as a spurious kink. This is a
+# single monotonic S-curve from `inland_height_m` at and west of `land_edge_x`
+# to `-ocean_depth_m` at and east of `land_edge_x + beach_run_m`, with genuine
+# zero-gradient flats on both sides because a smoothstep has zero derivative
+# at both its own endpoints -- no clamping needed to make the flats flat.
+COASTLINE_DEFAULTS: Dict[str, float] = {
+    "ocean_depth_m": 15.0,      # flat sea floor depth east of the beach
+    "inland_height_m": 5.0,     # flat land elevation west of the beach
+    "land_edge_x": -40.0,       # where the flat land ends and the beach begins
+    "beach_run_m": 60.0,        # horizontal span of the smoothstep beach face
+}
+_COASTLINE_LIMITS: Dict[str, tuple] = {
+    "ocean_depth_m": (2.0, 40.0),
+    "inland_height_m": (1.0, 30.0),
+    "land_edge_x": (-config.WORLD_SIZE_M * 0.5 + 5.0, config.WORLD_SIZE_M * 0.5 - 20.0),
+    "beach_run_m": (10.0, config.WORLD_SIZE_M),
+}
+
+
+def validate_coastline(params: Dict[str, Any] | None) -> Dict[str, float]:
+    out = dict(COASTLINE_DEFAULTS)
+    for key, value in (params or {}).items():
+        if key not in COASTLINE_DEFAULTS:
+            raise ValueError(f"unknown coastline parameter: {key!r}")
+        number = float(value)
+        if not np.isfinite(number):
+            raise ValueError(f"coastline.{key} must be finite")
+        low, high = _COASTLINE_LIMITS[key]
+        if not low <= number <= high:
+            raise ValueError(f"coastline.{key} out of range [{low}, {high}]: {number}")
+        out[key] = number
+    return out
+
+
+def coastline(terrain, params: Dict[str, Any] | None = None) -> Dict[str, float]:
+    """Write a straight coastline into `terrain.heights` in place.
+
+    Flat land (`inland_height_m`, well above any plausible `water.level`, so
+    the west-edge SOURCE columns inject nothing -- see
+    `WarpShallowWaterSolver.initialize`'s tsunami branch) smoothsteps down
+    over `beach_run_m` metres to a flat ocean floor at `-ocean_depth_m`, along
+    x only -- uniform in z, a straight-line shore matching the straight-line
+    wavefront `WaterState.tsunami_*` seeds. Returns the effective parameters
+    plus `shore_x`, the world x where the bed crosses 0 -- found the same way
+    docs/probe_tsunami_v1.py's find_shore_x() does (linear interpolation
+    between the two straddling grid columns), so a scenario builder can seat
+    gauges and a town at a real measured position instead of a guess (an
+    earlier draft of the probe guessed x=-2 for this and was off by nearly
+    20 m -- see the plan's "Замер" for what that produced).
+    """
+    p = validate_coastline(params)
+    rows, cols = terrain.heights.shape
+    cell = terrain.cell_size
+    x = (np.arange(cols, dtype=np.float64) - (cols - 1) * 0.5) * cell
+
+    land_edge_x, beach_run = p["land_edge_x"], p["beach_run_m"]
+    t = np.clip((x - land_edge_x) / beach_run, 0.0, 1.0)
+    s = t * t * (3.0 - 2.0 * t)
+    bed_row = p["inland_height_m"] - (p["inland_height_m"] + p["ocean_depth_m"]) * s
+
+    terrain.heights[:, :] = np.tile(
+        np.clip(bed_row, config.HEIGHT_MIN, config.HEIGHT_MAX).astype(np.float32),
+        (rows, 1))
+
+    below = bed_row < 0.0
+    idx = int(np.flatnonzero(np.diff(below.astype(np.int8)))[0])
+    x0, x1 = x[idx], x[idx + 1]
+    b0, b1 = bed_row[idx], bed_row[idx + 1]
+    shore_x = float(x0 + (x1 - x0) * (0.0 - b0) / (b1 - b0))
+
+    p = dict(p)
+    p["shore_x"] = shore_x
+    return p

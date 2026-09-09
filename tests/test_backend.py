@@ -2661,5 +2661,84 @@ class LavaCombustionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gauge_obj.state, "INTACT")
 
 
+class TsunamiLabTests(unittest.IsolatedAsyncioTestCase):
+    """docs/probe_tsunami_v1.py's finding, exercised through the real
+    SimulationManager/WorldState/save-load path rather than the probe's own
+    direct solver poking -- the probe proves the physics; this proves the
+    wiring (WaterState.to_dict/from_dict, fluid.initialize's tsunami branch,
+    reset() replaying the seed) actually connects it."""
+
+    async def test_tsunami_fields_survive_a_save_load_round_trip(self) -> None:
+        manager = SimulationManager()
+        from app.terrain_gen import coastline
+        coastline(manager.world.terrain, {"ocean_depth_m": 15.0})
+        manager.world.water.tsunami_enabled = True
+        manager.world.water.tsunami_amplitude_m = 2.0
+        manager.world.water.tsunami_half_width_m = 15.0
+        manager.world.water.tsunami_centre_x = 60.0
+        manager.save("tsunamitest")
+        manager.load("tsunamitest")
+        water = manager.world.water
+        self.assertTrue(water.tsunami_enabled)
+        self.assertEqual(water.tsunami_amplitude_m, 2.0)
+        self.assertEqual(water.tsunami_half_width_m, 15.0)
+        self.assertEqual(water.tsunami_centre_x, 60.0)
+
+    async def test_tsunami_default_world_is_unaffected(self) -> None:
+        """tsunami_enabled defaults False -- every world that predates this
+        feature, and every non-tsunami scenario, must seed exactly as before:
+        the level-held west SOURCE columns fill (water.level defaults 0.5),
+        everything else stays bone dry. Only the tsunami branch would touch
+        the rest of the grid."""
+        manager = SimulationManager()
+        manager.start()
+        h = np.asarray(manager.fluid._h.numpy()).reshape(N, N)
+        self.assertEqual(float(h[N // 2, col(0.0)]), 0.0,
+                          "a default (non-tsunami) flat world must stay dry away from the "
+                          "west edge -- the tsunami branch must not fire when disabled")
+
+    async def test_tsunami_pulse_gives_drawback_then_wave(self) -> None:
+        """The actual deliverable: loaded through SimulationManager (not the
+        probe's direct solver access), the shore point recedes to nearly dry
+        BEFORE a big wave arrives -- the same (depth=15m, amp=2.0m, hw=15m)
+        point docs/probe_tsunami_v1.py's summary sweep measured as
+        dry_at=7.2s, wave_at=8.5s."""
+        from app.terrain_gen import coastline
+
+        manager = SimulationManager()
+        effective = coastline(manager.world.terrain, {"ocean_depth_m": 15.0})
+        manager.world.water.level = 0.0
+        manager.world.water.tsunami_enabled = True
+        manager.world.water.tsunami_amplitude_m = 2.0
+        manager.world.water.tsunami_half_width_m = 15.0
+        manager.world.water.tsunami_centre_x = 60.0
+        manager.start()
+
+        centre_j = N // 2
+        shore_i = col(effective["shore_x"] + 2.0)
+        baseline = float(np.asarray(manager.fluid._h.numpy())
+                          .reshape(N, N)[centre_j, shore_i])
+        self.assertGreater(baseline, 0.1, "shore gauge must start in real water, not on land")
+
+        dry_at = wave_at = None
+        for step in range(int(40.0 / config.FIXED_DT)):
+            manager._step_once()
+            t = manager.sim_time
+            shore_h = float(np.asarray(manager.fluid._h.numpy())
+                             .reshape(N, N)[centre_j, shore_i])
+            if dry_at is None and shore_h <= 0.05:
+                dry_at = t
+            if wave_at is None and shore_h >= baseline * 1.5:
+                wave_at = t
+            if dry_at is not None and wave_at is not None:
+                break
+        manager.stop()
+
+        self.assertIsNotNone(dry_at, "shore never went dry -- no drawback")
+        self.assertIsNotNone(wave_at, "shore never saw a wave after the drawback")
+        self.assertLess(dry_at, wave_at,
+                         f"drawback (t={dry_at}) must precede the wave (t={wave_at})")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

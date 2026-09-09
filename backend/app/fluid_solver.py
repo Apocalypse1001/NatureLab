@@ -1358,7 +1358,31 @@ class WarpShallowWaterSolver(FluidSolver):
         source_columns = min(config.FLUID_SOURCE_COLUMNS, self._width)
         water = getattr(world, "water", None)
         inlet_wanted = bool(getattr(water, "inlet_enabled", False))
-        if not inlet_wanted:
+        tsunami_wanted = bool(getattr(water, "tsunami_enabled", False))
+        if tsunami_wanted:
+            # ONE-SHOT initial condition across the WHOLE grid (not just the
+            # source columns): real still water wherever the bed sits below
+            # `self._level` (the sea existing before the wave hits it is a
+            # precondition, not the effect), an N-wave superimposed uniform in
+            # z (a straight wavefront, matching a straight coastline), zero
+            # velocity. See WaterState.tsunami_* for why u=0 and not the
+            # "textbook" travelling-wave relation -- measured, not guessed, in
+            # docs/probe_tsunami_v1.py's seed_pulse(). Supersedes the source-
+            # column prefill below: a tsunami scenario's west edge is built as
+            # dry land (see terrain_gen.coastline), so that prefill would
+            # contribute nothing there anyway.
+            amplitude = float(getattr(water, "tsunami_amplitude_m", 2.0))
+            half_width = max(1.0e-6, float(getattr(water, "tsunami_half_width_m", 15.0)))
+            centre_x = float(getattr(water, "tsunami_centre_x", 0.0))
+            xs = (np.arange(self._width, dtype=np.float64)
+                  - world.terrain.width / 2.0) * world.terrain.cell_size
+            still = np.maximum(self._level - bed_grid.astype(np.float64), 0.0)
+            eta_row = amplitude * ((xs - centre_x) / half_width) \
+                * np.exp(-0.5 * ((xs - centre_x) / half_width) ** 2)
+            eta_grid = np.tile(eta_row[None, :], (self._height, 1))
+            eta_grid = np.where(still > config.FLUID_DRY_DEPTH, eta_grid, 0.0)
+            depth_grid = np.maximum(still + eta_grid, 0.0).astype(np.float32)
+        elif not inlet_wanted:
             # A river inlet owns the west edge; pre-filling it from the level
             # control as well would put a wall of water across the floodplain at
             # t = 0 and then leave it to drain, which is not a river starting.
