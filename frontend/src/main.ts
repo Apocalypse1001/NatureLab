@@ -35,6 +35,8 @@ const net = new BackendClient(wsUrl, {
     editor.terrainEditingEnabled = state.status !== 'RUNNING';
     ui.setClock(state.time, state.status);
     ui.setSimStats(state);
+    // the streaks draw what the solver applies, never the slider position
+    sceneManager.setRain(state.fluid?.rain_mm_h ?? 0, state.status === 'RUNNING');
     store.applyGaugeStates(state.gauges ?? [], state.gauge_history_capacity ?? 600);
     for (const moved of state.moved_objects) {
       store.updateObject(moved.id,
@@ -119,6 +121,10 @@ const ui = new UI(uiHost, {
   generateRiver: (params) => net.send({ op: 'terrain_river', params }),
   setRiverInlet: (fields) => net.send({ op: 'river_inlet', fields }),
   setRiverOutlet: (fields) => net.send({ op: 'river_outlet', fields }),
+  // RainLab-1: read live by the backend every tick, like the inlet, so the
+  // intensity can be changed while RUNNING
+  setRain: (fields) => net.send({ op: 'rain', fields }),
+  setEdgeInflow: (enabled) => net.send({ op: 'edge_inflow', enabled }),
   getObjects: () => [...store.objects.values()],
 });
 
@@ -138,6 +144,7 @@ function applyWorld(world: WorldData, simStatus: string): void {
   ui.setOutflowEnabled(store.outflowEnabled);
   // A scenario carries its own river boundary; the controls have to show it.
   ui.setRiverControls(world.water);
+  ui.setRainControls(world.water);
   sceneManager.clearObjects();
   for (const obj of world.objects) sceneManager.setObject(obj);
   ui.refreshObjectList([...store.objects.values()], null);

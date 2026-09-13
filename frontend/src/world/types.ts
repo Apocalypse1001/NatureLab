@@ -41,7 +41,10 @@ export interface WorldData {
            // v0.12.0 river boundaries: part of the world, so a loaded world has
            // to be able to put its own numbers back on the controls
            inlet_enabled?: boolean; inlet_width_m?: number;
-           inlet_discharge_m3s?: number; outlet_width_m?: number };
+           inlet_discharge_m3s?: number; outlet_width_m?: number;
+           // RainLab-1 (docs/14_rain_plan.md): rain in mm/h (= L/m² per hour),
+           // and whether the west edge holds its inflow level at all
+           rain_intensity_mm_h?: number; edge_inflow_enabled?: boolean };
   environment: { gravity: number; wind: number[]; temperature: number };
   objects: ObjectData[];
 }
@@ -75,7 +78,9 @@ export interface SimStateMessage {
             // v0.12.0 river boundaries and their volume ledger
             inlet_enabled?: boolean; inlet_request_m3s?: number;
             inlet_discharge_m3s?: number; added_m3?: number; removed_m3?: number;
-            volume_error_m3?: number; sediment_out_m3?: number };
+            volume_error_m3?: number; sediment_out_m3?: number;
+            // RainLab-1: what the solver is actually applying, not the slider
+            rain_mm_h?: number; rain_m3s?: number; edge_inflow?: boolean };
 }
 
 export interface GaugeSample {

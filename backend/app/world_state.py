@@ -358,6 +358,14 @@ class TerrainGrid:
         return grid
 
 
+def rain_intensity(value: Any, name: str = "water.rain_intensity_mm_h") -> float:
+    """RainLab-1: a rain rate in mm/h, finite and within 0..config.RAIN_MAX_MM_H."""
+    rate = finite_number(value, name)
+    if not 0.0 <= rate <= config.RAIN_MAX_MM_H:
+        raise ValueError(f"{name} out of range")
+    return rate
+
+
 @dataclass
 class WaterState:
     level: float = 0.5          # meters above terrain datum
@@ -423,6 +431,15 @@ class WaterState:
     tsunami_wave_spacing_s: float = 0.0
     tsunami_wave2_scale: float = 1.3
     tsunami_wave3_scale: float = 0.6
+    # RainLab-1 (docs/14_rain_plan.md). Rain is an AREAL source: it adds to
+    # whichever boundary is active instead of replacing it, unlike every other
+    # water source here. 0 = no rain, so every world that predates this is
+    # untouched.
+    rain_intensity_mm_h: float = 0.0
+    # Whether the west edge holds `level` at all. On by default (every world
+    # before RainLab behaves as it did); a rain-only world turns it off, or the
+    # edge columns are rewritten every substep and rain falling there is lost.
+    edge_inflow_enabled: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return {"level": self.level, "visible": self.visible,
@@ -440,7 +457,9 @@ class WaterState:
                 "tsunami_wave_count": self.tsunami_wave_count,
                 "tsunami_wave_spacing_s": self.tsunami_wave_spacing_s,
                 "tsunami_wave2_scale": self.tsunami_wave2_scale,
-                "tsunami_wave3_scale": self.tsunami_wave3_scale}
+                "tsunami_wave3_scale": self.tsunami_wave3_scale,
+                "rain_intensity_mm_h": self.rain_intensity_mm_h,
+                "edge_inflow_enabled": self.edge_inflow_enabled}
 
 
 @dataclass
@@ -549,7 +568,9 @@ class WorldState:
             tsunami_wave2_scale=finite_number(water.get("tsunami_wave2_scale", 1.3),
                                               "water.tsunami_wave2_scale"),
             tsunami_wave3_scale=finite_number(water.get("tsunami_wave3_scale", 0.6),
-                                              "water.tsunami_wave3_scale"))
+                                              "water.tsunami_wave3_scale"),
+            rain_intensity_mm_h=rain_intensity(water.get("rain_intensity_mm_h", 0.0)),
+            edge_inflow_enabled=bool(water.get("edge_inflow_enabled", True)))
         env = data.get("environment", {})
         state.environment = EnvironmentState(
             gravity=finite_number(env.get("gravity", 9.81), "environment.gravity"),

@@ -25,6 +25,8 @@ export interface UICallbacks {
   setRiverInlet(fields: { enabled?: boolean; width_m?: number;
                           discharge_m3s?: number }): void;
   setRiverOutlet(fields: { width_m?: number }): void;
+  setRain(fields: { intensity_mm_h: number }): void;
+  setEdgeInflow(enabled: boolean): void;
   loadScenario(name: string): void;
   getObjects(): ObjectData[];
 }
@@ -66,6 +68,20 @@ const SCENARIOS: { name: string; label: string; hint: string }[] = [
         + 'landmarks for scale and do not split the flow the way they do in '
         + 'the River scenario; and water damages nothing in this build (only '
         + 'lava does), so what you see is things carried, not broken' },
+];
+
+/**
+ * RainLab-1 presets, mm/h (= L/m² per hour). Anchored on the WMO/MANOBS scale
+ * -- light <=2.5, moderate 2.5-7.5, heavy 7.6-50, violent >50 -- which is one
+ * scale among several (the Met Office's differs); docs/14_rain_plan.md.
+ * A preset only moves the slider: the slider is the control.
+ */
+const RAIN_PRESETS: { label: string; mmPerHour: number }[] = [
+  { label: 'Light', mmPerHour: 1 },
+  { label: 'Moderate', mmPerHour: 5 },
+  { label: 'Heavy', mmPerHour: 20 },
+  { label: 'Downpour', mmPerHour: 50 },
+  { label: 'Extreme', mmPerHour: 100 },
 ];
 
 export class UI {
@@ -263,6 +279,58 @@ export class UI {
     erosion.onchange = () => this.cb.setErosion(erosion.checked);
     erosionRow.append(erosion);
     panel.append(erosionRow);
+
+    // RainLab-1: the west edge holds the inflow level above every tick, so on a
+    // map meant to be wetted by rain alone it has to be switchable -- otherwise
+    // rain falling on those columns is overwritten and the edge acts as a sink.
+    const edgeRow = el('label', 'slider-row', 'Edge inflow (west edge holds the level above)');
+    const edge = el('input', '') as HTMLInputElement;
+    edge.id = 'edge-inflow';
+    edge.type = 'checkbox';
+    edge.checked = true;
+    edge.onchange = () => this.cb.setEdgeInflow(edge.checked);
+    edgeRow.append(edge);
+    panel.append(edgeRow);
+
+    // Rain is an areal source: it adds to whatever boundary is active rather
+    // than replacing it. The readout under the slider is what the SOLVER reports
+    // applying, so a rejected value can never look accepted.
+    panel.append(el('h3', '', 'Rain'));
+    const rainPresets = el('div', 'palette');
+    const rain = el('div', 'slider-row');
+    rain.innerHTML =
+      '<label>Intensity <output id="rain-out">0</output> mm/h (= L/m² per hour)</label>';
+    const rainSlider = el('input', '') as HTMLInputElement;
+    rainSlider.id = 'rain-intensity';
+    rainSlider.type = 'range'; rainSlider.min = '0'; rainSlider.max = '150';
+    rainSlider.step = '0.5'; rainSlider.value = '0';
+    const sendRain = () => {
+      this.root.querySelector('#rain-out')!.textContent = rainSlider.value;
+      this.cb.setRain({ intensity_mm_h: parseFloat(rainSlider.value) });
+    };
+    rainSlider.oninput = sendRain;
+    const off = btn('Off', () => { rainSlider.value = '0'; sendRain(); });
+    off.title = 'No rain';
+    rainPresets.append(off);
+    for (const preset of RAIN_PRESETS) {
+      const button = btn(preset.label, () => {
+        rainSlider.value = String(preset.mmPerHour);
+        sendRain();
+      });
+      button.title = `${preset.mmPerHour} mm/h`;
+      rainPresets.append(button);
+    }
+    panel.append(rainPresets);
+    rain.append(rainSlider);
+    const applied = el('div', 'hint');
+    applied.id = 'rain-applied';
+    applied.textContent = 'applied: none';
+    rain.append(applied);
+    panel.append(rain);
+    panel.append(el('p', 'hint',
+      'Every drop becomes runoff: no infiltration, no evaporation, and rain on a '
+      + 'building is lost (no roofs yet). On flat ground light rain never gets '
+      + 'deep enough to see -- the water shows where the terrain gathers it.'));
 
     panel.append(el('h3', '', 'Flow visualization'));
     const tracerToggle = el('label', 'slider-row', 'Show physical tracers');
@@ -465,6 +533,21 @@ export class UI {
     put('#river-outlet-width', '#river-outlet-w-out', water.outlet_width_m);
   }
 
+  /** Put a loaded world's rain and edge-inflow settings back on the controls. */
+  setRainControls(water: WorldData['water']): void {
+    const slider = this.root.querySelector<HTMLInputElement>('#rain-intensity');
+    const output = this.root.querySelector('#rain-out');
+    const value = water.rain_intensity_mm_h ?? 0;
+    if (slider) slider.value = String(value);
+    if (output) output.textContent = String(value);
+    this.setEdgeInflowEnabled(water.edge_inflow_enabled ?? true);
+  }
+
+  setEdgeInflowEnabled(enabled: boolean): void {
+    const box = this.root.querySelector<HTMLInputElement>('#edge-inflow');
+    if (box) box.checked = enabled;
+  }
+
   setFps(fps: number): void {
     this.fpsEl.textContent = fps.toFixed(0);
   }
@@ -476,7 +559,23 @@ export class UI {
                                  inlet_enabled?: boolean;
                                  inlet_discharge_m3s?: number;
                                  added_m3?: number; removed_m3?: number;
-                                 substeps?: number; cfl_limited?: boolean } }): void {
+                                 substeps?: number; cfl_limited?: boolean;
+                                 rain_mm_h?: number; rain_m3s?: number;
+                                 edge_inflow?: boolean } }): void {
+    // The slider is left alone (a streamed value must never fight a drag); the
+    // readout beneath it is what the solver says it is applying.
+    if (state.fluid?.rain_mm_h !== undefined) {
+      const applied = this.root.querySelector('#rain-applied');
+      if (applied) {
+        applied.textContent = state.fluid.rain_mm_h > 0
+          ? `applied: ${state.fluid.rain_mm_h.toFixed(1)} mm/h ≈ `
+            + `${(state.fluid.rain_m3s ?? 0).toFixed(3)} m³/s over the map`
+          : 'applied: none';
+      }
+    }
+    if (state.fluid?.edge_inflow !== undefined) {
+      this.setEdgeInflowEnabled(state.fluid.edge_inflow);
+    }
     // Keep the checkbox honest about what the solver is actually doing: the
     // flag is streamed live, so a world loaded with erosion on -- or a state
     // changed by anything other than this checkbox -- still shows correctly.

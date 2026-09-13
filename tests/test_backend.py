@@ -2920,5 +2920,144 @@ class TsunamiLabTests(unittest.IsolatedAsyncioTestCase):
                                 f"{peak:.2f} m")
 
 
+class RainTests(unittest.IsolatedAsyncioTestCase):
+    """RainLab-1 (docs/14_rain_plan.md): uniform rain as an areal source.
+
+    The questions a person watching would ask, not only the ledger identity:
+    does the stated amount of water arrive, only where it can land, at the
+    moment the slider moves, and does it end up where the ground sends it?
+
+    Rain is poured in portions of config.RAIN_APPLY_STEP_M (float32 `h` would
+    round a per-substep sliver away), so "what has fallen" is the requested
+    depth minus the still-pending remainder the solver reports.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    def _run(self, seconds: float) -> None:
+        for _ in range(int(round(seconds / config.FIXED_DT))):
+            self.manager._step_once()
+
+    def _closed_dry(self) -> None:
+        """Flat, closed, no edge inflow: rain is the only way water can appear."""
+        self.manager.apply_water_level(0.0)
+        self.manager.apply_water_outflow(False)
+        self.manager.apply_edge_inflow(False)
+
+    def _depth(self) -> np.ndarray:
+        return np.asarray(self.manager.fluid._h.numpy(), dtype=np.float32).reshape(N, N)
+
+    @staticmethod
+    def _fallen_m3(diag: dict, mm_h: float, seconds: float, cells: int) -> float:
+        depth = mm_h / 3.6e6 * seconds - diag["rain_pending_m"]
+        return depth * cells * config.TERRAIN_CELL_SIZE ** 2
+
+    async def test_no_rain_adds_nothing(self) -> None:
+        """The default is off, and off is silent."""
+        self.assertEqual(self.manager.world.water.rain_intensity_mm_h, 0.0)
+        self._closed_dry()
+        self.manager.start()
+        self._run(2.0)
+        diag = self.manager.fluid.diagnostics()
+        self.assertEqual(diag["rain_m3s"], 0.0)
+        self.assertEqual(diag["added_m3"], 0.0)
+        self.assertEqual(float(self._depth().max()), 0.0)
+
+    async def test_the_map_holds_exactly_the_rain_that_fell(self) -> None:
+        """36 mm/h is 1e-5 m/s. Over a closed map nothing can leave, so the water
+        on it must be what the slider states fell on it."""
+        self._closed_dry()
+        self.manager.apply_rain({"intensity_mm_h": 36.0})
+        self.manager.start()
+        self._run(10.0)
+        diag = self.manager.fluid.diagnostics()
+        fallen = self._fallen_m3(diag, 36.0, 10.0, N * N)
+        self.assertGreater(fallen, 0.0)
+        self.assertAlmostEqual(diag["rain_added_m3"], fallen, delta=fallen * 1.0e-3)
+        self.assertAlmostEqual(diag["volume_m3"], fallen, delta=fallen * 1.0e-3)
+        self.assertLess(abs(diag["volume_error_m3"]), fallen * 1.0e-3)
+        self.assertAlmostEqual(diag["rain_m3s"],
+                               36.0 / 3.6e6 * N * N * config.TERRAIN_CELL_SIZE ** 2)
+
+    async def test_rain_does_not_land_inside_a_building(self) -> None:
+        """A wall is not ground. Until roofs exist (RainLab-2) rain on a house is
+        not delivered, and the ledger must not count it as if it were."""
+        self._closed_dry()
+        self.manager.apply_object_add({"type": "HOUSE", "position": [0.0, 0.0, 0.0]})
+        self.manager.apply_rain({"intensity_mm_h": 36.0})
+        self.manager.start()
+        self._run(5.0)
+        solid = np.asarray(self.manager.fluid._obstacles.numpy()).reshape(N, N) != 0
+        self.assertGreater(int(solid.sum()), 0, "the house is not in the mask")
+        self.assertEqual(float(self._depth()[solid].max()), 0.0)
+        diag = self.manager.fluid.diagnostics()
+        fallen = self._fallen_m3(diag, 36.0, 5.0, N * N - int(solid.sum()))
+        self.assertAlmostEqual(diag["rain_added_m3"], fallen, delta=fallen * 1.0e-3)
+
+    async def test_changing_the_intensity_acts_while_running(self) -> None:
+        self._closed_dry()
+        self.manager.start()
+        self._run(1.0)
+        self.assertEqual(self.manager.fluid.diagnostics()["rain_added_m3"], 0.0)
+        self.manager.apply_rain({"intensity_mm_h": 72.0})
+        self._run(1.0)
+        diag = self.manager.fluid.diagnostics()
+        self.assertEqual(diag["rain_mm_h"], 72.0)
+        fallen = self._fallen_m3(diag, 72.0, 1.0, N * N)
+        self.assertGreater(fallen, 0.0)
+        self.assertAlmostEqual(diag["rain_added_m3"], fallen, delta=fallen * 1.0e-3)
+
+    async def test_rain_is_saved_restored_and_validated(self) -> None:
+        self.manager.apply_rain({"intensity_mm_h": 20.0})
+        self.manager.apply_edge_inflow(False)
+        restored = WorldState.from_dict(self.manager.world.to_dict())
+        self.assertEqual(restored.water.rain_intensity_mm_h, 20.0)
+        self.assertFalse(restored.water.edge_inflow_enabled)
+        for bad in (-1.0, config.RAIN_MAX_MM_H + 1.0, math.nan):
+            with self.assertRaises(ValueError):
+                self.manager.apply_rain({"intensity_mm_h": bad})
+        with self.assertRaises(ValueError):
+            self.manager.apply_rain({"mm": 5.0})
+        with self.assertRaises(ValueError):
+            WorldState.from_dict({"water": {"rain_intensity_mm_h": -3.0}})
+
+    async def test_rain_on_a_slope_gathers_at_the_bottom(self) -> None:
+        """What a person watching looks for: not how much fell, but where it went.
+        A 2% slope falling east, closed edges: the top strip drains, the bottom
+        strip against the wall collects what ran down onto it."""
+        heights = self.manager.world.terrain.heights
+        x = (np.arange(N) - (N - 1) / 2) * config.TERRAIN_CELL_SIZE
+        heights[:, :] = (-0.02 * x)[None, :].astype(np.float32)
+        self.manager.terrain_revision += 1
+        self._closed_dry()
+        self.manager.apply_rain({"intensity_mm_h": 100.0})
+        self.manager.start()
+        self._run(60.0)
+        depth = self._depth()
+        band = max(2, N // 20)
+        high = float(depth[:, :band].mean())
+        low = float(depth[:, -band:].mean())
+        self.assertGreater(low, 3.0 * high,
+                           f"rain did not run downhill: {low * 1000:.2f} mm low "
+                           f"vs {high * 1000:.2f} mm high")
+
+    async def test_edge_inflow_off_leaves_the_west_edge_to_the_rain(self) -> None:
+        """With the edge on, its columns hold the level every substep; off, a
+        raised level must not fill them -- neither at start nor while running."""
+        self.manager.apply_water_level(1.0)
+        self.manager.apply_water_outflow(False)
+        self.manager.apply_edge_inflow(False)
+        self.manager.start()
+        self.assertEqual(float(self._depth()[:, :config.FLUID_SOURCE_COLUMNS].max()), 0.0)
+        self._run(1.0)
+        self.assertEqual(float(self._depth()[:, :config.FLUID_SOURCE_COLUMNS].max()), 0.0)
+        self.assertFalse(self.manager.fluid.diagnostics()["edge_inflow"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

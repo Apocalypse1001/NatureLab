@@ -309,3 +309,17 @@ SEABED_MANNING_N = 0.020
 # `tsunami_wave_spacing_s`'s auto default in world_state.py -- otherwise the
 # gate never opens at all.
 TSUNAMI_ACTIVE_WINDOW_PERIODS = 3.0
+
+# --------------------------------------------------------------- RainLab-1 (docs/14_rain_plan.md)
+# Uniform rain, in mm/h (= L/m2 per hour). The slider's ceiling: 150 mm/h is
+# past any preset (the heaviest, "Extreme", is 100) and well into the WMO's
+# "violent" class (>50 mm/h).
+RAIN_MAX_MM_H = 150.0
+# Rain is poured in portions of at least this depth, not a sliver per substep.
+# `h` is float32: 1 mm/h over one 1/60 s substep is 4.6e-9 m, while float32's
+# spacing is ~3e-8 m at 0.5 m depth -- a per-substep add would round to nothing
+# on any puddle, so light rain would silently vanish exactly where it collects.
+# 1e-5 m (0.01 mm) is invisible as a pulse, arrives every 36 s at 1 mm/h and
+# every 0.36 s at 100 mm/h, and is booked from the increment the GPU actually
+# made, so the ledger stays exact whatever rounding does to a deep cell.
+RAIN_APPLY_STEP_M = 1.0e-5

@@ -472,6 +472,30 @@ if WARP_IMPORTED:
 
 
     @wp.kernel
+    def _apply_rain(h: wp.array(dtype=float), solid: wp.array(dtype=wp.int32),
+                    depth: float, area: float, added: wp.array(dtype=float)):
+        """RainLab-1: uniform rain, one poured portion `depth` on every open cell.
+
+        An AREAL source (docs/14_rain_plan.md): it adds to whichever boundary is
+        active rather than replacing it, which is why it is not gated with the
+        edge/SOURCE/inlet "one answer to where the water comes from" rule.
+
+        The ledger books what `h` actually gained, not `depth * area`: `h` is
+        float32, and on a deep cell a small add is rounded. Booking the request
+        would turn that rounding into an unexplained conservation error; booking
+        the increment keeps `volume_error_m3` honest about the water that is
+        really there. Solid cells receive nothing -- until roofs exist
+        (RainLab-2) rain on a building is not delivered at all.
+        """
+        idx = wp.tid()
+        if solid[idx] != 0:
+            return
+        before = h[idx]
+        h[idx] = before + depth
+        wp.atomic_add(added, 0, (h[idx] - before) * area)
+
+
+    @wp.kernel
     def _measure_drain_circulation(u: wp.array(dtype=float), v: wp.array(dtype=float),
                                    h: wp.array(dtype=float),
                                    solid: wp.array(dtype=wp.int32),
@@ -1379,6 +1403,12 @@ class WarpShallowWaterSolver(FluidSolver):
         self._diag_solidified = None
         self._level = 0.5
         self._source_enabled = True
+        # RainLab-1 (docs/14_rain_plan.md)
+        self._edge_inflow_enabled = True
+        self._rain_mm_h = 0.0
+        self._rain_pending_m = 0.0
+        self._rain_added_m3 = 0.0
+        self._diag_rain = None
         self._tsunami_enabled = False
         self._tsunami_amplitude = 0.0
         self._tsunami_period = 60.0
@@ -1398,6 +1428,13 @@ class WarpShallowWaterSolver(FluidSolver):
         self._world, self._terrain = world, world.terrain
         self._level = float(world.water.level)
         self._source_enabled = True
+        # RainLab-1: read here as well as live each tick, because the edge
+        # prefill below has to know before the first substep whether the west
+        # edge holds a level at all
+        self._edge_inflow_enabled = bool(getattr(world.water, "edge_inflow_enabled", True))
+        self._rain_mm_h = float(getattr(world.water, "rain_intensity_mm_h", 0.0))
+        self._rain_pending_m = 0.0
+        self._rain_added_m3 = 0.0
         # TsunamiLab wavemaker. Off unless the world asks for it, so every
         # non-tsunami world behaves exactly as it did before v0.14.1.
         self._tsunami_enabled = bool(getattr(world.water, "tsunami_enabled", False))
@@ -1440,7 +1477,7 @@ class WarpShallowWaterSolver(FluidSolver):
             # tsunami world's west edge is dry land (terrain_gen.coastline).
             depth_grid = np.maximum(
                 self._level - bed_grid.astype(np.float64), 0.0).astype(np.float32)
-        elif not inlet_wanted:
+        elif not inlet_wanted and self._edge_inflow_enabled:
             # A river inlet owns the west edge; pre-filling it from the level
             # control as well would put a wall of water across the floodplain at
             # t = 0 and then leave it to drain, which is not a river starting.
@@ -1467,6 +1504,7 @@ class WarpShallowWaterSolver(FluidSolver):
         self._diag_removed = wp.zeros(1, dtype=float, device=self.device)
         self._diag_sediment_out = wp.zeros(1, dtype=float, device=self.device)
         self._diag_solidified = wp.zeros(1, dtype=float, device=self.device)
+        self._diag_rain = wp.zeros(1, dtype=float, device=self.device)
         self._solidified_m3 = 0.0
         # VolcanoLab (v0.13.0). Manning friction defaults to the constant every
         # non-lava world already ran with, filled ONCE here from
@@ -1849,6 +1887,18 @@ class WarpShallowWaterSolver(FluidSolver):
         self._inlet_q.assign(q_row)
         self._inlet_normal_depth.assign(depth_row)
 
+    def set_rain(self, intensity_mm_h: float) -> None:
+        """RainLab-1: uniform rain in mm/h. Read live every tick, so a change
+        acts from the next substep; 0 stops it (any undelivered portion below
+        RAIN_APPLY_STEP_M stays pending until rain resumes)."""
+        self._rain_mm_h = max(0.0, float(intensity_mm_h))
+
+    def set_edge_inflow(self, enabled: bool) -> None:
+        """Whether the west edge holds `level`. Off leaves those columns to the
+        physics -- a rain-only world needs this, or the edge rewrites them every
+        substep and drains whatever rain lands there."""
+        self._edge_inflow_enabled = bool(enabled)
+
     def set_water_features(self, sources: list, drains: list) -> None:
         """Upload placeable SOURCE and DRAIN objects, in world coordinates.
 
@@ -2094,7 +2144,8 @@ class WarpShallowWaterSolver(FluidSolver):
                                   float(self._terrain.cell_size), dt, area,
                                   config.SEDIMENT_CAPACITY_SCALE,
                                   self._diag_added], device=self.device)
-            elif self._source_enabled and not self._source_count:
+            elif (self._source_enabled and self._edge_inflow_enabled
+                  and not self._source_count):
                 # a placed SOURCE takes over from the edge inflow entirely --
                 # otherwise the map has two sources and "where does the water
                 # come from" stops having a single answer
@@ -2124,6 +2175,17 @@ class WarpShallowWaterSolver(FluidSolver):
                                   config.FLUID_DRY_DEPTH,
                                   config.FLUID_MAX_VELOCITY, area,
                                   self._diag_added], device=self.device)
+            if self._rain_mm_h > 0.0 and not self._lava_enabled:
+                # Poured in portions of RAIN_APPLY_STEP_M, not a float32 sliver
+                # per substep -- see config. Skipped in a lava world: `h` there
+                # IS lava, and rain would erupt from the sky.
+                self._rain_pending_m += self._rain_mm_h / 3.6e6 * dt
+                if self._rain_pending_m >= config.RAIN_APPLY_STEP_M:
+                    wp.launch(_apply_rain, dim=self._count,
+                              inputs=[self._h, self._obstacles,
+                                      float(self._rain_pending_m), area,
+                                      self._diag_rain], device=self.device)
+                    self._rain_pending_m = 0.0
             if self._drain_count:
                 self._drain_circulation.zero_()
                 self._drain_samples.zero_()
@@ -2291,6 +2353,14 @@ class WarpShallowWaterSolver(FluidSolver):
         self._diag_added.zero_()
         self._diag_removed.zero_()
         self._diag_sediment_out.zero_()
+        if self._diag_rain is not None:
+            # Rain enters `h` like any source, so it is booked on the same side
+            # of the ledger as `added_m3`; kept separately as well so the UI and
+            # the tests can read how much of the water on the map fell as rain.
+            rain = float(self._diag_rain.numpy()[0])
+            self._added_m3 += rain
+            self._rain_added_m3 += rain
+            self._diag_rain.zero_()
         if self._diag_solidified is not None:
             # Solidified lava leaves the fluid domain the same way outflow or a
             # drain does, so it belongs in the same ledger the volume-error
@@ -2371,7 +2441,7 @@ class WarpShallowWaterSolver(FluidSolver):
     def set_level(self, level: float) -> None:
         level = float(level)
         if (abs(level - self._level) > 1.0e-9 and self._h is not None
-                and not self._inlet_enabled):
+                and not self._inlet_enabled and self._edge_inflow_enabled):
             self._source_enabled = True
             wp.launch(_apply_source, dim=self._count, inputs=[self._h, self._bed,
                       self._u, self._v, self._sediment,
@@ -2474,6 +2544,18 @@ class WarpShallowWaterSolver(FluidSolver):
                 "inlet_enabled": self._inlet_enabled,
                 "inlet_request_m3s": self._inlet_request["discharge_m3s"],
                 "outflow_rows": list(self._outflow_rows),
+                # RainLab-1: what is actually being applied -- 0 in a lava world
+                # whatever the slider says, so the UI never claims rain it is not
+                # delivering
+                "rain_mm_h": (self._rain_mm_h if not self._lava_enabled else 0.0),
+                "rain_m3s": ((self._rain_mm_h / 3.6e6
+                              * float(np.count_nonzero(self._obstacle_host == 0))
+                              * float(self._terrain.cell_size ** 2))
+                             if (not self._lava_enabled and self._terrain is not None)
+                             else 0.0),
+                "rain_added_m3": self._rain_added_m3,
+                "rain_pending_m": self._rain_pending_m,
+                "edge_inflow": self._edge_inflow_enabled,
                 "sources": self._source_count,
                 "drains": self._drain_count,
                 "drain_swirl_mps": (

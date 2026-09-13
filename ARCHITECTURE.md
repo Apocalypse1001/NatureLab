@@ -187,6 +187,30 @@ A world with no `SOURCE` behaves exactly as 0.7.0 did, which is what keeps the o
 suite valid. A world with one turns the edge inflow off entirely, so "where does the
 water come from" always has a single answer.
 
+Rain (RainLab-1, `docs/14_rain_plan.md`) is the deliberate exception to that rule, and
+the reason is what it is rather than a preference: every mechanism in the table above
+is a BOUNDARY, and two boundaries claiming the same water over-determine it. Rain is an
+AREAL source -- it falls on the whole map -- so it adds to whichever boundary is active
+instead of replacing it:
+
+```text
+rain             every open cell, uniform mm/h, poured in RAIN_APPLY_STEP_M portions
+edge inflow off  WaterState.edge_inflow_enabled -- the west columns stop holding `level`
+```
+
+Two details that are easy to undo by accident. Rain is poured in portions and not a
+sliver per substep because `h` is float32: 1 mm/h over one substep is 4.6e-9 m, below
+float32's spacing on any puddle, so a per-substep add silently rounds light rain away
+exactly where it collects. And `_apply_rain` books the increment `h` actually gained,
+not the requested depth, so rounding on a deep cell cannot surface as a conservation
+error. Solid cells receive nothing (no roofs yet), and a lava world receives no rain,
+because its `h` is lava.
+
+The edge-inflow toggle exists because the edge columns are REWRITTEN to the level every
+substep: on a rain-only map they would overwrite the rain landing there, and a level
+below the ground turns them into a sink. The toggle is read in `initialize()` as well
+as live, since the edge prefill happens before the first substep.
+
 Two invariants worth keeping when this area is touched again:
 
 - The outlet copies only OUTWARD velocity. Allowing the inward component would turn

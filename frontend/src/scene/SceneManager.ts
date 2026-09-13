@@ -8,6 +8,7 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { TerrainGrid } from '../world/TerrainGrid';
+import { RainField } from './RainField';
 import { applyTransform, buildObjectMesh } from '../world/ObjectFactory';
 import type { ObjectData } from '../world/types';
 
@@ -57,6 +58,10 @@ export class SceneManager {
   private tracersVisible = true;
   private tracerDisplayLimit = 36000;   // matches config.FLOW_TRACER_COUNT
   private receivedTracerCount = 0;
+  // RainLab-1: streaks drawn from the intensity the solver reports applying
+  private rain = new RainField();
+  private rainRunning = false;
+  private lastRenderMs = performance.now();
 
   constructor(canvas: HTMLCanvasElement, private terrain: TerrainGrid) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -183,6 +188,7 @@ export class SceneManager {
     }));
     this.points.frustumCulled = false;
     this.scene.add(this.points);
+    this.scene.add(this.rain.lines);
 
     this.scene.add(this.objectsRoot);
 
@@ -398,6 +404,13 @@ export class SceneManager {
           gl_FragColor.rgb *= mix(1.28, 0.82, deep);
           gl_FragColor.rgb += vec3(0.0, 0.05, 0.02) * (1.0 - deep);
           gl_FragColor.a = clamp(gl_FragColor.a + foam * 0.5 + 0.12 * (1.0 - deep), 0.0, 1.0);
+          // RainLab-1: a film is not a flood. Rain wets every cell past the
+          // solver's 0.1 mm dry threshold within seconds, and the lines above
+          // make shallow water MORE opaque, so 45 s of a downpour (a 0.6 mm
+          // sheet) drew the whole map as standing water. Real water under a
+          // millimetre over ground is barely visible; fade it in between 1 mm
+          // and 1 cm. Lava is untouched -- lavaMix below forces alpha to 1.
+          gl_FragColor.a *= smoothstep(0.001, 0.01, vDepth);
           // Lava overrides the water treatment above entirely rather than
           // tinting it: foam and blue depth-shading are real-water phenomena
           // that mean nothing for a viscous melt. vLavaTemp is 0 for every
@@ -746,6 +759,15 @@ export class SceneManager {
     this.applyTracerDisplay();
   }
 
+  /**
+   * RainLab-1: intensity in mm/h as streamed in `fluid.rain_mm_h`. `running`
+   * false freezes the streaks -- a paused simulation is not raining.
+   */
+  setRain(mmPerHour: number, running: boolean): void {
+    this.rain.setIntensity(mmPerHour);
+    this.rainRunning = running;
+  }
+
   setTracerVisible(visible: boolean): void {
     this.tracersVisible = visible;
     this.applyTracerDisplay();
@@ -924,8 +946,14 @@ export class SceneManager {
 
   render(): void {
     // drives the advected ripple pattern in the water shader
-    this.waterTime.value = (performance.now() - this._clockStart) / 1000;
+    const now = performance.now();
+    this.waterTime.value = (now - this._clockStart) / 1000;
     this.controls.update();
+    this.rain.update((now - this.lastRenderMs) / 1000, this.controls.target,
+                     this.camera.position.distanceTo(this.controls.target),
+                     this.terrain.sizeM, (x, z) => this.terrain.heightAt(x, z),
+                     this.rainRunning);
+    this.lastRenderMs = now;
     if (this._selectionHelper) this._selectionHelper.update();
     this.renderer.info.reset();
     this.composer.render();

@@ -179,8 +179,11 @@ Writes `releases/NatureLab_v<version>.zip` (frontend `dist/` included, `.git`/
   `initialize()` starts the grid dry except for `FLUID_SOURCE_COLUMNS` (2) at the west
   edge, held at `max(0, level − bed)`. Everything after that is real flux physics, so the
   front takes tens of seconds to cross 100 m. `eastMean: 0` early in a run is correct, not
-  broken. There is **no other water source** — no rain, no point inflow (a deliberate open
-  item, see `docs/06_next_steps.md`).
+  broken. Other sources exist but are opt-in: a placed `SOURCE` (replaces the edge
+  inflow), the river inlet, and **rain** (RainLab-1): `send
+  {"op":"rain","fields":{"intensity_mm_h":50}}`, plus `send
+  {"op":"edge_inflow","enabled":false}` for a rain-only map. The applied rate is streamed
+  as `fluid.rain_mm_h` / `rain_m3s`; the streaks are `__NL.sceneManager.rain.lines`.
 - **The edge inflow respects terrain.** A hill touching the west edge stays dry if it is
   taller than the level you set — `_apply_source` computes `max(0, level − bed)` per cell.
   This is a fix relative to the pre-0.5.1 solver, which clamped the whole column and

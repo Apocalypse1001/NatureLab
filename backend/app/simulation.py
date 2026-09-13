@@ -177,6 +177,32 @@ class SimulationManager:
                 raise ValueError(f"unknown outlet field: {key!r}")
         return {"centre_z": water.outlet_centre_z, "width_m": water.outlet_width_m}
 
+    def apply_rain(self, fields: Dict[str, Any]) -> Dict[str, Any]:
+        """RainLab-1: uniform rain over the map, in mm/h (= L/m2 per hour).
+
+        Read live each tick in _step_once(), like the river inlet, so the
+        intensity can be changed while RUNNING. 0 means no rain.
+        """
+        water = self.world.water
+        for key, value in fields.items():
+            if key == "intensity_mm_h":
+                rate = finite_number(value, "rain.intensity_mm_h")
+                if not 0.0 <= rate <= config.RAIN_MAX_MM_H:
+                    raise ValueError("rain.intensity_mm_h out of range")
+                water.rain_intensity_mm_h = rate
+            else:
+                raise ValueError(f"unknown rain field: {key!r}")
+        return {"intensity_mm_h": water.rain_intensity_mm_h}
+
+    def apply_edge_inflow(self, enabled: bool) -> None:
+        """Whether the west edge holds the inflow level at all. Read live each tick.
+
+        Off is what a rain-only world needs: with it on, the edge columns are
+        rewritten to the level every substep, so rain falling on them is
+        overwritten and a level below the ground turns the edge into a sink.
+        """
+        self.world.water.edge_inflow_enabled = bool(enabled)
+
     @staticmethod
     def _affects_fluid_boundary(obj) -> bool:
         """Does this object change what the fluid solver sees as a boundary?
@@ -419,6 +445,10 @@ class SimulationManager:
             water = self.world.water
             self.fluid.set_river_inlet(water.inlet_enabled, water.inlet_centre_z,
                                        water.inlet_width_m, water.inlet_discharge_m3s)
+        if hasattr(self.fluid, "set_rain"):
+            # RainLab-1: live, so the slider acts while RUNNING
+            self.fluid.set_rain(self.world.water.rain_intensity_mm_h)
+            self.fluid.set_edge_inflow(self.world.water.edge_inflow_enabled)
         if hasattr(self.fluid, "set_water_features"):
             # Positions are read live every tick rather than snapshotted, so a
             # SOURCE or DRAIN can be dragged while RUNNING and the water reacts
