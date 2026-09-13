@@ -2,6 +2,11 @@
  *  dynamic water surface, particle points, object meshes. */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { TerrainGrid } from '../world/TerrainGrid';
 import { applyTransform, buildObjectMesh } from '../world/ObjectFactory';
 import type { ObjectData } from '../world/types';
@@ -18,6 +23,10 @@ export class SceneManager {
   readonly sun: THREE.DirectionalLight;
   readonly selectionBox: THREE.BoxHelper | null = null;
 
+  private composer: EffectComposer;
+  private bloomPass: UnrealBloomPass;
+  private skyDome: THREE.Mesh;
+  private groundTexture: THREE.CanvasTexture;
   private raycaster = new THREE.Raycaster();
   private _selectionHelper: THREE.BoxHelper | null = null;
   private waterBaseIndices: Uint16Array | Uint32Array;
@@ -58,12 +67,43 @@ export class SceneManager {
     // pass changes what the user can read off the scene as much as this does.
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // Filmic response instead of the flat linear default: highlights (lava
+    // glow, sun-lit glass) roll off instead of clipping to flat white, and
+    // mid-tones keep separation instead of crushing together.
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.1;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    // EffectComposer.render() calls renderer.render() once per pass, and each
+    // call resets `info` when autoReset is on -- so by the time render() below
+    // returns, `info.render` only reflects the LAST internal pass (the final
+    // full-screen quad: 1 triangle, 1 draw call), not the scene. The driver's
+    // "did it draw" smoke signal, and any future agent reading it, depends on
+    // this staying a real triangle/draw-call count.
+    this.renderer.info.autoReset = false;
+
+    // A neutral studio environment, not a photo HDRI: every MeshStandardMaterial
+    // (car glazing, window panes, metal hubs) picks up SOME reflection instead
+    // of looking like flat-shaded paint, without importing a texture asset or
+    // implying a specific sky that fights the fog/sun colours below.
+    const pmrem = new THREE.PMREMGenerator(this.renderer);
+    this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    this.scene.environmentIntensity = 0.6;
+    pmrem.dispose();
 
     // Camera framing, fog and zoom limits are derived from the world size, not
     // fixed numbers: they were tuned for a 100 m map and left the 200 m map
     // half out of frame and inside the fog when it was doubled in v0.7.0.
     const span = terrain.sizeM;
     this.scene.fog = new THREE.Fog(0x0e1420, span * 1.2, span * 4);
+
+    // A gradient dome, not the flat clear-colour backdrop the renderer painted
+    // before: at ground level (the camera height a child would actually use)
+    // a single flat colour reads as a wall behind the houses, not a sky. The
+    // horizon stop matches the fog colour exactly so the dome and the
+    // fog-swallowed terrain hand off with no seam.
+    this.skyDome = this.buildSkyDome();
+    this.scene.add(this.skyDome);
+    this.updateSkyDome(span);
 
     this.camera = new THREE.PerspectiveCamera(55, 1, 0.1, 1000);
     this.camera.position.set(span * 0.6, span * 0.55, span * 0.6);
@@ -92,9 +132,15 @@ export class SceneManager {
     const geo = new THREE.PlaneGeometry(
       this.terrain.sizeM, this.terrain.sizeM,
       this.terrain.width, this.terrain.height);
+    // A speckled canvas texture, not a flat fill: up close (a child's eye
+    // height) one solid green reads as a floor, not grass. Mottling is cheap
+    // -- baked once, tiled by repeat -- and keeps the same low-poly toy read
+    // the rest of the scene has, rather than importing a photo texture.
+    this.groundTexture = this.buildGroundTexture();
     this.terrainMesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
-      color: 0x6f8c56, roughness: 1.0, metalness: 0,
+      map: this.groundTexture, roughness: 1.0, metalness: 0,
     }));
+    this.updateGroundTextureRepeat(span);
     this.terrainMesh.rotation.x = -Math.PI / 2;
     this.terrainMesh.receiveShadow = true;
     this.scene.add(this.terrainMesh);
@@ -139,6 +185,17 @@ export class SceneManager {
     this.scene.add(this.points);
 
     this.scene.add(this.objectsRoot);
+
+    // Bloom only, kept deliberately subtle: threshold above the brightness any
+    // ordinary sunlit surface reaches post-tonemap, so it catches the genuinely
+    // emissive things -- the VENT throat, SOURCE/DRAIN rings, car lamps -- as a
+    // glow, without haloing every white wall the sun hits.
+    this.composer = new EffectComposer(this.renderer);
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.22, 0.2, 1.0);
+    this.composer.addPass(this.bloomPass);
+    this.composer.addPass(new OutputPass());
+
     this.resize();
   }
 
@@ -186,6 +243,8 @@ export class SceneManager {
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    this.composer.setSize(w, h);
+    this.composer.setPixelRatio(this.renderer.getPixelRatio());
   }
 
   // ------------------------------------------------------------------ terrain
@@ -364,6 +423,93 @@ export class SceneManager {
     return material;
   }
 
+  /**
+   * A vertex-coloured sphere, seen from inside (`BackSide`), standing in for
+   * a sky. `MeshBasicMaterial` with `fog: false`: it must ignore the scene's
+   * own fog, since it IS the thing the fog fades into, not an object the fog
+   * should dim as if it had depth.
+   */
+  private buildSkyDome(): THREE.Mesh {
+    const geometry = new THREE.SphereGeometry(1, 24, 16);
+    const position = geometry.attributes.position as THREE.BufferAttribute;
+    const colors = new Float32Array(position.count * 3);
+    const zenith = new THREE.Color(0x25446b);
+    const horizon = new THREE.Color(0x0e1420);   // matches scene.fog exactly
+    const c = new THREE.Color();
+    // Steep on purpose: from eye height, most of what a camera frames is
+    // within a few degrees of the horizon (y near 0), not the zenith. A
+    // gradient that only finished at y=0.65 stayed flat across that whole
+    // band and read as no gradient at all.
+    for (let i = 0; i < position.count; i++) {
+      const t = THREE.MathUtils.smoothstep(position.getY(i), -0.05, 0.3);
+      c.copy(horizon).lerp(zenith, t);
+      colors.set([c.r, c.g, c.b], i * 3);
+    }
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    const material = new THREE.MeshBasicMaterial({
+      vertexColors: true, side: THREE.BackSide, fog: false, depthWrite: false,
+    });
+    const dome = new THREE.Mesh(geometry, material);
+    dome.renderOrder = -1;
+    return dome;
+  }
+
+  /** Keep the dome outside `controls.maxDistance` but inside `camera.far`. */
+  private updateSkyDome(span: number): void {
+    this.skyDome.scale.setScalar(span * 4.5);
+  }
+
+  /**
+   * A small tileable patch of mottled grass, baked once on a canvas.
+   *
+   * Splotches, not speckle: a first version scattered 5000 tiny
+   * semi-transparent dots, which is exactly the setup that averages itself
+   * back into a flat colour -- with that many independent low-alpha samples
+   * overlapping, the law of large numbers wins and the result reads as
+   * uniform again. A few dozen soft, larger, more opaque blobs stay visible
+   * as patches instead of resolving into a new flat shade.
+   */
+  private buildGroundTexture(): THREE.CanvasTexture {
+    const size = 512;
+    const canvas = document.createElement('canvas');
+    canvas.width = size; canvas.height = size;
+    const ctx = canvas.getContext('2d')!;
+    ctx.fillStyle = '#6f8c56';
+    ctx.fillRect(0, 0, size, size);
+    for (let i = 0; i < 90; i++) {
+      const shade = 0.72 + Math.random() * 0.56;
+      const r = Math.min(255, Math.round(111 * shade));
+      const g = Math.min(255, Math.round(140 * shade));
+      const b = Math.min(255, Math.round(86 * shade));
+      const x = Math.random() * size, y = Math.random() * size;
+      const radius = 22 + Math.random() * 46;
+      const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius);
+      gradient.addColorStop(0, `rgba(${r},${g},${b},0.45)`);
+      gradient.addColorStop(1, `rgba(${r},${g},${b},0)`);
+      ctx.fillStyle = gradient;
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // Fine dark speckle on top for close-up grain, kept sparse enough that it
+    // does not average itself out the way the first attempt did.
+    for (let i = 0; i < 700; i++) {
+      ctx.fillStyle = `rgba(30,38,20,${0.08 + Math.random() * 0.1})`;
+      const x = Math.random() * size, y = Math.random() * size;
+      ctx.fillRect(x, y, 1.5, 1.5);
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+    texture.colorSpace = THREE.SRGBColorSpace;
+    return texture;
+  }
+
+  /** One tile roughly every 10 m, regardless of the map's physical size. */
+  private updateGroundTextureRepeat(sizeM: number): void {
+    const tiles = Math.max(1, Math.round(sizeM / 10));
+    this.groundTexture.repeat.set(tiles, tiles);
+  }
+
   /** Rebuild every piece of geometry whose resolution follows the grid. */
   private rebuildGridGeometry(): void {
     const { sizeM, width, height } = this.terrain;
@@ -397,6 +543,8 @@ export class SceneManager {
     // the constructor note and configureSun()
     this.configureSun();
     this.scene.fog = new THREE.Fog(0x0e1420, sizeM * 1.2, sizeM * 4);
+    this.updateSkyDome(sizeM);
+    this.updateGroundTextureRepeat(sizeM);
     this.camera.far = sizeM * 6;
     this.camera.position.set(sizeM * 0.6, sizeM * 0.55, sizeM * 0.6);
     this.camera.updateProjectionMatrix();
@@ -779,6 +927,7 @@ export class SceneManager {
     this.waterTime.value = (performance.now() - this._clockStart) / 1000;
     this.controls.update();
     if (this._selectionHelper) this._selectionHelper.update();
-    this.renderer.render(this.scene, this.camera);
+    this.renderer.info.reset();
+    this.composer.render();
   }
 }
