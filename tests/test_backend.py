@@ -2696,12 +2696,20 @@ class TsunamiLabTests(unittest.IsolatedAsyncioTestCase):
         manager.world.water.tsunami_enabled = True
         manager.world.water.tsunami_amplitude_m = 6.0
         manager.world.water.tsunami_period_s = 100.0
+        manager.world.water.tsunami_wave_count = 3
+        manager.world.water.tsunami_wave_spacing_s = 900.0
+        manager.world.water.tsunami_wave2_scale = 1.3
+        manager.world.water.tsunami_wave3_scale = 0.6
         manager.save("tsunamitest")
         manager.load("tsunamitest")
         water = manager.world.water
         self.assertTrue(water.tsunami_enabled)
         self.assertEqual(water.tsunami_amplitude_m, 6.0)
         self.assertEqual(water.tsunami_period_s, 100.0)
+        self.assertEqual(water.tsunami_wave_count, 3)
+        self.assertEqual(water.tsunami_wave_spacing_s, 900.0)
+        self.assertEqual(water.tsunami_wave2_scale, 1.3)
+        self.assertEqual(water.tsunami_wave3_scale, 0.6)
         self.assertEqual(manager.world.terrain.cell_size, self.CELL,
                           "cell_size must round-trip: it is what makes this one "
                           "scenario kilometre-scale while the others stay at 1 m")
@@ -2824,6 +2832,92 @@ class TsunamiLabTests(unittest.IsolatedAsyncioTestCase):
                           "drives that edge, whatever the world file asks for")
         self.assertEqual(removed, 0.0,
                           "and it must therefore remove nothing")
+
+    def _shore_col(self, manager, shore_x: float) -> int:
+        cell = manager.world.terrain.cell_size
+        return int(round(shore_x / cell + (N - 1) * 0.5))
+
+    def _shore_depth(self, manager, shore_col: int) -> float:
+        row = np.asarray(manager.fluid._h.numpy()).reshape(N, N)[N // 2]
+        return float(row[shore_col])
+
+    async def test_the_wavemaker_stops_reflecting_once_the_pulse_has_passed(self) -> None:
+        """v0.14.3's fix for the bug docs/13_tsunami2_plan.md's follow-up
+        records: with a hard Dirichlet edge running forever, the wave that
+        floods the shore has nowhere to go afterward and just bounces,
+        forever, off the boundary that generated it -- measured as a standing
+        oscillation, several m/s, that had not decayed after 1800 s. The
+        deliverable is that the domain actually loses water once the
+        scripted pulse is behind it (the outlet opens in the gap -- see
+        `WarpShallowWaterSolver.advance`) and the shore genuinely drains back
+        down, rather than staying pinned at the flood peak forever."""
+        manager = SimulationManager()
+        effective = self._coast(manager)
+        shore_col = self._shore_col(manager, effective["shore_x"])
+        manager.world.water.level = 0.0
+        manager.world.water.tsunami_enabled = True
+        manager.world.water.tsunami_amplitude_m = 6.0
+        manager.world.water.tsunami_period_s = 200.0
+        manager.start()
+        peak = 0.0
+        for step in range(int(1800.0 / config.FIXED_DT)):
+            manager._step_once()
+            if step % 60:
+                continue
+            peak = max(peak, self._shore_depth(manager, shore_col))
+        depth_at_end = self._shore_depth(manager, shore_col)
+        removed = float(manager.fluid.diagnostics().get("removed_m3", 0.0))
+        manager.stop()
+        self.assertGreater(peak, 3.0,
+                            "the scripted wave must still visibly reach the shore")
+        self.assertLess(depth_at_end, 0.5 * peak,
+                         f"the shore must drain back down well below its {peak:.1f} m "
+                         f"peak once the pulse has passed, not stay pinned there "
+                         f"(ended at {depth_at_end:.1f} m) -- that pinning is exactly "
+                         f"the never-decaying reflection this fix removes")
+        self.assertGreater(removed, 0.0,
+                            "water must actually have LEFT through the opened outlet, "
+                            "not merely stopped growing")
+
+    async def test_wave_train_delivers_three_distinguishable_arrivals(self) -> None:
+        """WaterState.tsunami_wave_count (v0.14.3): a real tsunami is a
+        train, and the second or third crest is sometimes the largest one
+        (1960 Chile: 4.5 m at 15 min, 8 m an hour later). This does not
+        assert a pristine silence between pulses -- measured, the domain
+        still carries real residual chop from one pulse into the next one's
+        window on this scene's 2 km scale, an honest limitation recorded in
+        docs/13_tsunami2_plan.md -- only that each of the three SCRIPTED
+        pulses leaves a clear signature at the shore near its own centre,
+        which is the thing a wave_count=3 world promises over wave_count=1."""
+        manager = SimulationManager()
+        effective = self._coast(manager)
+        shore_col = self._shore_col(manager, effective["shore_x"])
+        manager.world.water.level = 0.0
+        manager.world.water.tsunami_enabled = True
+        manager.world.water.tsunami_amplitude_m = 6.0
+        manager.world.water.tsunami_period_s = 200.0
+        manager.world.water.tsunami_wave_count = 3
+        manager.start()
+        period = manager.fluid._tsunami_period
+        spacing = manager.fluid._tsunami_wave_spacing
+        centres = [2.0 * period + k * spacing for k in range(3)]
+        peak_near_centre = [0.0, 0.0, 0.0]
+        total = centres[-1] + 4.0 * period
+        for step in range(int(total / config.FIXED_DT)):
+            manager._step_once()
+            if step % 60:
+                continue
+            t = manager.sim_time
+            depth = self._shore_depth(manager, shore_col)
+            for k, centre in enumerate(centres):
+                if abs(t - centre) < 1.5 * period:
+                    peak_near_centre[k] = max(peak_near_centre[k], depth)
+        manager.stop()
+        for k, peak in enumerate(peak_near_centre):
+            self.assertGreater(peak, 2.0,
+                                f"wave {k + 1} of 3 left no visible arrival near its "
+                                f"own scripted centre (t={centres[k]:.0f}s), only "
+                                f"{peak:.2f} m")
 
 
 if __name__ == "__main__":

@@ -400,6 +400,29 @@ class WaterState:
     tsunami_enabled: bool = False
     tsunami_amplitude_m: float = 6.0
     tsunami_period_s: float = 100.0
+    # v0.14.3: a real tsunami arrives as a TRAIN, not one N-wave -- and the
+    # second or third crest is sometimes the largest one (1960 Chile: 4.5 m
+    # at 15 min, 8 m an hour later). `tsunami_wave_count` repeats the same
+    # N-wave shape `tsunami_wave_count` times, spaced `tsunami_wave_spacing_s`
+    # apart (0 = auto, 7*tsunami_period_s -- the minimum that keeps
+    # consecutive pulses from overlapping, see
+    # config.TSUNAMI_ACTIVE_WINDOW_PERIODS, plus one period of real gap;
+    # roughly the real-world 10-60 minute crest-to-crest interval once period
+    # is read in this scene's compressed timescale), scaled by
+    # `tsunami_wave2_scale`/`tsunami_wave3_scale` against the first wave's
+    # amplitude. Defaults keep wave_count=1, so every world that predates
+    # this -- and every existing test -- gets
+    # exactly the single N-wave it always did.
+    #
+    # The scales act at the BOUNDARY; what reaches the shore is not monotonic
+    # in them. Measured on the shipped scenario: a lone 1.3x pulse floods the
+    # land 50% deeper than a lone 1x one, but in the default train wave 2
+    # arrives onto wave 1's residual motion and floods LESS (4.1 m vs 6.0 m
+    # at x = -720). See docs/13_tsunami2_plan.md, "проверка перед выпуском".
+    tsunami_wave_count: int = 1
+    tsunami_wave_spacing_s: float = 0.0
+    tsunami_wave2_scale: float = 1.3
+    tsunami_wave3_scale: float = 0.6
 
     def to_dict(self) -> Dict[str, Any]:
         return {"level": self.level, "visible": self.visible,
@@ -413,7 +436,11 @@ class WaterState:
                 "outlet_width_m": self.outlet_width_m,
                 "tsunami_enabled": self.tsunami_enabled,
                 "tsunami_amplitude_m": self.tsunami_amplitude_m,
-                "tsunami_period_s": self.tsunami_period_s}
+                "tsunami_period_s": self.tsunami_period_s,
+                "tsunami_wave_count": self.tsunami_wave_count,
+                "tsunami_wave_spacing_s": self.tsunami_wave_spacing_s,
+                "tsunami_wave2_scale": self.tsunami_wave2_scale,
+                "tsunami_wave3_scale": self.tsunami_wave3_scale}
 
 
 @dataclass
@@ -513,7 +540,16 @@ class WorldState:
             # a boundary driven in time, so they are dropped rather than
             # silently reinterpreted into a number they never meant.
             tsunami_period_s=finite_number(water.get("tsunami_period_s", 100.0),
-                                           "water.tsunami_period_s"))
+                                           "water.tsunami_period_s"),
+            tsunami_wave_count=int(finite_number(water.get("tsunami_wave_count", 1),
+                                                 "water.tsunami_wave_count")),
+            tsunami_wave_spacing_s=finite_number(
+                water.get("tsunami_wave_spacing_s", 0.0),
+                "water.tsunami_wave_spacing_s"),
+            tsunami_wave2_scale=finite_number(water.get("tsunami_wave2_scale", 1.3),
+                                              "water.tsunami_wave2_scale"),
+            tsunami_wave3_scale=finite_number(water.get("tsunami_wave3_scale", 0.6),
+                                              "water.tsunami_wave3_scale"))
         env = data.get("environment", {})
         state.environment = EnvironmentState(
             gravity=finite_number(env.get("gravity", 9.81), "environment.gravity"),

@@ -293,20 +293,23 @@ if WARP_IMPORTED:
         Why this rather than seeding a wave inside the grid, which is what
         v0.14.0 did and what docs/probe_tsunami_v2.py measured as wrong: a wave
         long enough to draw the sea back does not FIT in the domain alongside
-        the shore and the land behind it. Shallow-water theory wants wavelength
-        >> depth, and a pulse short enough to fit gave a ratio of 4, i.e. a
-        wave the solver is not entitled to model in the first place. Driving
-        the boundary moves the wave period into TIME, where the domain size
-        stops constraining it.
+        the shore and the land behind it. Driving the boundary moves the wave
+        period into TIME, where the domain size stops constraining it.
 
-        Honest limitation, stated here rather than discovered later: a
-        prescribed level is a REFLECTIVE boundary. Water the shore sends back
-        seaward does not leave through this edge, it bounces. That is harmless
-        for the arrival this scenario is about (the reflection needs a full
-        return trip to matter) and it is why `_apply_outflow` is suppressed on
-        these same columns while the wavemaker owns them -- two mechanisms
-        writing the same cells is the "two sources, no single answer to where
-        the water comes from" problem `_apply_source` already warns about.
+        Deliberately a hard write, not a soft pull toward `level`: a "blend
+        continuously, leave the edge's outward velocity always free" version
+        was tried (v0.14.3's first attempt) and measured wrong -- with
+        `set_outflow`'s wavemaker override removed, `_velocity_step`'s outlet
+        branch clamps ANY negative (inward) edge velocity to zero the instant
+        `outflow_columns > 0`, so the crest could never push water into the
+        domain no matter how hard this kernel pulled `h`: flood measured at
+        0 m instead of 258 m, reproducing the exact regression
+        docs/13_tsunami2_plan.md already recorded once for v0.14.1. Velocity
+        MUST be fully closed while a pulse is actually arriving; see
+        `WarpShallowWaterSolver.advance` for the (now discrete, not
+        continuous) on/off gate this settled on instead, and
+        config.TSUNAMI_ACTIVE_WINDOW_PERIODS for why the reflection problem
+        is solved between pulses rather than during one.
         """
         idx = wp.tid()
         if idx < width * height:
@@ -1401,6 +1404,19 @@ class WarpShallowWaterSolver(FluidSolver):
         self._tsunami_amplitude = float(getattr(world.water, "tsunami_amplitude_m", 0.0))
         self._tsunami_period = max(1.0e-3, float(
             getattr(world.water, "tsunami_period_s", 60.0)))
+        # v0.14.3: a wave TRAIN, not one N-wave -- see WaterState.tsunami_wave_count.
+        self._tsunami_wave_count = max(1, min(3, int(
+            getattr(world.water, "tsunami_wave_count", 1))))
+        spacing = float(getattr(world.water, "tsunami_wave_spacing_s", 0.0))
+        # Auto default must clear 2*TSUNAMI_ACTIVE_WINDOW_PERIODS periods, or
+        # consecutive pulses' active windows overlap and the gap the outlet
+        # needs to drain through (see config.TSUNAMI_ACTIVE_WINDOW_PERIODS)
+        # never opens. +1 period on top of that minimum leaves a real gap
+        # rather than exactly touching it.
+        auto_spacing = (2.0 * config.TSUNAMI_ACTIVE_WINDOW_PERIODS + 1.0) * self._tsunami_period
+        self._tsunami_wave_spacing = spacing if spacing > 0.0 else auto_spacing
+        self._tsunami_wave2_scale = float(getattr(world.water, "tsunami_wave2_scale", 1.3))
+        self._tsunami_wave3_scale = float(getattr(world.water, "tsunami_wave3_scale", 0.6))
         self._width, self._height = world.terrain.width + 1, world.terrain.height + 1
         self._count = self._width * self._height
         bed_grid = np.ascontiguousarray(world.terrain.heights, dtype=np.float32)
@@ -1986,6 +2002,40 @@ class WarpShallowWaterSolver(FluidSolver):
         gravity = float(self._world.environment.gravity)
         area = float(self._terrain.cell_size ** 2)
         for _ in range(substeps):
+            tsunami_active = True
+            if self._tsunami_enabled:
+                # v0.14.3: which regime this substep is in decides whether the
+                # east edge is the wavemaker (velocity closed, hard Dirichlet
+                # `_apply_tsunami_edge`) or a plain transmissive outlet
+                # (velocity open, `_apply_outflow` -- reusing the river's own
+                # mechanism). Velocity CANNOT be left open during an active
+                # pulse: `_velocity_step`'s outlet branch clamps any inward
+                # velocity to zero the instant outflow_columns > 0, so an
+                # always-open edge blocks the crest from ever pushing water
+                # in at all (measured: 0 m flood instead of 258 m, see
+                # `_apply_tsunami_edge`'s docstring). So this has to be a
+                # discrete gate, not a continuous blend.
+                #
+                # A pulse is "active" within this many periods of its own
+                # centre (the N-wave shape is already small past that --
+                # config.TSUNAMI_ACTIVE_WINDOW_PERIODS). `tsunami_wave_spacing`
+                # is chosen (see `initialize`) so consecutive pulses' windows
+                # do not overlap, which is what guarantees a real gap opens
+                # up between them for the outlet to actually drain through.
+                tsunami_active = False
+                for wave_i in range(self._tsunami_wave_count):
+                    centre = (2.0 * self._tsunami_period
+                              + wave_i * self._tsunami_wave_spacing)
+                    if (abs(self._time - centre)
+                            < config.TSUNAMI_ACTIVE_WINDOW_PERIODS * self._tsunami_period):
+                        tsunami_active = True
+                        break
+                # Overrides whatever `set_outflow` last wrote (it forces this
+                # to 0 whenever tsunami_enabled, unconditionally -- see its
+                # own docstring); recomputed fresh every substep because
+                # "active" can change inside a single frame's worth of them.
+                self._outflow_columns = 0 if tsunami_active else max(
+                    1, config.FLUID_OUTFLOW_COLUMNS)
             if self._lava_enabled:
                 # mu(T) from the PREVIOUS substep's temperature, written into the
                 # same array `_velocity_step` already reads -- so the array swap
@@ -2095,25 +2145,12 @@ class WarpShallowWaterSolver(FluidSolver):
                                   config.FLUID_DRY_DEPTH, config.DRAIN_SWIRL_GAIN,
                                   config.FLUID_MAX_VELOCITY, area,
                                   self._diag_removed], device=self.device)
-            if self._tsunami_enabled:
-                # The sea level outside the map, now. An N-shape in TIME:
-                # negative (the sea withdrawing) before the centre, positive
-                # (the wave) after it, so the trough arrives first because it
-                # is emitted first -- the same "ordering is the whole
-                # mechanism" the in-domain seed used, moved to the boundary.
-                # Peak magnitude is amplitude*exp(-0.5) = 0.607*amplitude, not
-                # amplitude; v0.14.0's plan doc quoted the latter as if it were
-                # the wave height, which it never was.
-                z = (self._time - 2.0 * self._tsunami_period) / self._tsunami_period
-                level = self._tsunami_amplitude * z * math.exp(-0.5 * z * z)
-                wp.launch(_apply_tsunami_edge, dim=self._count,
-                          inputs=[self._h, self._bed, self._obstacles,
-                                  self._width, self._height,
-                                  max(1, self._outflow_columns
-                                      or config.FLUID_OUTFLOW_COLUMNS),
-                                  float(level), area, self._diag_added],
-                          device=self.device)
-            if self._outflow_columns and not self._tsunami_enabled:
+            if self._outflow_columns:
+                # For a tsunami world this fires only in the GAP between
+                # pulses (or after the last one) -- see the gate computed
+                # above -- letting whatever the shore sends back out to sea
+                # actually leave instead of reflecting off the wavemaker's
+                # wall the rest of the time.
                 wp.launch(_apply_outflow, dim=self._count,
                           inputs=[self._h, self._u, self._sediment,
                                   self._obstacles,
@@ -2122,6 +2159,57 @@ class WarpShallowWaterSolver(FluidSolver):
                                   self._outflow_rows[0], self._outflow_rows[1],
                                   float(self._terrain.cell_size), dt, area,
                                   self._diag_removed, self._diag_sediment_out],
+                          device=self.device)
+            if self._tsunami_enabled and tsunami_active:
+                # The sea level outside the map, now. An N-shape in TIME:
+                # negative (the sea withdrawing) before the centre, positive
+                # (the wave) after it, so the trough arrives first because it
+                # is emitted first -- the same "ordering is the whole
+                # mechanism" the in-domain seed used, moved to the boundary.
+                # Peak magnitude is amplitude*exp(-0.5) = 0.607*amplitude, not
+                # amplitude; v0.14.0's plan doc quoted the latter as if it were
+                # the wave height, which it never was.
+                # v0.14.3: a wave TRAIN, one N-wave per `_tsunami_wave_count`,
+                # spaced `_tsunami_wave_spacing` apart and scaled per pulse --
+                # a real tsunami's second or third crest is sometimes the
+                # largest one (1960 Chile: 4.5 m at 15 min, 8 m an hour
+                # later), so wave2/3 default ABOVE and below 1x respectively,
+                # not as a decaying echo. wave_count=1 (the default) sums
+                # exactly one term and reproduces the original single-pulse
+                # formula bit for bit.
+                level = 0.0
+                for wave_i in range(self._tsunami_wave_count):
+                    scale = 1.0
+                    if wave_i == 1:
+                        scale = self._tsunami_wave2_scale
+                    elif wave_i == 2:
+                        scale = self._tsunami_wave3_scale
+                    centre = 2.0 * self._tsunami_period + wave_i * self._tsunami_wave_spacing
+                    z = (self._time - centre) / self._tsunami_period
+                    level += self._tsunami_amplitude * scale * z * math.exp(-0.5 * z * z)
+                # z(0) = -2, not -infinity: at t=0 this curve is already
+                # amplitude*(-2)*exp(-2) = -0.27*amplitude, e.g. -1.62 m at the
+                # default amplitude=6 -- a real number, not a rounding error.
+                # `initialize()` fills the whole sea to a flat, calm `level`
+                # (deliberately, so the scene starts as a still sea and not
+                # mid-event -- see test_tsunami_starts_as_a_calm_sea), so the
+                # boundary demanding -1.62 m on substep one is a discontinuity
+                # the interior never had: measured as a spurious ~5.6 m/s
+                # front crossing the whole domain before the real drawback
+                # even begins. Ramping the signal up from 0 over the first
+                # tenth of a period removes that step (the curve itself is
+                # still essentially flat on that timescale, so trough/crest
+                # timing is unaffected) without touching the boundary's
+                # physics once the ramp is done. Only the FIRST pulse needs
+                # this -- by the time a second or third pulse's centre
+                # arrives the ramp is long since 1.0.
+                ramp = min(1.0, self._time / (0.1 * self._tsunami_period))
+                level *= ramp
+                wp.launch(_apply_tsunami_edge, dim=self._count,
+                          inputs=[self._h, self._bed, self._obstacles,
+                                  self._width, self._height,
+                                  max(1, config.FLUID_OUTFLOW_COLUMNS),
+                                  float(level), area, self._diag_added],
                           device=self.device)
             if self._erosion_enabled:
                 # RiverLab (v0.6.0): pick material up where the flow is fast and

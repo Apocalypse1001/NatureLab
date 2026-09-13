@@ -268,3 +268,44 @@ def building_height_m(floors: float) -> float:
 # evidence of a period sweep, which tests duration and not friction; that claim
 # was wrong and this is what replaced it.
 SEABED_MANNING_N = 0.020
+
+# --------------------------------------------------------------- TsunamiLab wave train (v0.14.3)
+# The east edge's prescribed sea level (`_apply_tsunami_edge`) is a hard
+# Dirichlet write -- correct for GENERATING the scripted signal, but a wall
+# for anything coming back. Measured (docs/13_tsunami2_plan.md's follow-up):
+# a standing oscillation, several m/s, recurring on the wave's own period,
+# that had not decayed after 1800 s against a single 200 s-period event --
+# the "gains an inexplicable force" a person watching would report, and it
+# would make a genuine second SCRIPTED wave impossible to tell apart from
+# this artifact.
+#
+# Two other fixes were tried and measured wrong:
+#   - A spatial sponge (relax h/u/v toward calm over a band of edge columns):
+#     shallow-water wavelength at this depth (~3400 m) is far wider than any
+#     affordable sponge band, so the whole band sees essentially the SAME
+#     instantaneous level as the scripted signal -- it cannot tell "the wave
+#     being generated right now" from "reflected backwash arriving later" and
+#     damps both alike, gutting the calibrated retreat/flood numbers
+#     (102/308 m fell to 62/88 m at the settings tried).
+#   - Leaving the edge's outward velocity always free and blending the level
+#     write continuously instead of gating it: `_velocity_step`'s outlet
+#     branch clamps ANY inward velocity to zero the instant outflow_columns
+#     is nonzero, so with the edge always "open" the crest could never push
+#     water into the domain regardless of how hard the level write pulled --
+#     measured 0 m flood instead of 258 m. Velocity has to be fully closed
+#     while a pulse is actually arriving, which means this has to be a
+#     discrete gate, not a continuous one.
+#
+# What actually works: a pulse counts as ACTIVE within this many periods of
+# its own centre (the N-wave shape is already small past that). While
+# active, the edge is exactly the original hard Dirichlet write, with
+# velocity closed -- so the calibrated numbers for an ACTIVE wave do not
+# move at all. Between pulses, and after the last one, the edge switches to
+# `_apply_outflow` -- the plain transmissive river outlet, reused rather
+# than reinvented -- with velocity open: real outward flux leaves the domain
+# instead of reflecting, so a seiche the shore sends back out to sea drains
+# instead of bouncing back in as an unscripted extra wave. This only works
+# if consecutive pulses' active windows do not overlap -- see
+# `tsunami_wave_spacing_s`'s auto default in world_state.py -- otherwise the
+# gate never opens at all.
+TSUNAMI_ACTIVE_WINDOW_PERIODS = 3.0
