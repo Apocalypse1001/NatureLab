@@ -52,6 +52,10 @@ class ObjectType(str, enum.Enum):
     GAUGE = "GAUGE"
     VENT = "VENT"
     BUILDING = "BUILDING"
+    # v0.17.0 storm sewer (backend/app/sewer.py)
+    STORM_INLET = "STORM_INLET"
+    OUTFALL = "OUTFALL"
+    PIPE = "PIPE"
 
     @classmethod
     def register(cls, name: str) -> "ObjectType":
@@ -194,6 +198,27 @@ OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
                           "ground_contact_area": 16.0, "cross_sectional_area": 12.0,
                           "is_static": True, "floors": 1.0,
                           "foundation_height": 0.3, "damage_resistance": 0.8},
+    # v0.17.0 storm sewer: ground fixtures, not bodies (backend/app/sewer.py).
+    # A PIPE's route and connections live in metadata as `points`, `from_id`
+    # and `to_id`, which are not numbers and so are not listed here.
+    ObjectType.STORM_INLET: {"mass": 1.0, "friction": 0.0, "buoyancy": 0.0,
+                             "volume_m3": 1.0, "drag_coefficient": 1.0,
+                             "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
+                             "is_static": True,
+                             "inlet_radius": config.STORM_INLET_RADIUS_M,
+                             "foundation_height": 0.0, "damage_resistance": 1.0},
+    ObjectType.OUTFALL: {"mass": 1.0, "friction": 0.0, "buoyancy": 0.0,
+                         "volume_m3": 1.0, "drag_coefficient": 1.0,
+                         "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
+                         "is_static": True,
+                         "outfall_radius": config.OUTFALL_RADIUS_M,
+                         "foundation_height": 0.0, "damage_resistance": 1.0},
+    ObjectType.PIPE: {"mass": 1.0, "friction": 0.0, "buoyancy": 0.0,
+                      "volume_m3": 1.0, "drag_coefficient": 1.0,
+                      "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
+                      "is_static": True,
+                      "diameter_m": config.PIPE_DEFAULT_DIAMETER_M,
+                      "foundation_height": 0.0, "damage_resistance": 1.0},
 }
 
 
@@ -217,6 +242,7 @@ def default_properties(obj_type: str) -> Dict[str, float]:
             "drain_radius": 0.0, "drain_strength": 0.0,
             "vent_radius": 0.0, "vent_discharge_m3s": 0.0, "vent_temperature_c": 0.0,
             "floors": 0.0,
+            "inlet_radius": 0.0, "outfall_radius": 0.0, "diameter_m": 0.0,
             "foundation_height": 0.0, "damage_resistance": 0.5}
     base.update(OBJECT_DEFAULTS.get(ObjectType.register(obj_type), {}))
     return base

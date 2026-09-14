@@ -3186,5 +3186,128 @@ class RainTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.manager.fluid.diagnostics()["edge_inflow"])
 
 
+class SewerTests(unittest.IsolatedAsyncioTestCase):
+    """v0.17.0 storm sewer (backend/app/sewer.py, docs/16_sewer_plan.md).
+
+    The question a person watching asks is "does the water that goes down the
+    grate come out at the river, and no more than the pipe can carry" -- so
+    these read the water on the map on both sides of the pipe, not only the
+    sewer's own counters, which would agree with each other even if both were
+    wrong.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    def _pit_scene(self, diameter: float = 0.2) -> dict:
+        """A pit on a 2 m plateau holding water, a pipe down to low ground.
+
+        Nothing else adds or removes water: edge inflow and outlet are off.
+        """
+        terrain = self.manager.world.terrain
+        cell = terrain.cell_size
+        x = np.arange(N) * cell - terrain.width * cell / 2
+        self.X, self.Z = np.meshgrid(x, x)
+        heights = np.where(self.X < 30.0, 2.0, 0.0)
+        heights = np.where((self.X >= 30.0) & (self.X < 40.0),
+                           2.0 - (self.X - 30.0) * 0.2, heights)
+        self.pit = np.hypot(self.X + 40.0, self.Z) <= 6.0
+        terrain.heights[:, :] = np.where(self.pit, 1.5, heights).astype(np.float32)
+        self.manager.terrain_revision += 1
+        self.manager.apply_edge_inflow(False)
+        self.manager.apply_water_outflow(False)
+        self.manager.apply_water_level(0.0)
+        state = self.manager.apply_pipe_add({"points": [[-40, 0, 0], [0, 0, 0], [70, 0, 0]],
+                                             "diameter_m": diameter})
+        self.manager.start()
+        bed = np.asarray(terrain.heights, dtype=np.float32)
+        h0 = np.where(self.pit, np.maximum(1.9 - bed, 0.0), 0.0).astype(np.float32)
+        self.manager.fluid._h.assign(h0.ravel())
+        self.manager._step_once()
+        return state
+
+    def _volumes(self) -> tuple:
+        h = np.asarray(self.manager.fluid._h.numpy(), dtype=np.float64).reshape(N, N)
+        area = self.manager.world.terrain.cell_size ** 2
+        return (float(h[np.hypot(self.X + 40.0, self.Z) <= 7.0].sum() * area),
+                float(h[self.X >= 40.0].sum() * area))
+
+    def _run(self, seconds: float) -> None:
+        for _ in range(int(seconds * 60)):
+            self.manager._step_once()
+
+    async def test_water_down_the_grate_comes_out_at_the_outfall_at_the_pipe_capacity(self) -> None:
+        """Measured, 200 mm pipe, 1.5 m fall over 110 m: rated 38.3 L/s. Before
+        the sink strength was taken from the grid's own falloff sum the inlet
+        took 39.7 L/s, 3.6% more than the pipe can carry."""
+        state = self._pit_scene()
+        capacity = state["sewer"][0]["capacity_m3s"]
+        self.assertAlmostEqual(capacity, 0.0383, delta=0.001)
+        pit0, low0 = self._volumes()
+        d0 = self.manager.fluid.diagnostics()
+        self._run(20.0)
+        pit1, low1 = self._volumes()
+        d1 = self.manager.fluid.diagnostics()
+        taken, arrived = pit0 - pit1, low1 - low0
+        self.assertAlmostEqual(taken / 20.0, capacity, delta=0.01 * capacity,
+                               msg=f"took {taken / 20.0:.4f} m3/s through a {capacity:.4f} pipe")
+        self.assertAlmostEqual(arrived, taken, delta=0.002 * taken)
+        self.assertAlmostEqual(d1["sewer_out_m3"] - d0["sewer_out_m3"],
+                               d1["sewer_in_m3"] - d0["sewer_in_m3"], delta=1e-3)
+        flow = self.manager.sewer_state()[0]["flow_m3s"]
+        self.assertAlmostEqual(flow, capacity, delta=0.02 * capacity)
+
+    async def test_a_narrower_pipe_carries_less(self) -> None:
+        """Full-pipe capacity goes as d^(8/3): 100 mm carries 0.157 of 200 mm."""
+        state = self._pit_scene(diameter=0.1)
+        capacity = state["sewer"][0]["capacity_m3s"]
+        self.assertAlmostEqual(capacity / 0.0383, 0.5 ** (8.0 / 3.0), delta=0.01)
+        pit0, _ = self._volumes()
+        self._run(10.0)
+        pit1, _ = self._volumes()
+        self.assertAlmostEqual((pit0 - pit1) / 10.0, capacity, delta=0.02 * capacity)
+
+    async def test_a_pipe_running_uphill_carries_nothing(self) -> None:
+        self._pit_scene()
+        state = self.manager.apply_pipe_add({"points": [[70, 0, 30], [-60, 0, 30]]})
+        link = state["sewer"][-1]
+        self.assertEqual(link["status"], "uphill")
+        self.assertEqual(link["capacity_m3s"], 0.0)
+
+    async def test_laying_a_pipe_creates_its_inlet_and_outfall_and_is_saved(self) -> None:
+        state = self.manager.apply_pipe_add({"points": [[-10, 0, 0], [10, 0, 5]]})
+        types = sorted(o["type"] for o in state["objects"])
+        self.assertEqual(types, ["OUTFALL", "PIPE", "STORM_INLET"])
+        pipe = next(o for o in state["objects"] if o["type"] == "PIPE")
+        restored = WorldState.from_dict(self.manager.world.to_dict())
+        again = restored.objects[pipe["id"]]
+        self.assertEqual(again.metadata["from_id"], pipe["metadata"]["from_id"])
+        self.assertEqual(len(again.metadata["points"]), 2)
+        # carrying it on moves its outfall to the new end
+        moved = self.manager.apply_pipe_update({"id": pipe["id"],
+                                                "points": [[-10, 0, 0], [10, 0, 5], [30, 0, 5]]})
+        outfall = self.manager.world.objects[pipe["metadata"]["to_id"]]
+        self.assertAlmostEqual(outfall.position[0], 30.0)
+        self.assertEqual(len(moved["objects"]), 2)
+        with self.assertRaises(ValueError):
+            self.manager.apply_pipe_add({"points": [[0, 0, 0]]})
+        with self.assertRaises(ValueError):
+            self.manager.apply_pipe_add({"points": [[0, 0, 0], [5, 0, 0]], "diameter_m": 9.0})
+        with self.assertRaises(ValueError):
+            self.manager.apply_object_update(pipe["id"], {"metadata": {"points": "nowhere"}})
+
+    async def test_sewer_parts_are_not_walls_or_colliders(self) -> None:
+        self.manager.apply_pipe_add({"points": [[-10, 0, 0], [10, 0, 0]]})
+        self.manager.start()
+        self._run(0.1)
+        self.assertEqual(int(np.count_nonzero(self.manager.fluid._obstacle_host)), 0)
+        from app.rigid_body import NON_COLLIDING_TYPES
+        self.assertTrue({"STORM_INLET", "OUTFALL", "PIPE"} <= NON_COLLIDING_TYPES)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

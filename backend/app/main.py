@@ -109,6 +109,12 @@ async def _dispatch(ws: WebSocket, msg: dict) -> dict | None:
         if op == "object_add":
             obj_dict = manager.apply_object_add(msg.get("object", {}))
             return {"type": "ack", "op": op, "id": obj_dict["id"], "object": obj_dict}
+        if op in ("pipe_add", "pipe_update"):
+            # v0.17.0 storm sewer: one reply carries every object the edit
+            # created or changed (a pipe may create its inlet and outfall too)
+            state = (manager.apply_pipe_add(msg.get("pipe", {})) if op == "pipe_add"
+                     else manager.apply_pipe_update(msg.get("pipe", {})))
+            return {"type": "pipe", "op": op, **state}
         if op == "object_update":
             manager.apply_object_update(str(msg["id"]), msg.get("fields", {}))
             return {"type": "ack", "op": op}

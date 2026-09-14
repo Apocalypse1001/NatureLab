@@ -14,7 +14,7 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 import numpy as np
 
-from . import config, protocol
+from . import config, protocol, sewer
 from .compute_engine import ComputeEngine, create_engine
 from .events import EventLog, EventType
 from .fluid_solver import SOLID_OBSTACLE_TYPES, FluidSolver, create_fluid_solver
@@ -128,6 +128,112 @@ class SimulationManager:
                  float(obj.metadata.get("vent_discharge_m3s", 0.0)),
                  float(obj.metadata.get("vent_temperature_c", 0.0)))
                 for obj in self.world.objects.values() if obj.type == "VENT"]
+
+    # ------------------------------------------------------------------ storm sewer
+    def sewer_state(self, fluid: Dict[str, Any] | None = None,
+                    fresh: bool = False) -> List[Dict[str, Any]]:
+        """Per PIPE: what it can carry, what it is carrying, and why not.
+
+        Flow is what its inlet actually took over the last frame. Resolved
+        fresh when nothing has run yet, so a pipe laid at IDLE already reports
+        its capacity (or that it runs uphill) before PLAY -- and after every
+        pipe edit (`fresh`): otherwise a pipe laid while RUNNING was missing
+        from its own reply until the next tick re-resolved the network.
+        """
+        if fluid is None:
+            fluid = self.fluid.diagnostics()
+        if fresh or not getattr(self, "_sewer_links", None) or self.status == self.IDLE:
+            _inlets, _outfalls, links, inlet_ids = sewer.resolve(self.world)
+            self._sewer_links, self._sewer_inlet_ids = links, inlet_ids
+        flows = fluid.get("sewer_inlet_flow_m3s", []) or []
+        row = {oid: k for k, oid in enumerate(self._sewer_inlet_ids)}
+        out = []
+        for link in self._sewer_links:
+            item = link.to_dict()
+            k = row.get(link.inlet_id)
+            item["flow_m3s"] = (float(flows[k]) if (link.status == "ok" and k is not None
+                                                    and k < len(flows)) else 0.0)
+            out.append(item)
+        return out
+
+    def _ground(self, point) -> List[float]:
+        x, z = float(point[0]), float(point[2])
+        return [x, float(self.world.terrain.height_at(x, z)), z]
+
+    def apply_pipe_add(self, fields: Dict[str, Any]) -> Dict[str, Any]:
+        """Lay a pipe from point A to point B (v0.17.0, backend/app/sewer.py).
+
+        `points` is the route the user clicked, first to last. `from_id` joins
+        the pipe to an existing STORM_INLET and `to_id` to an existing OUTFALL;
+        either one missing is created at that end of the route. Every point
+        sits on the ground. Returns every object created or changed.
+        """
+        if not isinstance(fields, dict):
+            raise ValueError("pipe must be a JSON object")
+        raw = fields.get("points")
+        candidate = {"points": raw,
+                     "diameter_m": fields.get("diameter_m", config.PIPE_DEFAULT_DIAMETER_M),
+                     "from_id": str(fields.get("from_id") or ""),
+                     "to_id": str(fields.get("to_id") or "")}
+        sewer.validate_pipe_metadata(candidate)
+        points = [self._ground(p) for p in raw]
+        created: List[Dict[str, Any]] = []
+        inlet = self.world.objects.get(candidate["from_id"]) if candidate["from_id"] else None
+        if candidate["from_id"] and (inlet is None or inlet.type != sewer.INLET_TYPE):
+            raise ValueError(f"not a storm inlet: {candidate['from_id']!r}")
+        outfall = self.world.objects.get(candidate["to_id"]) if candidate["to_id"] else None
+        if candidate["to_id"] and (outfall is None or outfall.type != sewer.OUTFALL_TYPE):
+            raise ValueError(f"not an outfall: {candidate['to_id']!r}")
+        if inlet is None:
+            created.append(self.apply_object_add({"type": sewer.INLET_TYPE,
+                                                  "position": points[0]}))
+            inlet = self.world.objects[created[-1]["id"]]
+        if outfall is None:
+            created.append(self.apply_object_add({"type": sewer.OUTFALL_TYPE,
+                                                   "position": points[-1]}))
+            outfall = self.world.objects[created[-1]["id"]]
+        points[0] = list(inlet.position)
+        points[-1] = list(outfall.position)
+        pipe = self.world.objects[self.apply_object_add(
+            {"type": sewer.PIPE_TYPE, "position": points[0]})["id"]]
+        pipe.metadata.update({"points": points, "diameter_m": float(candidate["diameter_m"]),
+                              "from_id": inlet.id, "to_id": outfall.id})
+        created.append(pipe.to_dict())
+        return {"objects": created, "sewer": self.sewer_state(fresh=True)}
+
+    def apply_pipe_update(self, fields: Dict[str, Any]) -> Dict[str, Any]:
+        """Continue a pipe to a new end, or change its diameter.
+
+        New `points` replace the route; its outfall moves to the new last point,
+        which is how "carry the pipe on from B to C" works.
+        """
+        if not isinstance(fields, dict):
+            raise ValueError("pipe must be a JSON object")
+        pipe = self.world.objects.get(str(fields.get("id", "")))
+        if pipe is None or pipe.type != sewer.PIPE_TYPE:
+            raise ValueError(f"not a pipe: {fields.get('id')!r}")
+        candidate = dict(pipe.metadata)
+        if "points" in fields:
+            candidate["points"] = fields["points"]
+        if "diameter_m" in fields:
+            candidate["diameter_m"] = fields["diameter_m"]
+        sewer.validate_pipe_metadata(candidate)
+        changed = []
+        points = [self._ground(p) for p in candidate["points"]]
+        inlet = self.world.objects.get(str(candidate.get("from_id", "")))
+        if inlet is not None:
+            points[0] = list(inlet.position)
+        outfall = self.world.objects.get(str(candidate.get("to_id", "")))
+        if outfall is not None and "points" in fields:
+            outfall.position = list(points[-1])
+            self.rigid.update_body(outfall)
+            changed.append(outfall.to_dict())
+        pipe.metadata.update({"points": points,
+                              "diameter_m": float(candidate["diameter_m"])})
+        pipe.position = list(points[0])
+        self.rigid.update_body(pipe)
+        changed.append(pipe.to_dict())
+        return {"objects": changed, "sewer": self.sewer_state(fresh=True)}
 
     def apply_water_outflow(self, enabled: bool) -> None:
         """Open/close the downstream map edge. Read live each tick."""
@@ -278,6 +384,10 @@ class SimulationManager:
             elif key == "metadata":
                 if not isinstance(value, dict):
                     raise ValueError("metadata must be an object")
+                if obj.type == sewer.PIPE_TYPE:
+                    # a pipe's route and joints are checked before they land,
+                    # not discovered broken by the solver a tick later
+                    sewer.validate_pipe_metadata({**obj.metadata, **value})
                 obj.metadata.update(value)
             else:
                 raise ValueError(f"field is not editable: {key}")
@@ -467,6 +577,13 @@ class SimulationManager:
                                           self._drain_snapshot())
         if hasattr(self.fluid, "set_lava_vents"):
             self.fluid.set_lava_vents(self._vent_snapshot())
+        if hasattr(self.fluid, "set_sewer"):
+            # v0.17.0: resolved from the objects every tick, like SOURCE/DRAIN,
+            # so an inlet or outfall dragged while RUNNING re-routes at once and
+            # a pipe's capacity follows the ground under its two ends
+            inlets, outfalls, links, inlet_ids = sewer.resolve(self.world)
+            self._sewer_links, self._sewer_inlet_ids = links, inlet_ids
+            self.fluid.set_sewer(inlets, outfalls)
         if self._obstacle_snapshot is None:
             self._obstacle_snapshot = self.rigid.obstacle_snapshot()
         self.fluid.set_boundaries(self.world.terrain, self._obstacle_snapshot,
@@ -779,6 +896,7 @@ class SimulationManager:
                                for oid, pos, state, damage in moved],
             "fluid": self.fluid.diagnostics(),
         }
+        message["sewer"] = self.sewer_state(message["fluid"])
         try:
             await self._send_text(json.dumps(message, separators=(",", ":")))
         except Exception:

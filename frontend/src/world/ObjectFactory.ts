@@ -636,6 +636,97 @@ const builders: Record<string, Builder> = {
     g.add(head);
     return g;
   },
+
+  // ---------------------------------------------------------- storm sewer (v0.17.0)
+  STORM_INLET: (obj) => {
+    // A street gully: an iron grate over a dark pit, with a faint ring at the
+    // radius the solver's sink actually takes water from.
+    const g = new THREE.Group();
+    const radius = obj.metadata.inlet_radius ?? 1.5;
+    const iron = new THREE.MeshStandardMaterial({
+      color: OBJECT_COLORS.STORM_INLET, metalness: 0.6, roughness: 0.45,
+    });
+    const pit = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.04, 1.2),
+      new THREE.MeshStandardMaterial({ color: 0x07090b, roughness: 1 }));
+    pit.position.y = 0.02;
+    g.add(pit);
+    for (let k = 0; k < 6; k++) {
+      const bar = new THREE.Mesh(new THREE.BoxGeometry(1.25, 0.07, 0.08), iron);
+      bar.position.set(0, 0.08, -0.5 + k * 0.2);
+      g.add(bar);
+    }
+    for (const [sx, sz, w, d] of [[0, 0.66, 1.44, 0.12], [0, -0.66, 1.44, 0.12],
+                                  [0.66, 0, 0.12, 1.44], [-0.66, 0, 0.12, 1.44]]) {
+      const frame = new THREE.Mesh(new THREE.BoxGeometry(w, 0.1, d), iron);
+      frame.position.set(sx, 0.07, sz);
+      g.add(frame);
+    }
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(radius, 0.05, 8, 48),
+      new THREE.MeshStandardMaterial({ color: 0x9fc4e6, emissive: 0x1d3a55,
+                                       emissiveIntensity: 0.8 }));
+    ring.rotation.x = Math.PI / 2;
+    ring.position.y = 0.06;
+    g.add(ring);
+    return g;
+  },
+
+  OUTFALL: (obj) => {
+    // The pipe's mouth in a small concrete headwall, facing +x. SewerView turns
+    // it to face along the pipe it ends, every frame.
+    const g = new THREE.Group();
+    const radius = obj.metadata.outfall_radius ?? 1.5;
+    const concrete = new THREE.MeshStandardMaterial({ color: OBJECT_COLORS.OUTFALL,
+                                                      roughness: 0.9 });
+    const wall = new THREE.Mesh(new THREE.BoxGeometry(0.4, 1.1, 2.0), concrete);
+    wall.position.set(-0.3, 0.55, 0);
+    const mouth = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.32, 0.7, 20, 1, true),
+      new THREE.MeshStandardMaterial({ color: 0x6f7780, roughness: 0.6,
+                                       side: THREE.DoubleSide }));
+    mouth.rotation.z = Math.PI / 2;
+    mouth.position.set(0.1, 0.45, 0);
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(radius, 0.05, 8, 48),
+      new THREE.MeshStandardMaterial({ color: 0x9fc4e6, emissive: 0x1d3a55,
+                                       emissiveIntensity: 0.8 }));
+    ring.rotation.x = Math.PI / 2;
+    ring.position.y = 0.06;
+    g.add(wall, mouth, ring);
+    return g;
+  },
+
+  PIPE: (obj) => {
+    // Laid ON the ground, not buried: the whole point is to see where it runs.
+    // The route is decoration on a graph edge (backend/app/sewer.py) -- the
+    // solver reads nothing off it but its length.
+    const g = new THREE.Group();
+    const points: number[][] = Array.isArray(obj.metadata.points) ? obj.metadata.points : [];
+    if (points.length < 2) return g;
+    const radius = Math.max(0.12, (obj.metadata.diameter_m ?? 0.2) / 2);
+    const lift = radius + 0.05;
+    const origin = obj.position;
+    const local = points.map((p) => new THREE.Vector3(
+      p[0] - origin[0], p[1] - origin[1] + lift, p[2] - origin[2]));
+    const path = new THREE.CurvePath<THREE.Vector3>();
+    for (let k = 0; k < local.length - 1; k++) {
+      path.add(new THREE.LineCurve3(local[k], local[k + 1]));
+    }
+    const material = new THREE.MeshStandardMaterial({
+      color: OBJECT_COLORS.PIPE, metalness: 0.25, roughness: 0.55,
+      transparent: true, opacity: 0.8,
+    });
+    const tube = new THREE.Mesh(
+      new THREE.TubeGeometry(path, Math.max(8, (local.length - 1) * 24), radius, 12, false),
+      material);
+    tube.name = 'pipe-tube';
+    g.add(tube);
+    for (const joint of local.slice(1, -1)) {
+      const knee = new THREE.Mesh(new THREE.SphereGeometry(radius * 1.15, 12, 8), material);
+      knee.position.copy(joint);
+      g.add(knee);
+    }
+    g.userData.curve = path;
+    g.userData.pipeRadius = radius;
+    return g;
+  },
 };
 
 export function registerObjectBuilder(type: string, build: Builder): void {

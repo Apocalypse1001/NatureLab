@@ -57,6 +57,22 @@ NORTH_ROW_Z = 31.0         # houses on the far side of the street
 DUMP_AT = (-20.0, 18.0)    # upstream of the town, downstream of the dam crest
 DUMP_RADIUS = 5.0          # keeps the scatter clear of the bank top at z = 10
 
+# v0.17.0 storm sewer scenario (docs/16_sewer_plan.md). Routes run from a storm
+# inlet (first point) to an outfall on the river bank (last point). Two inlets
+# sit in the gutter between the south row and the street, in the gaps between
+# houses; the third sits in a hollow behind the north row, and its pipe crosses
+# the street and threads between the houses to the river -- the "from A to B"
+# the user asked to see. Every inlet sits in a shallow dug hollow, which is
+# where a real gully goes: at the low point, so the rain runs to it.
+SEWER_ROUTES = (
+    ((6.5, 19.8), (6.5, 8.5)),
+    ((45.5, 19.8), (45.5, 8.5)),
+    ((25.0, 37.5), (25.5, 24.0), (19.5, 19.8), (19.5, 8.5)),
+)
+SEWER_HOLLOW_RADIUS = 3.0
+SEWER_HOLLOW_DEPTH = 0.25
+SEWER_RAIN_MM_H = 50.0
+
 
 def seat(world: WorldState, obj_type: str, x: float, z: float,
          yaw: float = 0.0, scale: List[float] | None = None,
@@ -167,6 +183,31 @@ def build_river(world: WorldState) -> Dict[str, Any]:
     water.inlet_discharge_m3s = 12.0
     water.outlet_kind = "river"         # the river runs on past the map edge
     return river
+
+
+def build_sewer(world: WorldState) -> Dict[str, Any]:
+    """The River scenario's valley in the rain, with hollows dug for the inlets."""
+    river = build_river(world)
+    for route in SEWER_ROUTES:
+        x, z = route[0]
+        world.terrain.brush(x, z, SEWER_HOLLOW_RADIUS, -SEWER_HOLLOW_DEPTH)
+    world.water.rain_intensity_mm_h = SEWER_RAIN_MM_H
+    return river
+
+
+def build_sewer_town(world: WorldState) -> Dict[str, int]:
+    """The shared town, plus three inlets piped to the river."""
+    counts = build_town(world)
+    for route in SEWER_ROUTES:
+        inlet = seat(world, "STORM_INLET", *route[0])
+        outfall = seat(world, "OUTFALL", *route[-1])
+        pipe = seat(world, "PIPE", *route[0])
+        pipe.metadata.update({
+            "points": [[float(x), float(world.terrain.height_at(x, z)), float(z)]
+                       for x, z in route],
+            "diameter_m": 0.2, "from_id": inlet.id, "to_id": outfall.id})
+    counts["storm inlet"] = counts["outfall"] = counts["pipe"] = len(SEWER_ROUTES)
+    return counts
 
 
 def build_dam(world: WorldState) -> Dict[str, Any]:
@@ -430,6 +471,7 @@ def build_beachfront_town(world: WorldState) -> Dict[str, int]:
 
 SCENARIOS = {
     "river": ("scenario_river", build_river, build_town),
+    "sewer": ("scenario_sewer", build_sewer, build_sewer_town),
     "dam": ("scenario_dam", build_dam, build_town),
     "volcano": ("scenario_volcano", build_volcano, build_volcano_settlement),
     "tsunami": ("scenario_tsunami", build_tsunami, build_beachfront_town),

@@ -1,5 +1,6 @@
 /** WebSocket client: JSON control/state messages + versioned bulk frames. */
-import type { EngineInfo, ObjectData, SimStateMessage, WorldData } from '../world/types';
+import type { EngineInfo, ObjectData, SewerLinkState, SimStateMessage,
+  WorldData } from '../world/types';
 
 export type BackendStatus = 'connecting' | 'connected' | 'disconnected';
 
@@ -12,6 +13,8 @@ interface Handlers {
   onError?: (message: string) => void;
   onObjectAdded?: (obj: ObjectData) => void;
   onTerrainPatch?: (heights: number[], checksum: string) => void;
+  // v0.17.0: a pipe edit, with every object it created or changed
+  onPipe?: (objects: ObjectData[], sewer: SewerLinkState[]) => void;
 }
 
 const MAGIC = 0x4c4e; // bytes 'N','L' read as little-endian u16
@@ -90,6 +93,10 @@ export class BackendClient {
         if (Array.isArray(msg.heights) && typeof msg.checksum === 'string') {
           this.handlers.onTerrainPatch?.(msg.heights as number[], msg.checksum);
         }
+        break;
+      case 'pipe':
+        this.handlers.onPipe?.((msg.objects ?? []) as ObjectData[],
+                               (msg.sewer ?? []) as SewerLinkState[]);
         break;
       case 'ack':
         if (msg.op === 'object_add' && msg.object) {

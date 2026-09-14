@@ -3,7 +3,7 @@ import { WorldStore } from './world/WorldStore';
 import { EditorController } from './editor/EditorController';
 import { BackendClient } from './net/BackendClient';
 import { UI } from './ui/UI';
-import type { OutletKind, WorldData } from './world/types';
+import type { ObjectData, OutletKind, WorldData } from './world/types';
 import type { EdgeWaterMode } from './scene/EdgeSkirt';
 import './style.css';
 
@@ -65,6 +65,8 @@ const net = new BackendClient(wsUrl, {
       sceneManager.setEdgeWater(modes.east, modes.west, modes.sides);
     }
     store.applyGaugeStates(state.gauges ?? [], state.gauge_history_capacity ?? 600);
+    sceneManager.setSewerState(state.sewer ?? [], state.status === 'RUNNING');
+    ui.updateSewerReadout(state.sewer ?? []);
     for (const moved of state.moved_objects) {
       store.updateObject(moved.id,
         { position: moved.position, state: moved.state, damage: moved.damage });
@@ -82,6 +84,19 @@ const net = new BackendClient(wsUrl, {
     store.addObject(obj);
     sceneManager.setObject(obj);
     store.select(obj.id);
+  },
+  // v0.17.0 storm sewer: a pipe edit returns every object it created or moved
+  onPipe: (objects, sewer) => {
+    let pipeId: string | null = null;
+    for (const obj of objects) {
+      if (store.objects.has(obj.id)) store.updateObject(obj.id, obj);
+      else store.addObject(obj);
+      sceneManager.setObject(obj);
+      if (obj.type === 'PIPE') pipeId = obj.id;
+    }
+    sceneManager.setSewerState(sewer, currentSimStatus === 'RUNNING');
+    ui.updateSewerReadout(sewer);
+    if (pipeId) store.select(pipeId);
   },
   onTerrainPatch: (heights, checksum) => {
     store.terrain.loadHeights(heights);
@@ -152,6 +167,9 @@ const ui = new UI(uiHost, {
   // intensity can be changed while RUNNING
   setRain: (fields) => net.send({ op: 'rain', fields }),
   setEdgeInflow: (enabled) => net.send({ op: 'edge_inflow', enabled }),
+  setPipeDiameter: (diameterM) => { editor.pipeDiameter = diameterM; },
+  extendPipe: (id) => editor.extendPipe(id),
+  updatePipe: (id, diameterM) => net.send({ op: 'pipe_update', pipe: { id, diameter_m: diameterM } }),
   getObjects: () => [...store.objects.values()],
 });
 
@@ -186,8 +204,33 @@ function applyWorld(world: WorldData, simStatus: string): void {
 store.on('objects-changed', () => {
   ui.refreshObjectList([...store.objects.values()], store.selectedId);
 });
+/**
+ * v0.17.0: a pipe's end follows its inlet or outfall when either is dragged.
+ * The solver already routes by the fixtures themselves (backend/app/sewer.py);
+ * this keeps the drawn route -- and the saved one -- attached to them.
+ */
+function syncPipeEnds(end: ObjectData): void {
+  for (const pipe of store.objects.values()) {
+    if (pipe.type !== 'PIPE') continue;
+    const points = pipe.metadata.points as number[][] | undefined;
+    if (!points || points.length < 2) continue;
+    const k = pipe.metadata.from_id === end.id ? 0
+      : pipe.metadata.to_id === end.id ? points.length - 1 : -1;
+    if (k < 0) continue;
+    const p = points[k];
+    if (Math.hypot(p[0] - end.position[0], p[2] - end.position[2]) < 1e-3) continue;
+    const next = points.map((q) => [...q]);
+    next[k] = [...end.position];
+    const patch: Partial<ObjectData> = { metadata: { ...pipe.metadata, points: next } };
+    if (k === 0) patch.position = [...end.position];
+    store.updateObject(pipe.id, patch);
+    net.send({ op: 'object_update', id: pipe.id, fields: patch });
+  }
+}
+
 store.on('object-updated', (id) => {
   const obj = store.objects.get(id as string);
+  if (obj && (obj.type === 'STORM_INLET' || obj.type === 'OUTFALL')) syncPipeEnds(obj);
   if (obj) {
     const rebuilt = sceneManager.setObject(obj);
     // A rebuild (BUILDING's floors changing) tore down the THREE.Object3D

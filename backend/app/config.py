@@ -132,6 +132,20 @@ OUTLET_KINDS = ("overfall", "river")
 # stroke at the edge does not set the slope of the river beyond it.
 OUTLET_SLOPE_REACH_M = 20.0
 
+# ------------------------------------------------------ Storm sewer (v0.17.0)
+# docs/16_sewer_plan.md and backend/app/sewer.py. Primitives, not a pipe solver:
+# an inlet takes water off the surface, a pipe caps how much, an outfall pours
+# it out. Manning's n for a smooth concrete or plastic sewer pipe.
+SEWER_MANNING_N = 0.013
+# A street grate's footprint on the grid. Smaller than a DRAIN's 5 m, which is a
+# bottomless sink rather than a gully.
+STORM_INLET_RADIUS_M = 1.5
+OUTFALL_RADIUS_M = 1.5
+PIPE_DEFAULT_DIAMETER_M = 0.2    # 200 mm, a common street sewer
+PIPE_MIN_DIAMETER_M = 0.05
+PIPE_MAX_DIAMETER_M = 2.0
+PIPE_MAX_POINTS = 64
+
 # A placed DRAIN removes water through a smooth radial sink and spins the flow
 # around it. The spin is NOT a constant: it comes from the ambient circulation
 # the drain measures in the annulus just outside itself, amplified as 1/r by

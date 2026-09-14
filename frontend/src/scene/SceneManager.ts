@@ -10,6 +10,8 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { TerrainGrid } from '../world/TerrainGrid';
 import { RainField } from './RainField';
 import { EdgeSkirt, type EdgeWaterMode } from './EdgeSkirt';
+import { SewerView } from './SewerView';
+import type { SewerLinkState } from '../world/types';
 import { applyTransform, buildObjectMesh } from '../world/ObjectFactory';
 import type { ObjectData } from '../world/types';
 
@@ -65,6 +67,9 @@ export class SceneManager {
   private lastRenderMs = performance.now();
   // v0.16.0: terrain and water continued past the map edge, drawn only
   private edgeSkirt: EdgeSkirt;
+  // v0.17.0: flow along the storm sewer's pipes, and the route being laid
+  private sewerView: SewerView;
+  private pipePreview: THREE.Line | null = null;
 
   constructor(canvas: HTMLCanvasElement, private terrain: TerrainGrid) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -198,6 +203,8 @@ export class SceneManager {
     this.scene.add(this.rain.lines);
 
     this.scene.add(this.objectsRoot);
+    this.sewerView = new SewerView(this.objectsRoot);
+    this.scene.add(this.sewerView.group);
 
     // Bloom only, kept deliberately subtle: threshold above the brightness any
     // ordinary sunlit surface reaches post-tonemap, so it catches the genuinely
@@ -310,6 +317,26 @@ export class SceneManager {
     let lowest = Infinity;
     for (let i = 0; i < terrain.heights.length; i++) lowest = Math.min(lowest, terrain.heights[i]);
     this.gridHelper.visible = lowest >= this.gridHelper.position.y - 0.05;
+  }
+
+  /** v0.17.0: each pipe's live capacity and flow, as streamed in sim_state. */
+  setSewerState(links: SewerLinkState[], running: boolean): void {
+    this.sewerView.setState(links, running);
+  }
+
+  /** v0.17.0: the route of a pipe being laid, or null to clear it. */
+  setPipePreview(route: THREE.Vector3[] | null): void {
+    if (this.pipePreview) {
+      this.scene.remove(this.pipePreview);
+      this.pipePreview.geometry.dispose();
+      this.pipePreview = null;
+    }
+    if (!route || route.length < 1) return;
+    const points = route.length === 1 ? [route[0], route[0].clone().setY(route[0].y + 1.5)] : route;
+    this.pipePreview = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points),
+      new THREE.LineBasicMaterial({ color: 0x7fd4ff, depthTest: false }));
+    this.pipePreview.renderOrder = 10;
+    this.scene.add(this.pipePreview);
   }
 
   /** What the water does past the east outlet, the west inflow and the north/south walls. */
@@ -829,6 +856,16 @@ export class SceneManager {
     // BUILDING's geometry is parametric on obj.metadata.floors, not just its
     // transform -- unlike every other builder, so a floor-count edit in the
     // properties panel has to force a real rebuild, not just applyTransform.
+    // v0.17.0: a PIPE's mesh IS its route and diameter, so a changed route
+    // (continued, or an end dragged along with its inlet) needs a rebuild too
+    const pipeKey = obj.type === 'PIPE'
+      ? JSON.stringify([obj.metadata.points, obj.metadata.diameter_m, obj.position]) : null;
+    if (group && pipeKey !== null && group.userData.pipeKey !== pipeKey) {
+      this.objectsRoot.remove(group);
+      SceneManager.disposeSubtree(group);
+      group = undefined;
+      rebuilt = true;
+    }
     if (group && obj.type === 'BUILDING' && group.userData.floors !== obj.metadata.floors) {
       this.objectsRoot.remove(group);
       SceneManager.disposeSubtree(group);
@@ -838,6 +875,7 @@ export class SceneManager {
     if (!group) {
       group = buildObjectMesh(obj);
       if (obj.type === 'BUILDING') group.userData.floors = obj.metadata.floors;
+      if (pipeKey !== null) group.userData.pipeKey = pipeKey;
       this.objectsRoot.add(group);
     }
     applyTransform(group, obj);
@@ -977,6 +1015,7 @@ export class SceneManager {
                      this.camera.position.distanceTo(this.controls.target),
                      this.terrain.sizeM, (x, z) => this.terrain.heightAt(x, z),
                      this.rainRunning);
+    this.sewerView.update(Math.min(0.1, (now - this.lastRenderMs) / 1000));
     this.lastRenderMs = now;
     if (this._selectionHelper) this._selectionHelper.update();
     this.renderer.info.reset();

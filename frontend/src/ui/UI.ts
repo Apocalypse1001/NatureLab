@@ -1,7 +1,8 @@
 /** HUD: top bar, object palette, properties panel, terrain/water controls,
  *  debug strip. Pure DOM — no framework, easy to extend. */
 import { OBJECT_TYPES, type GaugeSample, type GaugeState, type ObjectData,
-  type ObjectType, type OutletKind, type SimEvent, type WorldData } from '../world/types';
+  type ObjectType, type OutletKind, type SewerLinkState, type SimEvent,
+  type WorldData } from '../world/types';
 
 export interface UICallbacks {
   play(): void;
@@ -19,7 +20,11 @@ export interface UICallbacks {
   setOutflow(enabled: boolean): void;
   setTracerVisible(visible: boolean): void;
   setTracerCount(count: number): void;
-  setTool(tool: 'select' | 'raise' | 'lower'): void;
+  setTool(tool: 'select' | 'raise' | 'lower' | 'pipe'): void;
+  // v0.17.0 storm sewer
+  setPipeDiameter(diameterM: number): void;
+  extendPipe(id: string): void;
+  updatePipe(id: string, diameterM: number): void;
   setBrush(radius: number, strength: number): void;
   generateRiver(params: { slope: number; bed_width: number; incision: number }): void;
   setRiverInlet(fields: { enabled?: boolean; width_m?: number;
@@ -46,6 +51,12 @@ const SCENARIOS: { name: string; label: string; hint: string }[] = [
         + 'with, the channel runs about a metre deep and the town stays dry. '
         + 'Take Q to the top of the slider and the channel goes bankfull -- '
         + 'about 13 cm of water in the street after some three minutes' },
+  { name: 'scenario_sewer', label: 'Sewer',
+    hint: 'The river town in the rain, with a storm sewer: three street inlets '
+        + 'piped down to the river. Water gathers at each grate and goes down it, '
+        + 'runs along the pipe and pours out of the outfall into the river. Click '
+        + 'a pipe to see its flow against what it can carry; raise the rain and '
+        + 'watch it fill; lay your own with "Lay pipe"' },
   { name: 'scenario_dam', label: 'Dam',
     hint: 'The same town below a dam. At the discharge it ships with, the '
         + 'spillway carries the river and the dam holds. Push Q past about 60 '
@@ -104,6 +115,7 @@ export class UI {
   private objectList: HTMLElement;
   private propsHost: HTMLElement;
   private selectedId: string | null = null;
+  private sewerLinks: SewerLinkState[] = [];
 
   constructor(root: HTMLElement, private cb: UICallbacks) {
     this.root = root;
@@ -178,6 +190,32 @@ export class UI {
                          () => this.cb.add(t)));
     }
     panel.append(palette);
+
+    // v0.17.0 storm sewer (docs/16_sewer_plan.md): lay a pipe from a grate to
+    // an outfall, and watch the street drain into the river through it
+    panel.append(el('h3', '', 'Storm sewer'));
+    const sewerTools = el('div', 'palette');
+    const layPipe = btn('Lay pipe', () => this.cb.setTool('pipe'));
+    layPipe.id = 'lay-pipe';
+    sewerTools.append(layPipe);
+    panel.append(sewerTools);
+    const pipeRow = el('div', 'slider-row');
+    pipeRow.innerHTML = '<label>Pipe diameter <output id="pipe-d-out">200</output> mm</label>';
+    const pipeDiameter = el('input', '') as HTMLInputElement;
+    pipeDiameter.id = 'pipe-diameter';
+    pipeDiameter.type = 'range'; pipeDiameter.min = '100'; pipeDiameter.max = '1000';
+    pipeDiameter.step = '50'; pipeDiameter.value = '200';
+    pipeDiameter.oninput = () => {
+      this.root.querySelector('#pipe-d-out')!.textContent = pipeDiameter.value;
+      this.cb.setPipeDiameter(parseFloat(pipeDiameter.value) / 1000);
+    };
+    pipeRow.append(pipeDiameter);
+    panel.append(pipeRow);
+    panel.append(el('p', 'hint',
+      'Click a storm inlet, or bare ground to place one; click along the route; '
+      + 'click an outfall, or press Enter (or right-click) to place one at the last '
+      + 'point. Esc cancels, Backspace takes back a point. A pipe only carries water '
+      + 'downhill.'));
     this.objectListPlaceholder();
     panel.append(el('h3', '', 'Scene'));
     const list = el('div', 'object-list');
@@ -666,7 +704,15 @@ export class UI {
       ['Scale Y', 'scl_y', obj.scale[1], (v) => this.patchScale(obj.id, 1, v)],
       ['Scale Z', 'scl_z', obj.scale[2], (v) => this.patchScale(obj.id, 2, v)],
     ];
-    if (obj.type !== 'GAUGE') fields.push(
+    const sewerPart = obj.type === 'PIPE' || obj.type === 'STORM_INLET' || obj.type === 'OUTFALL';
+    // A pipe is its route: moving or scaling it by number would pull the
+    // drawing off the points the solver holds, so it gets only its diameter.
+    if (obj.type === 'PIPE') fields.length = 0;
+    if (obj.type === 'PIPE') fields.push(
+      ['Diameter (mm)', 'pipe_d', (obj.metadata.diameter_m ?? 0.2) * 1000,
+       (v) => this.cb.updatePipe(obj.id, Math.max(50, Math.min(2000, v)) / 1000)],
+    );
+    if (obj.type !== 'GAUGE' && !sewerPart) fields.push(
       ['Mass (kg)', 'mass', obj.mass, (v) => this.cb.updateObject(obj.id, { mass: v })],
       ['Friction', 'friction', obj.friction, (v) => this.cb.updateObject(obj.id, { friction: v })],
       ['Sealed buoyancy (0–1)', 'buoyancy', obj.buoyancy,
@@ -732,6 +778,49 @@ export class UI {
         '<polyline points="" /></svg>';
       host.append(readout);
     }
+    if (sewerPart) {
+      const readout = el('div', 'gauge-readout');
+      readout.id = 'sewer-readout';
+      readout.innerHTML = '<h3>Storm sewer</h3><div id="sewer-lines"></div>';
+      host.append(readout);
+      if (obj.type === 'PIPE') {
+        const more = btn('Continue the pipe', () => this.cb.extendPipe(obj.id));
+        more.id = 'pipe-extend';
+        host.append(more);
+      }
+      this.renderSewerReadout();
+    }
+  }
+
+  /** v0.17.0: the pipes' live numbers, for whichever sewer part is selected. */
+  updateSewerReadout(links: SewerLinkState[]): void {
+    this.sewerLinks = links;
+    this.renderSewerReadout();
+  }
+
+  private renderSewerReadout(): void {
+    const host = this.root.querySelector('#sewer-lines');
+    if (!host) return;
+    const id = this.selectedId;
+    const mine = this.sewerLinks.filter(
+      (l) => l.pipe_id === id || l.inlet_id === id || l.outfall_id === id);
+    if (!mine.length) {
+      host.innerHTML = '<div>Not joined to a pipe yet.</div>';
+      return;
+    }
+    const why: Record<string, string> = {
+      uphill: 'Runs uphill: a gravity pipe carries nothing.',
+      disconnected: 'Not joined to an inlet and an outfall.',
+      second_pipe: 'This inlet already feeds another pipe.',
+    };
+    host.innerHTML = mine.map((l) => {
+      const ls = (q: number) => (q * 1000).toFixed(1);
+      const load = l.capacity_m3s > 0 ? Math.round(100 * l.flow_m3s / l.capacity_m3s) : 0;
+      return `<div>Flow <strong>${ls(l.flow_m3s)} L/s</strong> of `
+        + `${ls(l.capacity_m3s)} L/s (${load}%)</div>`
+        + `<div>Fall ${l.fall_m.toFixed(2)} m over ${l.length_m.toFixed(0)} m</div>`
+        + (why[l.status] ? `<div class="bad">${why[l.status]}</div>` : '');
+    }).join('');
   }
 
   updateGaugeReadout(state: GaugeState | undefined, history: GaugeSample[]): void {

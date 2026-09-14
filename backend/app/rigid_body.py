@@ -175,6 +175,9 @@ class RigidStateBuffer:
         return self.volumes / np.maximum(self.ground_areas, 1.0e-6)
 
 
+NON_COLLIDING_TYPES = frozenset({"GAUGE", "STORM_INLET", "OUTFALL", "PIPE"})
+
+
 def footprint_half_extents(obj: WorldObject) -> np.ndarray:
     if obj.type == "BUILDING":
         # Parametric on `floors`, not a fixed lookup -- see config.py's BUILDING
@@ -275,7 +278,10 @@ class PlaceholderRigidBodySystem(RigidBodySystem):
         distance = np.linalg.norm(delta, axis=2)
         minimum = radii[:, None] + radii[None, :]
         pair_i, pair_j = np.where(np.triu(distance < minimum, 1))
-        collidable = np.asarray([self._world.objects[oid].type != "GAUGE"
+        # v0.17.0: sewer fixtures are not bodies either -- a PIPE's position is
+        # only its first point, so as a collider it would be an invisible post
+        # shoving cars at the start of every pipe.
+        collidable = np.asarray([self._world.objects[oid].type not in NON_COLLIDING_TYPES
                                  for oid in self.buffer.ids], dtype=np.bool_)
         active = ((dynamic[pair_i] | dynamic[pair_j])
                   & collidable[pair_i] & collidable[pair_j])

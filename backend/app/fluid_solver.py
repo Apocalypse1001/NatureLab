@@ -689,8 +689,16 @@ if WARP_IMPORTED:
                       samples: wp.array(dtype=float),
                       count: int, width: int, height: int, dx: float, dt: float,
                       dry: float, swirl_gain: float, max_velocity: float,
-                      area: float, removed_total: wp.array(dtype=float)):
+                      area: float, removed_total: wp.array(dtype=float),
+                      removed_each: wp.array(dtype=float), take_dregs: int):
         """Remove water through a localized sink and spin up the flow around it.
+
+        v0.17.0: the same kernel runs the storm sewer's inlets. `removed_each`
+        books what every sink took, so a pipe can hand exactly that volume to
+        its outfall; `take_dregs` = 0 leaves a film below the dry threshold
+        where it is, so an inlet on a wet street cannot take more than its pipe
+        carries by sweeping up films (at 60 substeps a second, the dregs of a
+        few cells alone come to tens of litres a second).
 
         Removal uses a smooth radial profile and is capped by the water actually
         present, so a drain can never pull a cell below zero or invent negative
@@ -745,10 +753,12 @@ if WARP_IMPORTED:
             removed = wp.min(h[idx], strength * falloff * dt)
             h[idx] = h[idx] - removed
             wp.atomic_add(removed_total, 0, removed * area)
-            if h[idx] <= dry:
+            wp.atomic_add(removed_each, n, removed * area)
+            if take_dregs != 0 and h[idx] <= dry:
                 # the dregs are removed too, so the volume ledger stays exact
                 # rather than exact-to-within-a-film
                 wp.atomic_add(removed_total, 0, h[idx] * area)
+                wp.atomic_add(removed_each, n, h[idx] * area)
                 h[idx] = 0.0
                 u[idx] = 0.0
                 v[idx] = 0.0
@@ -768,6 +778,82 @@ if WARP_IMPORTED:
                 face_v = _sink_velocity(dxc, dzc + 0.5 * dx, radius, strength,
                                         h[idx], dry, mean_tangential, swirl_gain)
                 v[idx] = wp.clamp(face_v[1], -max_velocity, max_velocity)
+
+
+    @wp.kernel
+    def _sewer_route(step: wp.array(dtype=float), outfall_of: wp.array(dtype=wp.int32),
+                     outfall_volume: wp.array(dtype=float), frame: wp.array(dtype=float)):
+        """Hand what every storm inlet took this substep to its pipe's outfall.
+
+        In the SAME substep, on the GPU: `_apply_drains` has already written
+        `step`, so there is no delay and no host readback. The pipe holds no
+        water (backend/app/sewer.py), so this is the whole of the pipe.
+        """
+        n = wp.tid()
+        taken = step[n]
+        frame[n] = frame[n] + taken
+        target = outfall_of[n]
+        if target >= 0:
+            wp.atomic_add(outfall_volume, target, taken)
+
+
+    @wp.kernel
+    def _count_outfall_cells(solid: wp.array(dtype=wp.int32),
+                             centres: wp.array(dtype=wp.vec3),
+                             radii: wp.array(dtype=float),
+                             count: int, width: int, height: int, dx: float,
+                             cells: wp.array(dtype=float)):
+        """How many open cells each outfall disc covers -- with the very same
+        disc test `_apply_outfalls` uses, so the volume spread over them is
+        exactly the volume that arrived."""
+        idx = wp.tid()
+        if solid[idx] != 0:
+            return
+        i = idx % width
+        j = idx // width
+        x = (float(i) - float(width - 1) * 0.5) * dx
+        z = (float(j) - float(height - 1) * 0.5) * dx
+        for n in range(count):
+            if radii[n] <= 0.0:
+                continue
+            centre = centres[n]
+            dxc = x - centre[0]
+            dzc = z - centre[2]
+            if wp.sqrt(dxc * dxc + dzc * dzc) <= radii[n]:
+                wp.atomic_add(cells, n, 1.0)
+
+
+    @wp.kernel
+    def _apply_outfalls(h: wp.array(dtype=float), solid: wp.array(dtype=wp.int32),
+                        centres: wp.array(dtype=wp.vec3), radii: wp.array(dtype=float),
+                        volumes: wp.array(dtype=float), cells: wp.array(dtype=float),
+                        count: int, width: int, height: int, dx: float, area: float,
+                        added: wp.array(dtype=float)):
+        """Pour what the pipes delivered this substep out over each outfall disc.
+
+        Evenly over the disc's open cells, and mass only: the water arrives at
+        rest and runs off down the surface slope. A jet with the pipe's own
+        velocity would need the pipe's flow state, which a primitive pipe does
+        not have (docs/16_sewer_plan.md).
+        """
+        idx = wp.tid()
+        if solid[idx] != 0:
+            return
+        i = idx % width
+        j = idx // width
+        x = (float(i) - float(width - 1) * 0.5) * dx
+        z = (float(j) - float(height - 1) * 0.5) * dx
+        for n in range(count):
+            volume = volumes[n]
+            if volume <= 0.0 or cells[n] <= 0.0 or radii[n] <= 0.0:
+                continue
+            centre = centres[n]
+            dxc = x - centre[0]
+            dzc = z - centre[2]
+            if wp.sqrt(dxc * dxc + dzc * dzc) <= radii[n]:
+                gain = volume / (cells[n] * area)
+                h[idx] = h[idx] + gain
+                wp.atomic_add(added, 0, gain * area)
 
 
     @wp.kernel
@@ -1528,6 +1614,18 @@ class WarpShallowWaterSolver(FluidSolver):
         self._drain_centres = self._drain_radii = None
         self._drain_strengths = self._drain_circulation = None
         self._drain_samples = None
+        self._drain_removed_each = None
+        # v0.17.0 storm sewer (set_sewer)
+        self._inlet_count = self._outfall_count = 0
+        self._inlet_centres = self._inlet_radii = self._inlet_strengths = None
+        self._inlet_targets = self._inlet_circulation = self._inlet_samples = None
+        self._inlet_step = self._inlet_frame = None
+        self._outfall_centres = self._outfall_radii = None
+        self._outfall_volume = self._outfall_cells = None
+        self._inlet_flow_m3s: list = []
+        self._inlet_capacity_m3s: list = []
+        self._diag_sewer_in = self._diag_sewer_out = None
+        self._sewer_in_m3 = self._sewer_out_m3 = 0.0
         # VolcanoLab (v0.13.0). Lava mode is DERIVED from whether any VENT is
         # placed, the same way a placed SOURCE takes over from the edge inflow
         # entirely (v0.8.0) -- no separate toggle, so there is exactly one
@@ -1651,6 +1749,13 @@ class WarpShallowWaterSolver(FluidSolver):
         self._diag_sediment_out = wp.zeros(1, dtype=float, device=self.device)
         self._diag_solidified = wp.zeros(1, dtype=float, device=self.device)
         self._diag_rain = wp.zeros(1, dtype=float, device=self.device)
+        self._diag_sewer_in = wp.zeros(1, dtype=float, device=self.device)
+        self._diag_sewer_out = wp.zeros(1, dtype=float, device=self.device)
+        self._sewer_in_m3 = self._sewer_out_m3 = 0.0
+        self._inlet_count = self._outfall_count = 0
+        self._inlet_frame = None
+        self._inlet_flow_m3s = []
+        self._inlet_capacity_m3s = []
         self._solidified_m3 = 0.0
         # VolcanoLab (v0.13.0). Manning friction defaults to the constant every
         # non-lava world already ran with, filled ONCE here from
@@ -2114,6 +2219,102 @@ class WarpShallowWaterSolver(FluidSolver):
                                                    device=self.device)
                 self._drain_samples = wp.zeros(len(drains), dtype=float,
                                                device=self.device)
+                self._drain_removed_each = wp.zeros(len(drains), dtype=float,
+                                                    device=self.device)
+
+    def _sink_weight(self, centre, radius: float, dx: float) -> float:
+        """Sum of `_apply_drains`' falloff (1 - r^2/R^2) over a disc's open
+        cells, times the cell area: the m2 a strength of 1 m/s drains."""
+        width, height = self._width, self._height
+        ci = centre[0] / dx + (width - 1) * 0.5
+        cj = centre[2] / dx + (height - 1) * 0.5
+        span = int(math.ceil(radius / dx)) + 1
+        i0, i1 = max(0, int(ci) - span), min(width - 1, int(ci) + span)
+        j0, j1 = max(0, int(cj) - span), min(height - 1, int(cj) + span)
+        if i1 < i0 or j1 < j0:
+            return 0.0
+        ii, jj = np.meshgrid(np.arange(i0, i1 + 1), np.arange(j0, j1 + 1))
+        x = (ii - (width - 1) * 0.5) * dx
+        z = (jj - (height - 1) * 0.5) * dx
+        r = np.hypot(x - centre[0], z - centre[2])
+        inside = r <= radius
+        if self._obstacle_host.size:
+            inside &= self._obstacle_host.reshape(height, width)[jj, ii] == 0
+        return float(np.sum((1.0 - (r / radius) ** 2)[inside])) * dx * dx
+
+    def set_sewer(self, inlets: list, outfalls: list) -> None:
+        """v0.17.0 storm sewer, from backend/app/sewer.py's `resolve`.
+
+        `inlets` is (centre_xyz, radius_m, capacity_m3s, outfall_index) and
+        `outfalls` is (centre_xyz, radius_m), read live every tick like
+        SOURCE/DRAIN so any of them can be moved while RUNNING.
+
+        An inlet's sink strength is chosen so that, with water to spare, the
+        disc takes exactly its pipe's capacity: strength = Q / (area * sum of
+        the kernel's falloff over the disc's open cells). Not the continuous
+        2 Q / (pi R^2): on 1 m cells a 1.5 m disc's falloff sums to 3.67 m2
+        where pi R^2 / 2 is 3.53, and the inlet measurably took 0.0397 m3/s
+        through a pipe rated 0.0383 (docs/16_sewer_plan.md). With less water
+        about it takes less.
+
+        Both discs are at least 0.75 of a cell in radius, which guarantees each
+        covers the centre of the cell it sits in. An outfall whose own cell is
+        solid (inside a house) or off the map could pour nowhere, and the water
+        its inlets took would vanish, so those inlets get no capacity.
+        """
+        dx = float(self._terrain.cell_size) if self._terrain is not None else 1.0
+        floor_radius = 0.75 * dx
+        usable = []
+        for centre, _radius in outfalls:
+            i = int(round(centre[0] / dx + (self._width - 1) * 0.5))
+            j = int(round(centre[2] / dx + (self._height - 1) * 0.5))
+            inside = 0 <= i < self._width and 0 <= j < self._height
+            usable.append(bool(inside and self._obstacle_host.size
+                               and self._obstacle_host[j * self._width + i] == 0))
+        rebuilt = len(inlets) != self._inlet_count
+        self._inlet_count = len(inlets)
+        self._outfall_count = len(outfalls)
+        self._inlet_capacity_m3s = []
+        if inlets:
+            radii, strengths, targets = [], [], []
+            for centre, radius, capacity, target in inlets:
+                r = max(float(radius), floor_radius)
+                if target < 0 or target >= len(outfalls) or not usable[target]:
+                    capacity, target = 0.0, -1
+                weight = self._sink_weight(centre, r, dx)
+                radii.append(r)
+                strengths.append(float(capacity) / weight if weight > 0.0 else 0.0)
+                targets.append(int(target))
+                self._inlet_capacity_m3s.append(float(capacity))
+            self._inlet_centres = wp.array(
+                np.array([item[0] for item in inlets], dtype=np.float32),
+                dtype=wp.vec3, device=self.device)
+            self._inlet_radii = wp.array(np.array(radii, dtype=np.float32),
+                                         dtype=float, device=self.device)
+            self._inlet_strengths = wp.array(np.array(strengths, dtype=np.float32),
+                                             dtype=float, device=self.device)
+            self._inlet_targets = wp.array(np.array(targets, dtype=np.int32),
+                                           dtype=wp.int32, device=self.device)
+            if rebuilt or self._inlet_frame is None:
+                self._inlet_circulation = wp.zeros(len(inlets), dtype=float, device=self.device)
+                self._inlet_samples = wp.zeros(len(inlets), dtype=float, device=self.device)
+                self._inlet_step = wp.zeros(len(inlets), dtype=float, device=self.device)
+                self._inlet_frame = wp.zeros(len(inlets), dtype=float, device=self.device)
+                self._inlet_flow_m3s = [0.0] * len(inlets)
+        elif rebuilt:
+            self._inlet_frame = None
+            self._inlet_flow_m3s = []
+        if outfalls:
+            self._outfall_centres = wp.array(
+                np.array([item[0] for item in outfalls], dtype=np.float32),
+                dtype=wp.vec3, device=self.device)
+            self._outfall_radii = wp.array(
+                np.array([max(float(item[1]), floor_radius) if ok else 0.0
+                          for item, ok in zip(outfalls, usable)], dtype=np.float32),
+                dtype=float, device=self.device)
+            if self._outfall_volume is None or len(self._outfall_volume) != len(outfalls):
+                self._outfall_volume = wp.zeros(len(outfalls), dtype=float, device=self.device)
+                self._outfall_cells = wp.zeros(len(outfalls), dtype=float, device=self.device)
 
     def set_lava_vents(self, vents: list) -> None:
         """Upload placeable VENT objects; their presence IS the lava toggle.
@@ -2399,7 +2600,57 @@ class WarpShallowWaterSolver(FluidSolver):
                                   float(self._terrain.cell_size), dt,
                                   config.FLUID_DRY_DEPTH, config.DRAIN_SWIRL_GAIN,
                                   config.FLUID_MAX_VELOCITY, area,
-                                  self._diag_removed], device=self.device)
+                                  self._diag_removed, self._drain_removed_each, 1],
+                          device=self.device)
+            if self._inlet_count and not self._lava_enabled:
+                # v0.17.0 storm sewer (backend/app/sewer.py): inlets take water
+                # through the drain kernel at a strength capped by their pipe,
+                # and the same substep pours it out at the outfalls. Booked on
+                # its own two counters, not added/removed: the water is moved,
+                # not created or destroyed, and the HUD should not say otherwise.
+                # Skipped in a lava world for the reason rain is.
+                self._inlet_step.zero_()
+                self._inlet_circulation.zero_()
+                self._inlet_samples.zero_()
+                wp.launch(_measure_drain_circulation, dim=self._count,
+                          inputs=[self._uc, self._vc, self._h, self._obstacles,
+                                  self._inlet_centres, self._inlet_radii,
+                                  self._inlet_circulation, self._inlet_samples,
+                                  self._inlet_count,
+                                  self._width, self._height,
+                                  float(self._terrain.cell_size),
+                                  config.FLUID_DRY_DEPTH], device=self.device)
+                wp.launch(_apply_drains, dim=self._count,
+                          inputs=[self._h, self._u, self._v, self._obstacles,
+                                  self._inlet_centres, self._inlet_radii,
+                                  self._inlet_strengths, self._inlet_circulation,
+                                  self._inlet_samples,
+                                  self._inlet_count, self._width, self._height,
+                                  float(self._terrain.cell_size), dt,
+                                  config.FLUID_DRY_DEPTH, config.DRAIN_SWIRL_GAIN,
+                                  config.FLUID_MAX_VELOCITY, area,
+                                  self._diag_sewer_in, self._inlet_step, 0],
+                          device=self.device)
+                if self._outfall_count:
+                    self._outfall_volume.zero_()
+                    wp.launch(_sewer_route, dim=self._inlet_count,
+                              inputs=[self._inlet_step, self._inlet_targets,
+                                      self._outfall_volume, self._inlet_frame],
+                              device=self.device)
+                    self._outfall_cells.zero_()
+                    wp.launch(_count_outfall_cells, dim=self._count,
+                              inputs=[self._obstacles, self._outfall_centres,
+                                      self._outfall_radii, self._outfall_count,
+                                      self._width, self._height,
+                                      float(self._terrain.cell_size),
+                                      self._outfall_cells], device=self.device)
+                    wp.launch(_apply_outfalls, dim=self._count,
+                              inputs=[self._h, self._obstacles, self._outfall_centres,
+                                      self._outfall_radii, self._outfall_volume,
+                                      self._outfall_cells, self._outfall_count,
+                                      self._width, self._height,
+                                      float(self._terrain.cell_size), area,
+                                      self._diag_sewer_out], device=self.device)
             if self._outflow_columns:
                 # For a tsunami world this fires only in the GAP between
                 # pulses (or after the last one) -- see the gate computed
@@ -2528,6 +2779,7 @@ class WarpShallowWaterSolver(FluidSolver):
                               self._tracer_vent_x, self._tracer_vent_z],
                       device=self.device)
             self._time += dt
+        self._frame_dt = global_dt
         self._fold_ledger()
         self._measure()
         self.last_substeps = substeps
@@ -2565,6 +2817,18 @@ class WarpShallowWaterSolver(FluidSolver):
             # up as an unexplained conservation error, not as a feature.
             self._solidified_m3 += float(self._diag_solidified.numpy()[0])
             self._diag_solidified.zero_()
+        if self._diag_sewer_in is not None:
+            # v0.17.0: what the inlets took and what the outfalls poured out,
+            # and per inlet the flow over this frame -- what a pipe is carrying
+            self._sewer_in_m3 += float(self._diag_sewer_in.numpy()[0])
+            self._sewer_out_m3 += float(self._diag_sewer_out.numpy()[0])
+            self._diag_sewer_in.zero_()
+            self._diag_sewer_out.zero_()
+            if self._inlet_count and self._inlet_frame is not None:
+                frame = np.asarray(self._inlet_frame.numpy(), dtype=np.float64)
+                span = max(float(getattr(self, "_frame_dt", 0.0)), 1.0e-9)
+                self._inlet_flow_m3s = (frame / span).tolist()
+                self._inlet_frame.zero_()
 
     def _host_fields(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self._h is None:
@@ -2737,7 +3001,14 @@ class WarpShallowWaterSolver(FluidSolver):
                 # step reads as a conservation bug rather than as a feature.
                 "volume_error_m3": (self._diag["volume_m3"] - self._volume_at_start
                                     - self._added_m3 + self._removed_m3
-                                    + self._solidified_m3),
+                                    + self._solidified_m3
+                                    + self._sewer_in_m3 - self._sewer_out_m3),
+                # v0.17.0 storm sewer: moved, not created or destroyed, so on
+                # its own two counters. In and out differ only by float noise.
+                "sewer_in_m3": self._sewer_in_m3,
+                "sewer_out_m3": self._sewer_out_m3,
+                "sewer_inlet_flow_m3s": list(self._inlet_flow_m3s),
+                "sewer_inlet_capacity_m3s": list(self._inlet_capacity_m3s),
                 "sediment_out_m3": self._sediment_out_m3,
                 "lava_enabled": self._lava_enabled,
                 "vents": self._vent_count,

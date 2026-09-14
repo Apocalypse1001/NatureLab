@@ -1,7 +1,21 @@
 /** Shared data model — mirrors backend/app/world_state.py. */
 
 export type ObjectType = 'HOUSE' | 'CAR' | 'TREE' | 'BOX' | 'DEBRIS' | 'ROCK'
-  | 'BRIDGE' | 'PERSON' | 'ROAD' | 'SOURCE' | 'DRAIN' | 'GAUGE' | 'VENT' | 'BUILDING';
+  | 'BRIDGE' | 'PERSON' | 'ROAD' | 'SOURCE' | 'DRAIN' | 'GAUGE' | 'VENT' | 'BUILDING'
+  // v0.17.0 storm sewer (backend/app/sewer.py)
+  | 'STORM_INLET' | 'OUTFALL' | 'PIPE';
+
+/** What one PIPE is doing, streamed in sim_state and in the pipe_* replies. */
+export interface SewerLinkState {
+  pipe_id: string;
+  inlet_id: string;
+  outfall_id: string;
+  capacity_m3s: number;
+  flow_m3s: number;
+  length_m: number;
+  fall_m: number;
+  status: 'ok' | 'uphill' | 'disconnected' | 'second_pipe';
+}
 
 export type ObjectState =
   | 'INTACT' | 'MOVING' | 'FLOATING' | 'COLLIDING'
@@ -23,7 +37,10 @@ export interface ObjectData {
   is_static: boolean;
   damage: number;       // 0..1
   state: ObjectState;
-  metadata: Record<string, number>;
+  // Numbers for every type, plus a PIPE's route and joints
+  // (`points` [[x,y,z],...], `from_id`, `to_id`).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  metadata: Record<string, any>;
 }
 
 export interface TerrainData {
@@ -77,6 +94,7 @@ export interface SimStateMessage {
   moved_objects: { id: string; position: number[]; state: ObjectState; damage: number }[];
   gauge_history_capacity: number;
   gauges: GaugeState[];
+  sewer?: SewerLinkState[];
   fluid?: { solver: string; device?: string; grid?: number[]; substeps: number;
             wet_cells?: number; volume_m3?: number; cfl_dt?: number;
             max_depth?: number; max_velocity?: number;
@@ -114,7 +132,9 @@ export interface SimEvent {
 
 /** Add new object types here (+ backend defaults) without touching the core. */
 export const OBJECT_TYPES: ObjectType[] = ['HOUSE', 'BUILDING', 'CAR', 'TREE', 'BOX', 'DEBRIS',
-  'ROCK', 'BRIDGE', 'PERSON', 'ROAD', 'SOURCE', 'DRAIN', 'GAUGE', 'VENT'];
+  'ROCK', 'BRIDGE', 'PERSON', 'ROAD', 'SOURCE', 'DRAIN', 'GAUGE', 'VENT',
+  // a PIPE is laid with the Pipe tool, not dropped on a grid
+  'STORM_INLET', 'OUTFALL'];
 
 export const OBJECT_COLORS: Record<string, number> = {
   HOUSE: 0xc9a27a,
@@ -127,6 +147,9 @@ export const OBJECT_COLORS: Record<string, number> = {
   PERSON: 0xf2d64b,
   ROAD: 0x4a4a52,
   SOURCE: 0x4fd8a0,
+  STORM_INLET: 0x5b6470,
+  OUTFALL: 0x9aa3ad,
+  PIPE: 0x8a939c,
   DRAIN: 0xd85f4f,
   GAUGE: 0x62e6ff,
   VENT: 0xff5a1f,
