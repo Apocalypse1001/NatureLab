@@ -125,10 +125,19 @@ for step in range(1, 1801):
 ```
 
 ```
-t=  10s  wet= 3030  vol=  2290.4 m3  vmax=2.605 m/s  substeps=1
-t=  20s  wet= 5151  vol=  3484.0 m3  vmax=2.023 m/s  substeps=1
-t=  30s  wet= 6868  vol=  4311.3 m3  vmax=1.587 m/s  substeps=1
+t=  10s  wet= 6834  vol=  6151.0 m3  vmax=2.988 m/s  substeps=1
+t=  20s  wet=12663  vol= 11239.4 m3  vmax=2.835 m/s  substeps=1
+t=  30s  wet=18090  vol= 15769.8 m3  vmax=2.714 m/s  substeps=1
 ```
+
+(v0.15.0 numbers. The v0.14.3 collocated solver gives the same inflow to a percent here --
+the larger figures that used to sit in this block were from v0.5.1.)
+
+**`_u` / `_v` are FACE velocities since v0.15.0** (`docs/15_cgrid_plan.md`): `u[idx]` sits
+on the face between cell `idx` and `idx+1`, `v[idx]` between `idx` and `idx+width`, and the
+last column/row slot is the outer edge face. Anything that wants the velocity AT a cell
+reads `_uc` / `_vc`, which `_measure()` refreshes -- so a probe that writes `_u` directly
+sees the matching `_uc` after the next `diagnostics()`-producing step, not immediately.
 
 `set_boundaries(terrain, obstacles, terrain_revision, obstacle_revision)` only re-uploads
 to the GPU when a revision number actually changes — passing constants (as above) is

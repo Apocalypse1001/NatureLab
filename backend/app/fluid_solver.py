@@ -11,6 +11,24 @@ from .compute_engine import WARP_IMPORTED, wp
 
 
 if WARP_IMPORTED:
+    @wp.func
+    def _face_flux(velocity: float, h_from: float, bed_from: float,
+                   bed_other: float) -> float:
+        available = wp.max(0.0, bed_from + h_from - wp.max(bed_from, bed_other))
+        return velocity * available
+
+
+    @wp.func
+    def _upwind_flux(face: float, h_a: float, bed_a: float, h_b: float,
+                     bed_b: float) -> float:
+        """Discharge per unit width from cell a to cell b across their shared
+        face, carried at the upwind cell's depth above the higher of the two
+        beds -- water does not climb out over a higher dry bed."""
+        if face >= 0.0:
+            return _face_flux(face, h_a, bed_a, bed_b)
+        return _face_flux(face, h_b, bed_b, bed_a)
+
+
     @wp.kernel
     def _velocity_step(h: wp.array(dtype=float), u: wp.array(dtype=float),
                        v: wp.array(dtype=float), bed: wp.array(dtype=float),
@@ -22,131 +40,157 @@ if WARP_IMPORTED:
                        friction_min_depth: float,
                        max_velocity: float, outflow_columns: int,
                        outflow_row_lo: int, outflow_row_hi: int):
+        """Local-inertial momentum at cell FACES (v0.15.0, docs/15_cgrid_plan.md).
+
+        `u[idx]` is the velocity on the face between cell idx and idx+1, and
+        `v[idx]` on the face between idx and idx+width. The slot in the last
+        column (u) or row (v) is the outer edge face. Cell-centred velocity is
+        derived from these by `_centre_velocity` for everything that wants a
+        velocity AT a cell.
+
+        Until v0.14.3 u, v and h shared one point, the surface gradient was the
+        central (eta[i+1] - eta[i-1]) / 2dx, and `_depth_step` carried water at
+        the average of two cell velocities. Both operators are blind to a
+        pattern that alternates cell to cell, so that pattern neither grew nor
+        decayed: it scoured alternate cells under erosion (v0.12.0) and grew to
+        56% of the depth in a rain film running into a channel (v0.14.3 rain,
+        measured in docs/probe_2dx_gauge_v1.py). On a face the gradient is the
+        compact (eta_b - eta_a) / dx, which such a pattern cannot hide from:
+        it becomes an ordinary short gravity wave that runs off and is damped.
+        This is also where Bates, Horritt & Fewtrell (2010) put the discharge
+        in the first place.
+
+        The face is wet when the higher surface stands above the higher bed --
+        the same test `_face_flux` already applied to transport, so a dry bank
+        higher than the water beside it feels no gradient and takes no flow.
+        ANY positive depth counts, not only depth above FLUID_DRY_DEPTH: with
+        the threshold here a draining film decays toward the threshold and
+        stops exactly on it -- measured on the tsunami beach, a strip of cells
+        left at 0.100 mm that the waterline (and every "is it wet" reader)
+        counted as sea, so the sea "retreated" 52 m while at a 1 mm threshold it
+        had gone 102 m. The dry threshold decides what is reported as wet and
+        whether a cell has a velocity; it must not decide whether water can
+        leave.
+
+        Manning bed friction, tau/rho = g*n^2*|u|*u / h^(4/3), is applied
+        semi-implicitly (divide by 1 + drag) rather than subtracted: the
+        explicit form overshoots and reverses the flow exactly where the
+        coefficient is largest, a thin fast wetting front, and would need its
+        own timestep limit. Dividing can only slow water, never turn it round
+        (FrictionLawTests). One denominator from the full speed -- this face's
+        component and the mean of the four faces of the other kind around it
+        -- so diagonal flow is not dragged less than axis-aligned flow.
+
+        Boundaries live on faces too:
+        - west inlet (a row with inlet_q > 0): the face 0->1 carries the
+          arriving velocity q/h, capped at twice critical so a nearly dry edge
+          cell does not turn q/h into a jet. The discharge itself is written by
+          `_depth_step`; this value is what the cells around it, the sediment
+          capacity and the CFL limit read. v0.12.0 learned the hard way that a
+          flux coaxed out of an averaged cell velocity comes out doubled, and
+          that the "exact" correction u[0] = 2q/h - u[1] generates the very
+          odd-even mode this grid removes;
+        - east outlet band: the edge face copies the last interior face's
+          outward velocity (zero gradient), and every face in the band may only
+          point outward, so the boundary can never become a second source.
+          `_apply_outflow` removes what crosses the edge face;
+        - every other outer face is a wall, u = 0.
+        """
         idx = wp.tid()
         i = idx % width
         j = idx // width
-        if solid[idx] != 0 or h[idx] <= dry:
-            next_u[idx] = 0.0
-            next_v[idx] = 0.0
-        else:
-            eta = bed[idx] + h[idx]
-            eta_l = eta
-            eta_r = eta
-            eta_d = eta
-            eta_u = eta
-            if i > 0 and solid[idx - 1] == 0:
-                eta_l = bed[idx - 1] + h[idx - 1]
-                if h[idx - 1] <= dry and bed[idx - 1] >= eta:
-                    eta_l = eta
-            if i < width - 1 and solid[idx + 1] == 0:
-                eta_r = bed[idx + 1] + h[idx + 1]
-                if h[idx + 1] <= dry and bed[idx + 1] >= eta:
-                    eta_r = eta
-            if j > 0 and solid[idx - width] == 0:
-                eta_d = bed[idx - width] + h[idx - width]
-                if h[idx - width] <= dry and bed[idx - width] >= eta:
-                    eta_d = eta
-            if j < height - 1 and solid[idx + width] == 0:
-                eta_u = bed[idx + width] + h[idx + width]
-                if h[idx + width] <= dry and bed[idx + width] >= eta:
-                    eta_u = eta
+        in_band = (outflow_columns > 0 and j >= outflow_row_lo
+                   and j <= outflow_row_hi and i >= width - 1 - outflow_columns)
 
-            ux = u[idx] - gravity * dt * (eta_r - eta_l) / (2.0 * dx)
-            vz = v[idx] - gravity * dt * (eta_u - eta_d) / (2.0 * dx)
+        ux = float(0.0)
+        if i == width - 1:
+            if in_band and solid[idx] == 0 and h[idx] > dry and solid[idx - 1] == 0:
+                # The open edge: a ghost cell beyond the map continues the
+                # surface slope of the last two cells, and the edge face feels
+                # that slope and friction like any other face. A level pool
+                # feels nothing and stays; a wave or a river running at the
+                # edge draws its own surface down and leaves.
+                #
+                # Capped at critical, sqrt(g*h): the most a free edge can pass is
+                # critical flow at its brink, and a local-inertial model has no
+                # advection to stop it running supercritical on its own. For a
+                # river this makes the edge a FREE OVERFALL -- measured, 80 m3/s
+                # settles at Froude 1.00 at the edge with a drawdown over the
+                # last ~100 m -- not a normal-depth boundary. A normal-depth
+                # edge would need to know what lies beyond the map: a river
+                # continuing at its bed slope, or a sea it would drain.
+                # Measured before this, with the edge copying the last interior
+                # face's velocity: 80 m3/s drew the last cell down to 0.61 m at
+                # 8.1 m/s, Froude 3.3, and the whole 200 m channel sat in the
+                # drawdown. The collocated outlet this replaced had the opposite
+                # fault -- it held 4.3 m of still water in the last two columns,
+                # a dam at the map edge (docs/15_cgrid_plan.md).
+                eta_last = bed[idx] + h[idx]
+                eta_prev = bed[idx - 1] + h[idx - 1]
+                ux = u[idx] + gravity * dt * (eta_prev - eta_last) / dx
+                cross = v[idx]
+                if j > 0:
+                    cross = 0.5 * (cross + v[idx - width])
+                speed = wp.sqrt(ux * ux + cross * cross)
+                n = manning[idx]
+                hf = wp.max(h[idx], friction_min_depth)
+                ux = ux / (1.0 + gravity * n * n * speed * dt / wp.pow(hf, 1.3333333))
+                ux = wp.clamp(ux, 0.0, wp.min(wp.sqrt(gravity * h[idx]), max_velocity))
+        elif i == 0 and inlet_q[j] > 0.0:
+            if solid[idx] == 0 and h[idx] > dry:
+                ux = wp.min(inlet_q[j] / h[idx], 2.0 * wp.sqrt(gravity * h[idx]))
+        elif solid[idx] == 0 and solid[idx + 1] == 0:
+            eta_a = bed[idx] + h[idx]
+            eta_b = bed[idx + 1] + h[idx + 1]
+            flow = wp.max(eta_a, eta_b) - wp.max(bed[idx], bed[idx + 1])
+            if flow > 0.0:
+                ux = u[idx] - gravity * dt * (eta_b - eta_a) / dx
+                cross = v[idx] + v[idx + 1]
+                if j > 0:
+                    cross = cross + v[idx - width] + v[idx - width + 1]
+                cross = 0.25 * cross
+                speed = wp.sqrt(ux * ux + cross * cross)
+                n = 0.5 * (manning[idx] + manning[idx + 1])
+                hf = wp.max(flow, friction_min_depth)
+                ux = ux / (1.0 + gravity * n * n * speed * dt / wp.pow(hf, 1.3333333))
+                if i == 1 and inlet_q[j] > 0.0 and h[idx - 1] > dry:
+                    # The arriving water brings its momentum with it -- the one
+                    # place the model carries momentum flux at all, because a
+                    # prescribed discharge is momentum entering the map. Without
+                    # it the inlet hands cell 1 mass and nothing else, and a
+                    # river primed at rest has to accelerate from gravity alone:
+                    # measured on this grid before the term was restored, 10.8
+                    # of a requested 12 m3/s crossed this face after 10 s, 11.3
+                    # after 60. Mixing, not forcing: the fraction of cell 1's
+                    # column replaced this substep arrives at the inlet
+                    # velocity, the rest keeps what it had, and at equilibrium
+                    # the two are the same number so the term does nothing.
+                    arriving = wp.min(inlet_q[j] / h[idx - 1],
+                                      2.0 * wp.sqrt(gravity * h[idx - 1]))
+                    fraction = wp.min(1.0, inlet_q[j] * dt / (dx * h[idx]))
+                    ux = ux + fraction * (arriving - ux)
+                if in_band:
+                    ux = wp.max(0.0, ux)
+                ux = wp.clamp(ux, -max_velocity, max_velocity)
+        next_u[idx] = ux
 
-            # Manning bed friction: tau/rho = g*n^2*|u|*u / h^(4/3). Depth is in
-            # the law, which is the whole point -- the bed drags on the bottom of
-            # the column and a deep column has more momentum to lose per unit of
-            # that drag, so a channel outruns a sheet over the same ground.
-            #
-            # Applied semi-implicitly (divide by 1 + drag) rather than explicitly
-            # (subtract drag): the explicit form overshoots and can reverse the
-            # flow when friction is strong -- exactly where a wetting front lives,
-            # h small and the coefficient large -- and would need its own dt limit.
-            # The implicit form is unconditionally stable and can only ever slow
-            # water down, never turn it around. FrictionLawTests checks that.
-            #
-            # One denominator built from the full speed, applied to both
-            # components: a per-component denominator would drag axis-aligned flow
-            # harder than diagonal flow and quietly bend the river toward the grid.
-            speed = wp.sqrt(ux * ux + vz * vz)
-            hf = wp.max(h[idx], friction_min_depth)
-            n = manning[idx]
-            drag = gravity * n * n * speed * dt / wp.pow(hf, 1.3333333)
-            ux = ux / (1.0 + drag)
-            vz = vz / (1.0 + drag)
-            if i == 0:
-                # v0.12.0: the west edge is where a prescribed-discharge inlet
-                # lives, and its velocity has to be imposed HERE rather than in
-                # the inlet kernel. This line used to be an unconditional
-                # `ux = 0.0`, which runs every substep after the inlet kernel
-                # has already written its u -- so a Q inlet that set u anywhere
-                # else would report the requested discharge in diagnostics while
-                # no water moved at all. Same shape as the bug that made the
-                # outlet inert before v0.8.0; see `_apply_outflow`.
-                #
-                # The edge velocity is the mean velocity of the arriving flow,
-                # u = q/h, and nothing more: the discharge itself is delivered
-                # by `_depth_step`, which is handed q directly for this face.
-                #
-                # It was tried the other way first, and the record is worth
-                # keeping. `_depth_step` transports across a face at the average
-                # of the two cells' velocities, so prescribing q/h here made the
-                # face carry (q/h + u[1])/2 * h -- about twice the requested
-                # discharge. Solving u_face*h = q for the edge value gives
-                # u[0] = 2q/h - u[1], which delivers exactly Q and is also an
-                # odd-even feedback: the edge velocity set to minus its
-                # neighbour's is the definition of a 2dx mode, the grid is
-                # collocated with a central surface gradient so nothing damps
-                # that mode, and with erosion on it locks in and alternate cells
-                # scour. Relaxing the response only slowed it down. Prescribing
-                # the flux where the flux actually lives removes the coupling
-                # instead of fighting it.
-                #
-                # The Froude cap keeps a nearly dry edge cell from turning q/h
-                # into a jet: water arriving faster than about twice critical is
-                # not a river entering a channel, it is a division by a small
-                # number.
-                if inlet_q[j] > 0.0 and h[idx] > dry:
-                    ux = wp.min(inlet_q[j] / h[idx],
-                                2.0 * wp.sqrt(gravity * h[idx]))
-                else:
-                    ux = 0.0
-            if i == 1 and inlet_q[j] > 0.0 and h[idx] > dry and h[idx - 1] > dry:
-                # The arriving water brings its momentum with it. Without this
-                # the flux boundary hands cell 1 mass and nothing else, the mass
-                # piles into a mound, the mound's own surface gradient shoves
-                # water back at the boundary, and the inlet reach rings.
-                #
-                # Mixing, not forcing: the fraction of this cell's column that
-                # was replaced this substep arrives at the inlet velocity, the
-                # rest keeps the velocity it had. At equilibrium the two are the
-                # same number and the term does nothing.
-                arriving = wp.min(inlet_q[j] / h[idx - 1],
-                                  2.0 * wp.sqrt(gravity * h[idx - 1]))
-                fraction = wp.min(1.0, inlet_q[j] * dt / (dx * h[idx]))
-                ux = ux + fraction * (arriving - ux)
-            if (i >= width - 1 - outflow_columns and outflow_columns > 0
-                    and j >= outflow_row_lo and j <= outflow_row_hi):
-                # Open outlet: the east edge is allowed to keep its velocity so
-                # water can actually leave, but only outward -- clamping the
-                # inward direction stops the boundary from ever acting as a
-                # second, accidental source. With outflow off (0) the edge is
-                # closed exactly as before.
-                ux = wp.max(0.0, ux)
-            elif i == width - 1:
-                ux = 0.0
-            if j == 0 or j == height - 1:
-                vz = 0.0
-            next_u[idx] = wp.clamp(ux, -max_velocity, max_velocity)
-            next_v[idx] = wp.clamp(vz, -max_velocity, max_velocity)
-
-
-    @wp.func
-    def _face_flux(velocity: float, h_from: float, bed_from: float,
-                   bed_other: float) -> float:
-        available = wp.max(0.0, bed_from + h_from - wp.max(bed_from, bed_other))
-        return velocity * available
+        vz = float(0.0)
+        if j < height - 1 and solid[idx] == 0 and solid[idx + width] == 0:
+            eta_a = bed[idx] + h[idx]
+            eta_b = bed[idx + width] + h[idx + width]
+            flow = wp.max(eta_a, eta_b) - wp.max(bed[idx], bed[idx + width])
+            if flow > 0.0:
+                vz = v[idx] - gravity * dt * (eta_b - eta_a) / dx
+                cross = u[idx] + u[idx + width]
+                if i > 0:
+                    cross = cross + u[idx - 1] + u[idx + width - 1]
+                cross = 0.25 * cross
+                speed = wp.sqrt(vz * vz + cross * cross)
+                n = 0.5 * (manning[idx] + manning[idx + width])
+                hf = wp.max(flow, friction_min_depth)
+                vz = vz / (1.0 + gravity * n * n * speed * dt / wp.pow(hf, 1.3333333))
+                vz = wp.clamp(vz, -max_velocity, max_velocity)
+        next_v[idx] = vz
 
 
     @wp.kernel
@@ -155,14 +199,36 @@ if WARP_IMPORTED:
                     solid: wp.array(dtype=wp.int32), next_h: wp.array(dtype=float),
                     inlet_q: wp.array(dtype=float),
                     width: int, height: int, dx: float, dt: float):
+        """Continuity: each cell gains what its four faces carry in.
+
+        Every face is read from one stored velocity, so the water leaving one
+        cell across a face is the same number as the water arriving in its
+        neighbour -- conservation holds face by face, not on average. The outer
+        faces carry nothing here; the outlet's edge face is emptied by
+        `_apply_outflow`, which books it to the ledger.
+        """
         idx = wp.tid()
         i = idx % width
         j = idx // width
         if solid[idx] != 0:
             next_h[idx] = 0.0
-        elif inlet_q[j] > 0.0 and i <= 1:
-            # The river inlet is a flux boundary, so its discharge is written
-            # where fluxes live rather than being coaxed out of an edge
+            return
+        q_right = float(0.0)
+        q_left = float(0.0)
+        q_up = float(0.0)
+        q_down = float(0.0)
+        if i < width - 1 and solid[idx + 1] == 0:
+            q_right = _upwind_flux(u[idx], h[idx], bed[idx], h[idx + 1], bed[idx + 1])
+        if i > 0 and solid[idx - 1] == 0:
+            q_left = _upwind_flux(u[idx - 1], h[idx - 1], bed[idx - 1], h[idx], bed[idx])
+        if j < height - 1 and solid[idx + width] == 0:
+            q_up = _upwind_flux(v[idx], h[idx], bed[idx], h[idx + width], bed[idx + width])
+        if j > 0 and solid[idx - width] == 0:
+            q_down = _upwind_flux(v[idx - width], h[idx - width], bed[idx - width],
+                                  h[idx], bed[idx])
+        if inlet_q[j] > 0.0 and i <= 1:
+            # The river inlet is a flux boundary, so its discharge is written on
+            # the face between columns 0 and 1 rather than coaxed out of a
             # velocity. Both cells compute the same number from the same depth,
             # so the water that leaves cell 0 is exactly the water that arrives
             # in cell 1 -- prescribing it independently on each side would leak
@@ -174,79 +240,84 @@ if WARP_IMPORTED:
             # the difference and put the volume ledger out.
             crossing = wp.min(inlet_q[j], h[idx - i] * dx / dt)
             if i == 0:
-                q_out = float(0.0)
-                if j < height - 1 and solid[idx + width] == 0:
-                    face = 0.5 * (v[idx] + v[idx + width])
-                    if face >= 0.0:
-                        q_out = q_out + _face_flux(face, h[idx], bed[idx],
-                                                   bed[idx + width])
-                    else:
-                        q_out = q_out + _face_flux(face, h[idx + width],
-                                                   bed[idx + width], bed[idx])
-                if j > 0 and solid[idx - width] == 0:
-                    face = 0.5 * (v[idx - width] + v[idx])
-                    if face >= 0.0:
-                        q_out = q_out - _face_flux(face, h[idx - width],
-                                                   bed[idx - width], bed[idx])
-                    else:
-                        q_out = q_out - _face_flux(face, h[idx], bed[idx],
-                                                   bed[idx - width])
-                next_h[idx] = wp.max(0.0, h[idx] - dt * (crossing + q_out) / dx)
+                q_right = crossing
             else:
-                q_right = float(0.0)
-                q_up = float(0.0)
-                q_down = float(0.0)
-                if i < width - 1 and solid[idx + 1] == 0:
-                    face = 0.5 * (u[idx] + u[idx + 1])
-                    if face >= 0.0:
-                        q_right = _face_flux(face, h[idx], bed[idx], bed[idx + 1])
-                    else:
-                        q_right = _face_flux(face, h[idx + 1], bed[idx + 1], bed[idx])
-                if j < height - 1 and solid[idx + width] == 0:
-                    face = 0.5 * (v[idx] + v[idx + width])
-                    if face >= 0.0:
-                        q_up = _face_flux(face, h[idx], bed[idx], bed[idx + width])
-                    else:
-                        q_up = _face_flux(face, h[idx + width], bed[idx + width], bed[idx])
-                if j > 0 and solid[idx - width] == 0:
-                    face = 0.5 * (v[idx - width] + v[idx])
-                    if face >= 0.0:
-                        q_down = _face_flux(face, h[idx - width], bed[idx - width], bed[idx])
-                    else:
-                        q_down = _face_flux(face, h[idx], bed[idx], bed[idx - width])
-                value = h[idx] - dt * ((q_right - crossing) + (q_up - q_down)) / dx
-                next_h[idx] = wp.max(0.0, value)
-        else:
-            q_right = float(0.0)
-            q_left = float(0.0)
-            q_up = float(0.0)
-            q_down = float(0.0)
-            if i < width - 1 and solid[idx + 1] == 0:
-                face = 0.5 * (u[idx] + u[idx + 1])
-                if face >= 0.0:
-                    q_right = _face_flux(face, h[idx], bed[idx], bed[idx + 1])
-                else:
-                    q_right = _face_flux(face, h[idx + 1], bed[idx + 1], bed[idx])
-            if i > 0 and solid[idx - 1] == 0:
-                face = 0.5 * (u[idx - 1] + u[idx])
-                if face >= 0.0:
-                    q_left = _face_flux(face, h[idx - 1], bed[idx - 1], bed[idx])
-                else:
-                    q_left = _face_flux(face, h[idx], bed[idx], bed[idx - 1])
-            if j < height - 1 and solid[idx + width] == 0:
-                face = 0.5 * (v[idx] + v[idx + width])
-                if face >= 0.0:
-                    q_up = _face_flux(face, h[idx], bed[idx], bed[idx + width])
-                else:
-                    q_up = _face_flux(face, h[idx + width], bed[idx + width], bed[idx])
-            if j > 0 and solid[idx - width] == 0:
-                face = 0.5 * (v[idx - width] + v[idx])
-                if face >= 0.0:
-                    q_down = _face_flux(face, h[idx - width], bed[idx - width], bed[idx])
-                else:
-                    q_down = _face_flux(face, h[idx], bed[idx], bed[idx - width])
-            value = h[idx] - dt * ((q_right - q_left) + (q_up - q_down)) / dx
-            next_h[idx] = wp.max(0.0, value)
+                q_left = crossing
+        next_h[idx] = wp.max(0.0, h[idx] - dt * ((q_right - q_left) + (q_up - q_down)) / dx)
+
+
+    @wp.kernel
+    def _centre_velocity(h: wp.array(dtype=float), u: wp.array(dtype=float),
+                         v: wp.array(dtype=float), bed: wp.array(dtype=float),
+                         solid: wp.array(dtype=wp.int32),
+                         inlet_q: wp.array(dtype=float),
+                         uc: wp.array(dtype=float), vc: wp.array(dtype=float),
+                         width: int, height: int, dry: float, max_velocity: float):
+        """Cell-centred velocity: the discharge through the cell over its depth.
+
+        Everything that asks "how fast is the water HERE" -- sediment capacity
+        and transport, flow tracers, floating bodies, gauges, the drain's
+        circulation measurement, the velocity stream to the browser -- reads
+        this rather than a face.
+
+        Built from the face DISCHARGES `_depth_step` actually moves, averaged
+        and divided by this cell's own depth, not from the mean of the two
+        face velocities. The two agree in uniform flow and part company exactly
+        where it matters: a face velocity belongs to the depth it was carried
+        at. Measured on the first version of this kernel (plain velocity mean):
+        the cell after the river inlet averaged in q/h of the SHALLOW inlet
+        cell, read 1.4 m/s where its own depth carried the same q at 0.85, took
+        that as sediment capacity, scoured, got deeper -- and a deeper cell with
+        the same borrowed speed has even more capacity. 1.4 m of trench in
+        150 s, across the whole inlet band.
+
+        A dry cell has no velocity, and the result is clamped to the faster of
+        its two faces: a film receiving the flux of a deep neighbour would
+        otherwise divide a large q by a small h and report a speed no face has.
+        In an inlet row the west edge delivers the inlet's q, so column 0 is not
+        averaged against a wall -- a half-loaded inlet is a hungry one.
+        """
+        idx = wp.tid()
+        if solid[idx] != 0 or h[idx] <= dry:
+            uc[idx] = 0.0
+            vc[idx] = 0.0
+            return
+        i = idx % width
+        j = idx // width
+        inlet_row = inlet_q[j] > 0.0 and i <= 1
+
+        q_left = float(0.0)
+        u_left = float(0.0)
+        if i == 0 and inlet_row:
+            q_left = inlet_q[j]
+            u_left = u[idx]
+        elif i == 1 and inlet_row:
+            q_left = inlet_q[j]
+            u_left = u[idx - 1]
+        elif i > 0 and solid[idx - 1] == 0:
+            q_left = _upwind_flux(u[idx - 1], h[idx - 1], bed[idx - 1], h[idx], bed[idx])
+            u_left = u[idx - 1]
+        q_right = float(0.0)
+        if i == 0 and inlet_row:
+            q_right = inlet_q[j]
+        elif i == width - 1:
+            q_right = u[idx] * h[idx]           # the outlet's edge face
+        elif solid[idx + 1] == 0:
+            q_right = _upwind_flux(u[idx], h[idx], bed[idx], h[idx + 1], bed[idx + 1])
+        limit_x = wp.min(wp.max(wp.abs(u_left), wp.abs(u[idx])), max_velocity)
+        uc[idx] = wp.clamp(0.5 * (q_left + q_right) / h[idx], -limit_x, limit_x)
+
+        q_down = float(0.0)
+        v_down = float(0.0)
+        if j > 0 and solid[idx - width] == 0:
+            q_down = _upwind_flux(v[idx - width], h[idx - width], bed[idx - width],
+                                  h[idx], bed[idx])
+            v_down = v[idx - width]
+        q_up = float(0.0)
+        if j < height - 1 and solid[idx + width] == 0:
+            q_up = _upwind_flux(v[idx], h[idx], bed[idx], h[idx + width], bed[idx + width])
+        limit_z = wp.min(wp.max(wp.abs(v_down), wp.abs(v[idx])), max_velocity)
+        vc[idx] = wp.clamp(0.5 * (q_down + q_up) / h[idx], -limit_z, limit_z)
 
 
     @wp.kernel
@@ -420,7 +491,13 @@ if WARP_IMPORTED:
         idx = wp.tid()
         i = idx % width
         j = idx // width
-        if i < width - columns or solid[idx] != 0:
+        # v0.15.0: water leaves across the one outer face, from the last
+        # column, at that face's velocity (`_velocity_step` gives the edge face
+        # the last interior face's outward speed). Before, u lived at centres
+        # and each of the last `columns` columns drained on its own velocity;
+        # on faces the interior columns already pass their water on, so
+        # draining them too would take it twice.
+        if i != width - 1 or solid[idx] != 0:
             return
         if j < row_lo or j > row_hi:
             return
@@ -550,6 +627,44 @@ if WARP_IMPORTED:
             wp.atomic_add(samples, n, 1.0)
 
 
+    @wp.func
+    def _sink_velocity(dxc: float, dzc: float, radius: float, strength: float,
+                       depth: float, dry: float, mean_tangential: float,
+                       swirl_gain: float) -> wp.vec2:
+        """The drain's imposed (u, v) at offset (dxc, dzc) from its centre."""
+        r = wp.sqrt(dxc * dxc + dzc * dzc)
+        # keep the core finite: 1/r blows up at the exact centre, and a real
+        # vortex has a rotational core of finite size anyway
+        r_safe = wp.max(r, radius * 0.25)
+        nx = dxc / r_safe
+        nz = dzc / r_safe
+        tx = -nz
+        tz = nx
+        # radial speed straight from continuity with the removal
+        enclosed = strength * 3.14159265 * r_safe * r_safe * (
+            1.0 - r_safe * r_safe / (2.0 * radius * radius))
+        radial = -enclosed / (2.0 * 3.14159265 * r_safe * wp.max(depth, dry))
+        # Mean ambient tangential speed measured in the annulus at ~1.5R.
+        # Angular momentum conservation, v_theta * r = const, carries it
+        # inward: v_theta(r) = v_mean * r_ref / r. Sign and magnitude both
+        # come from the measurement -- nothing here picks a direction.
+        spin = swirl_gain * mean_tangential * (radius * 1.5) / r_safe
+        return wp.vec2(nx * radial + tx * spin, nz * radial + tz * spin)
+
+
+    @wp.func
+    def _vent_velocity(dxc: float, dzc: float, radius: float, strength: float,
+                       depth: float, dry: float) -> wp.vec2:
+        """A vent's outward (u, v) at offset (dxc, dzc): the drain's continuity
+        relation run backwards, with no swirl."""
+        r = wp.sqrt(dxc * dxc + dzc * dzc)
+        r_safe = wp.max(r, radius * 0.25)
+        enclosed = strength * 3.14159265 * r_safe * r_safe * (
+            1.0 - r_safe * r_safe / (2.0 * radius * radius))
+        radial = enclosed / (2.0 * 3.14159265 * r_safe * wp.max(depth, dry))
+        return wp.vec2(dxc / r_safe * radial, dzc / r_safe * radial)
+
+
     @wp.kernel
     def _apply_drains(h: wp.array(dtype=float), u: wp.array(dtype=float),
                       v: wp.array(dtype=float), solid: wp.array(dtype=wp.int32),
@@ -623,27 +738,21 @@ if WARP_IMPORTED:
                 u[idx] = 0.0
                 v[idx] = 0.0
                 continue
-            # keep the core finite: 1/r blows up at the exact centre, and a real
-            # vortex has a rotational core of finite size anyway
-            r_safe = wp.max(r, radius * 0.25)
-            nx = dxc / r_safe
-            nz = dzc / r_safe
-            tx = -nz
-            tz = nx
-            # radial speed straight from continuity with the removal above
-            enclosed = strength * 3.14159265 * r_safe * r_safe * (
-                1.0 - r_safe * r_safe / (2.0 * radius * radius))
-            radial = -enclosed / (2.0 * 3.14159265 * r_safe * wp.max(h[idx], dry))
-            # Mean ambient tangential speed measured in the annulus at ~1.5R.
-            # Angular momentum conservation, v_theta * r = const, carries it
-            # inward: v_theta(r) = v_mean * r_ref / r. Sign and magnitude both
-            # come from the measurement -- nothing here picks a direction.
             mean_tangential = circulation[n] / wp.max(1.0, samples[n])
-            spin = swirl_gain * mean_tangential * (radius * 1.5) / r_safe
-            # inside the sink the drain owns the flow, so this is assigned, not
-            # accumulated -- accumulating let the two terms drift apart
-            u[idx] = wp.clamp(nx * radial + tx * spin, -max_velocity, max_velocity)
-            v[idx] = wp.clamp(nz * radial + tz * spin, -max_velocity, max_velocity)
+            # Inside the sink the drain owns the flow, so this is assigned, not
+            # accumulated -- accumulating let the two terms drift apart.
+            # v0.15.0: velocity lives on faces, so the field is evaluated where
+            # each face actually is (half a cell east of the centre for u, half
+            # a cell north for v) instead of being written at the centre and
+            # silently shifted half a cell by the grid.
+            if i < width - 1:
+                face_u = _sink_velocity(dxc + 0.5 * dx, dzc, radius, strength,
+                                        h[idx], dry, mean_tangential, swirl_gain)
+                u[idx] = wp.clamp(face_u[0], -max_velocity, max_velocity)
+            if j < height - 1:
+                face_v = _sink_velocity(dxc, dzc + 0.5 * dx, radius, strength,
+                                        h[idx], dry, mean_tangential, swirl_gain)
+                v[idx] = wp.clamp(face_v[1], -max_velocity, max_velocity)
 
 
     @wp.kernel
@@ -818,28 +927,28 @@ if WARP_IMPORTED:
         t_up = temperature[idx]
         t_down = temperature[idx]
         if i < width - 1 and solid[idx + 1] == 0:
-            face = 0.5 * (u[idx] + u[idx + 1])
+            face = u[idx]
             if face >= 0.0:
                 q_right = _face_flux(face, old_h[idx], bed[idx], bed[idx + 1])
             else:
                 q_right = _face_flux(face, old_h[idx + 1], bed[idx + 1], bed[idx])
                 t_right = temperature[idx + 1]
         if i > 0 and solid[idx - 1] == 0:
-            face = 0.5 * (u[idx - 1] + u[idx])
+            face = u[idx - 1]
             if face >= 0.0:
                 q_left = _face_flux(face, old_h[idx - 1], bed[idx - 1], bed[idx])
                 t_left = temperature[idx - 1]
             else:
                 q_left = _face_flux(face, old_h[idx], bed[idx], bed[idx - 1])
         if j < height - 1 and solid[idx + width] == 0:
-            face = 0.5 * (v[idx] + v[idx + width])
+            face = v[idx]
             if face >= 0.0:
                 q_up = _face_flux(face, old_h[idx], bed[idx], bed[idx + width])
             else:
                 q_up = _face_flux(face, old_h[idx + width], bed[idx + width], bed[idx])
                 t_up = temperature[idx + width]
         if j > 0 and solid[idx - width] == 0:
-            face = 0.5 * (v[idx - width] + v[idx])
+            face = v[idx - width]
             if face >= 0.0:
                 q_down = _face_flux(face, old_h[idx - width], bed[idx - width], bed[idx])
                 t_down = temperature[idx - width]
@@ -914,13 +1023,6 @@ if WARP_IMPORTED:
             wp.atomic_add(added, 0, gain * area)
             h[idx] = h[idx] + gain
             temperature[idx] = temps[n]
-            r_safe = wp.max(r, radius * 0.25)
-            nx = dxc / r_safe
-            nz = dzc / r_safe
-            enclosed = strength * 3.14159265 * r_safe * r_safe * (
-                1.0 - r_safe * r_safe / (2.0 * radius * radius))
-            hf = wp.max(h[idx], dry)
-            radial = enclosed / (2.0 * 3.14159265 * r_safe * hf)
             # Deliberately NOT Froude-capped the way `_apply_river_inlet` caps
             # its edge velocity: that cap desynchronises mass from momentum here
             # -- `gain` above already added the full requested volume this
@@ -931,8 +1033,13 @@ if WARP_IMPORTED:
             # deep and 0.10 m/s in 30 s (a lake), not a flow. `max_velocity`
             # below is the same hard ceiling every other kernel in this file
             # already clamps to, which is what actually bounds a near-dry disc.
-            u[idx] = wp.clamp(nx * radial, -max_velocity, max_velocity)
-            v[idx] = wp.clamp(nz * radial, -max_velocity, max_velocity)
+            # v0.15.0: evaluated at each face's own position, as in `_apply_drains`
+            if i < width - 1:
+                face_u = _vent_velocity(dxc + 0.5 * dx, dzc, radius, strength, h[idx], dry)
+                u[idx] = wp.clamp(face_u[0], -max_velocity, max_velocity)
+            if j < height - 1:
+                face_v = _vent_velocity(dxc, dzc + 0.5 * dx, radius, strength, h[idx], dry)
+                v[idx] = wp.clamp(face_v[1], -max_velocity, max_velocity)
 
 
     @wp.kernel
@@ -1140,7 +1247,7 @@ if WARP_IMPORTED:
         j = idx // width
         if i != 1 or solid[idx] != 0 or inlet_q[j] <= 0.0 or solid[idx + 1] != 0:
             return
-        face = 0.5 * (u[idx] + u[idx + 1])
+        face = u[idx]
         if face >= 0.0:
             q = _face_flux(face, h[idx], bed[idx], bed[idx + 1])
         else:
@@ -1150,13 +1257,17 @@ if WARP_IMPORTED:
 
     @wp.kernel
     def _reduce_diagnostics(h: wp.array(dtype=float), u: wp.array(dtype=float),
-                            v: wp.array(dtype=float), solid: wp.array(dtype=wp.int32),
+                            v: wp.array(dtype=float), uc: wp.array(dtype=float),
+                            vc: wp.array(dtype=float), solid: wp.array(dtype=wp.int32),
                             gravity: float, area: float, dry: float,
                             stats: wp.array(dtype=float)):
         idx = wp.tid()
         if solid[idx] == 0:
             depth = wp.max(0.0, h[idx])
-            speed = wp.sqrt(u[idx] * u[idx] + v[idx] * v[idx])
+            # speed as a gauge would read it (cell centre); the CFL wave speed
+            # from this cell's own faces, which are what the time step must
+            # keep from crossing more than a cell
+            speed = wp.sqrt(uc[idx] * uc[idx] + vc[idx] * vc[idx])
             wave = wp.max(wp.abs(u[idx]), wp.abs(v[idx])) + wp.sqrt(gravity * depth)
             wp.atomic_max(stats, 0, depth)
             wp.atomic_max(stats, 1, speed)
@@ -1349,6 +1460,9 @@ class WarpShallowWaterSolver(FluidSolver):
         self._width = self._height = self._count = 0
         self._h = self._u = self._v = None
         self._next_h = self._next_u = self._next_v = None
+        # v0.15.0: `_u`/`_v` are FACE velocities (see `_velocity_step`); these
+        # are the cell-centred ones every "velocity at a cell" reader uses
+        self._uc = self._vc = None
         self._bed = self._obstacles = None
         # v0.6.0 RiverLab: the bed is split in two. `_bed_terrain` is the real,
         # erodible ground the solver now OWNS (erosion mutates it every tick, so
@@ -1492,6 +1606,8 @@ class WarpShallowWaterSolver(FluidSolver):
         self._next_h = wp.empty(self._count, dtype=float, device=self.device)
         self._next_u = wp.empty(self._count, dtype=float, device=self.device)
         self._next_v = wp.empty(self._count, dtype=float, device=self.device)
+        self._uc = wp.array(zeros, dtype=float, device=self.device)
+        self._vc = wp.array(zeros, dtype=float, device=self.device)
         self._bed_terrain = wp.array(self._bed_host, dtype=float, device=self.device)
         self._bed_offset_host = np.zeros(self._count, dtype=np.float32)
         self._bed_offset = wp.array(self._bed_offset_host, dtype=float, device=self.device)
@@ -1735,7 +1851,12 @@ class WarpShallowWaterSolver(FluidSolver):
                         mask[row * self._width + column] = 1
 
     def _remap_obstacles(self, new_mask: np.ndarray) -> None:
-        h, u, v = self._host_fields()
+        # face velocities, not `_host_fields()`'s centred ones: these are the
+        # state the next substep starts from. A face left touching a new wall
+        # is closed by `_velocity_step` on that substep regardless.
+        h = np.asarray(self._h.numpy(), dtype=np.float32)
+        u = np.asarray(self._u.numpy(), dtype=np.float32)
+        v = np.asarray(self._v.numpy(), dtype=np.float32)
         old_mask = self._obstacle_host
         newly_solid = np.flatnonzero((old_mask == 0) & (new_mask != 0))
         freed = (old_mask != 0) & (new_mask == 0)
@@ -1999,13 +2120,25 @@ class WarpShallowWaterSolver(FluidSolver):
             return np.zeros(0, dtype=np.float32)
         return np.asarray(self._bed_terrain.numpy(), dtype=np.float32)
 
+    def _update_centre_velocity(self) -> None:
+        wp.launch(_centre_velocity, dim=self._count,
+                  inputs=[self._h, self._u, self._v, self._bed, self._obstacles,
+                          self._inlet_q, self._uc, self._vc, self._width,
+                          self._height, config.FLUID_DRY_DEPTH,
+                          config.FLUID_MAX_VELOCITY], device=self.device)
+
     def _measure(self) -> None:
         if self._h is None:
             return
+        # also refreshes the centred field for anything read between frames --
+        # bodies, gauges, the velocity stream -- including after a probe or
+        # test has written the face arrays directly
+        self._update_centre_velocity()
         wp.launch(_clear_diagnostics, dim=1, inputs=[self._diag_stats],
                   device=self.device)
         wp.launch(_reduce_diagnostics, dim=self._count, inputs=[self._h, self._u,
-                  self._v, self._obstacles, float(self._world.environment.gravity),
+                  self._v, self._uc, self._vc, self._obstacles,
+                  float(self._world.environment.gravity),
                   float(self._terrain.cell_size ** 2), config.FLUID_DRY_DEPTH,
                   self._diag_stats], device=self.device)
         if self._inlet_enabled:
@@ -2131,13 +2264,14 @@ class WarpShallowWaterSolver(FluidSolver):
                           device=self.device)
                 self._temperature, self._next_temperature = (
                     self._next_temperature, self._temperature)
+            self._update_centre_velocity()
             if self._inlet_enabled:
                 # A local discharge inlet is the river's own boundary and takes
                 # over from the edge-level source, for the same reason a placed
                 # SOURCE does: one map, one answer to "where does the water come
                 # from". The level mode stays available and unchanged.
                 wp.launch(_apply_river_inlet, dim=self._count,
-                          inputs=[self._h, self._u, self._v, self._sediment,
+                          inputs=[self._h, self._uc, self._vc, self._sediment,
                                   self._obstacles,
                                   self._inlet_q, self._inlet_normal_depth,
                                   self._width, self._height,
@@ -2150,7 +2284,7 @@ class WarpShallowWaterSolver(FluidSolver):
                 # otherwise the map has two sources and "where does the water
                 # come from" stops having a single answer
                 wp.launch(_apply_source, dim=self._count, inputs=[self._h,
-                          self._bed, self._u, self._v, self._sediment,
+                          self._bed, self._uc, self._vc, self._sediment,
                           self._obstacles, self._width,
                           self._height, config.FLUID_SOURCE_COLUMNS,
                           self._level, area, config.SEDIMENT_CAPACITY_SCALE,
@@ -2190,7 +2324,7 @@ class WarpShallowWaterSolver(FluidSolver):
                 self._drain_circulation.zero_()
                 self._drain_samples.zero_()
                 wp.launch(_measure_drain_circulation, dim=self._count,
-                          inputs=[self._u, self._v, self._h, self._obstacles,
+                          inputs=[self._uc, self._vc, self._h, self._obstacles,
                                   self._drain_centres, self._drain_radii,
                                   self._drain_circulation, self._drain_samples,
                                   self._drain_count,
@@ -2273,6 +2407,10 @@ class WarpShallowWaterSolver(FluidSolver):
                                   max(1, config.FLUID_OUTFLOW_COLUMNS),
                                   float(level), area, self._diag_added],
                           device=self.device)
+            if self._drain_count or self._vent_count:
+                # drains and vents write faces; what reads the cell after them
+                # has to see the vortex or the eruption they just imposed
+                self._update_centre_velocity()
             if self._erosion_enabled:
                 # RiverLab (v0.6.0): pick material up where the flow is fast and
                 # deep, drop it where it slows, then carry the suspended load
@@ -2282,7 +2420,7 @@ class WarpShallowWaterSolver(FluidSolver):
                 # already feels the freshly cut channel -- that closed loop
                 # (flow -> erosion -> terrain -> flow) is the whole point.
                 wp.launch(_erode_deposit, dim=self._count,
-                          inputs=[self._h, self._u, self._v, self._bed_terrain,
+                          inputs=[self._h, self._uc, self._vc, self._bed_terrain,
                                   self._bed_offset, self._sediment, self._obstacles,
                                   self._next_sediment, dt,
                                   config.SEDIMENT_CAPACITY_SCALE,
@@ -2294,8 +2432,8 @@ class WarpShallowWaterSolver(FluidSolver):
                           device=self.device)
                 self._sediment, self._next_sediment = self._next_sediment, self._sediment
                 wp.launch(_advect_sediment, dim=self._count,
-                          inputs=[self._sediment, self._next_sediment, self._u,
-                                  self._v, self._h, self._obstacles, self._width,
+                          inputs=[self._sediment, self._next_sediment, self._uc,
+                                  self._vc, self._h, self._obstacles, self._width,
                                   self._height, float(self._terrain.cell_size), dt,
                                   config.FLUID_DRY_DEPTH], device=self.device)
                 self._sediment, self._next_sediment = self._next_sediment, self._sediment
@@ -2322,7 +2460,7 @@ class WarpShallowWaterSolver(FluidSolver):
                                   self._diag_solidified], device=self.device)
                 self._recombine_bed()
             wp.launch(_advect_flow_tracers, dim=config.FLOW_TRACER_COUNT,
-                      inputs=[self._flow_particles, self._h, self._u, self._v,
+                      inputs=[self._flow_particles, self._h, self._uc, self._vc,
                               self._bed, self._obstacles, self._width, self._height,
                               config.FLUID_SOURCE_COLUMNS,
                               float(self._terrain.cell_size), dt,
@@ -2374,8 +2512,8 @@ class WarpShallowWaterSolver(FluidSolver):
             empty = np.zeros(0, dtype=np.float32)
             return empty, empty, empty
         return (np.asarray(self._h.numpy(), dtype=np.float32),
-                np.asarray(self._u.numpy(), dtype=np.float32),
-                np.asarray(self._v.numpy(), dtype=np.float32))
+                np.asarray(self._uc.numpy(), dtype=np.float32),
+                np.asarray(self._vc.numpy(), dtype=np.float32))
 
     def sample_for_bodies(self, positions: np.ndarray, body_velocities=None,
                            drag=None, cross_area=None, body_height=None,
@@ -2418,7 +2556,11 @@ class WarpShallowWaterSolver(FluidSolver):
         self._body_drag.assign(drag)
         self._body_area.assign(cross_area)
         self._body_height.assign(body_height)
-        wp.launch(_sample_bodies, dim=count, inputs=[self._h, self._u, self._v,
+        # Refreshed here too, not only in `advance`: bodies are sampled from the
+        # CELL velocity, and anything that wrote the face arrays since the last
+        # substep (a probe, a test, a remap) would otherwise be read stale.
+        self._update_centre_velocity()
+        wp.launch(_sample_bodies, dim=count, inputs=[self._h, self._uc, self._vc,
                    self._bed, self._obstacles, self._body_positions,
                    self._body_rotations, self._body_extents, self._body_velocities,
                    self._body_drag, self._body_area, self._body_height,
@@ -2444,7 +2586,7 @@ class WarpShallowWaterSolver(FluidSolver):
                 and not self._inlet_enabled and self._edge_inflow_enabled):
             self._source_enabled = True
             wp.launch(_apply_source, dim=self._count, inputs=[self._h, self._bed,
-                      self._u, self._v, self._sediment,
+                      self._uc, self._vc, self._sediment,
                       self._obstacles, self._width, self._height,
                       config.FLUID_SOURCE_COLUMNS, level,
                       float(self._terrain.cell_size ** 2),

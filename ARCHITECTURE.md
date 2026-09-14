@@ -24,6 +24,19 @@ Grid 201x201 follows terrain vertices. Velocity and continuity use ping-pong War
 Outer faces and solid faces have zero normal flux; tangential edge velocity remains valid.
 Face discharge uses water above the maximum neighboring bed elevation.
 
+Since v0.15.0 the grid is STAGGERED (Arakawa C, `docs/15_cgrid_plan.md`): depth lives at
+the cell, `u` on the face to its east and `v` on the face to its north, and momentum is
+stepped on the face with the compact surface gradient `(eta_b - eta_a) / dx`. Until then
+all three shared one point, the gradient was central over two cells and transport used
+the average of two cell velocities -- both blind to a pattern alternating cell to cell,
+which therefore never decayed: it scoured alternate cells under erosion and reached 56%
+of the depth in rain films running into a channel. Cell-centred velocity (`_uc`, `_vc`)
+is derived as the discharge through the cell over its own depth, and is what sediment,
+tracers, bodies, gauges, drains and the browser read. Drains and vents write their
+imposed field on faces, evaluated at each face's own position. The open east edge feels
+the surface slope continued past the map and is capped at critical flow: a free
+overfall, not a normal-depth boundary.
+
 CFL diagnostics reduce max depth, speed, wave speed, volume and wet count to scalar GPU
 buffers. `FLUID_CFL=0.45` selects internal substeps; `FLUID_MAX_SUBSTEPS` is a guardrail.
 

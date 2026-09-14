@@ -326,7 +326,15 @@ class Physics04Tests(unittest.IsolatedAsyncioTestCase):
         u = np.zeros(count, dtype=np.float32)
         v = np.zeros(count, dtype=np.float32)
         center = col(0.0) * N + col(0.0)
-        depth[center], u[center], v[center] = 1.0, 3.0, 4.0
+        # v0.15.0: velocity lives on faces, and the cell velocity a gauge reads
+        # is the discharge through the cell over its depth -- so the water and
+        # both faces on each axis are set, a 3x3 patch at rest depth 1 m moving
+        # uniformly at (3, 4) m/s through the centre cell
+        for dj in (-1, 0, 1):
+            for di in (-1, 0, 1):
+                depth[center + dj * N + di] = 1.0
+        u[center - 1], u[center] = 3.0, 3.0
+        v[center - N], v[center] = 4.0, 4.0
         self.manager.fluid._h.assign(depth)
         self.manager.fluid._u.assign(u)
         self.manager.fluid._v.assign(v)
@@ -398,7 +406,11 @@ class Physics04Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(int(np.count_nonzero(self.manager.fluid._obstacle_host)), 25)
         self.assertEqual(float(depth[col(0.0), 10]), 0.0)  # house center
         self.assertGreater(float(depth[col(0.0) + 6, 10]), 0.01)  # flow around its side
-        self.assertEqual(float(depth[col(0.0), 13]), 0.0)  # no direct through-flow
+        # No direct through-flow: the cell in the lee is dry. Not `== 0.0` since
+        # v0.15.0 -- a face passes ANY positive depth (docs/15_cgrid_plan.md
+        # 6.6), so water wrapping round the corners leaves an exponentially small
+        # tail there (measured 1.6e-33 m). Through-flow would be tenths of a metre.
+        self.assertLessEqual(float(depth[col(0.0), 13]), config.FLUID_DRY_DEPTH)
 
     async def test_obstacle_move_remove_has_no_phantom_water(self) -> None:
         house = self.manager.apply_object_add({"type": "HOUSE", "position": [x_at(20), 0, 0]})
@@ -1220,8 +1232,20 @@ class BridgeAndPeopleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bridge_piers_speed_the_flow_up_between_them(self) -> None:
         """The educational payoff: a constriction accelerates the water. Same
-        rows, with and without the bridge."""
-        def speed(with_bridge: bool) -> float:
+        rows, with and without the bridge -- and, with the bridge, faster in the
+        gap than a few metres upstream, so the speed-up belongs to the piers
+        and not to the whole reach.
+
+        The factor was 1.2 against the collocated grid, which read 1.24; the
+        face grid (v0.15.0) reads 1.19. Neither is a reference: the piers block
+        3 of every 12 rows along the pier line, so continuity bounds the gap
+        speed-up at 1/(1 - 0.25) = 1.33 if no water went round, and the
+        collocated grid's section flux AT the piers came out 0.4% above the
+        upstream section's -- a scheme that does not conserve face by face is
+        not the one to calibrate a threshold against. 1.15 keeps the claim
+        (a clear speed-up, well inside the bound) without asserting a digit
+        of either scheme."""
+        def speeds(with_bridge: bool) -> tuple:
             manager = SimulationManager()
             if with_bridge:
                 manager.apply_object_add({"type": "BRIDGE", "position": [x_at(40), 0.0, 0.0]})
@@ -1229,13 +1253,20 @@ class BridgeAndPeopleTests(unittest.IsolatedAsyncioTestCase):
             manager.start()
             for _ in range(1500):
                 manager._step_once()
-            u = np.asarray(manager.fluid._u.numpy(), dtype=np.float32).reshape(N, N)
+            # cell-centred (v0.15.0): `_u` slot 40 is the face between columns
+            # 40 and 41, half a cell off the piers the rows are chosen against
+            u = np.asarray(manager.fluid._uc.numpy(), dtype=np.float32).reshape(N, N)
             centre = col(0.0)
-            out = float(np.abs(u[centre - 8:centre - 3, 40]).mean())
+            gap = float(np.abs(u[centre - 8:centre - 3, 40]).mean())
+            upstream = float(np.abs(u[centre - 8:centre - 3, 36]).mean())
             manager.stop()
-            return out
-        self.assertGreater(speed(True), speed(False) * 1.2,
-                           "the piers did not constrict the channel")
+            return gap, upstream
+        bridged, upstream = speeds(True)
+        plain, _ = speeds(False)
+        self.assertGreater(bridged, plain * 1.15,
+                           f"the piers did not constrict the channel: {bridged:.2f} vs {plain:.2f} m/s")
+        self.assertGreater(bridged, upstream,
+                           f"the gap is no faster than upstream: {bridged:.2f} vs {upstream:.2f} m/s")
 
     async def test_a_flooded_deck_is_reported_once_and_only_when_reached(self) -> None:
         """A deck matters exactly once -- when the river reaches it. That is a
@@ -1378,8 +1409,10 @@ class VelocityStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(count, N * N)
         # the frame carries (u, 0, v) per cell, in terrain-vertex order
         streamed = values.reshape(N * N, 3)
-        u = np.asarray(self.manager.fluid._u.numpy(), dtype=np.float32)
-        v = np.asarray(self.manager.fluid._v.numpy(), dtype=np.float32)
+        # v0.15.0: `_u`/`_v` are face velocities; the stream carries the
+        # cell-centred field, which is what a per-vertex flow map needs
+        u = np.asarray(self.manager.fluid._uc.numpy(), dtype=np.float32)
+        v = np.asarray(self.manager.fluid._vc.numpy(), dtype=np.float32)
         np.testing.assert_allclose(streamed[:, 0], u, atol=1e-6)
         np.testing.assert_allclose(streamed[:, 2], v, atol=1e-6)
         np.testing.assert_allclose(streamed[:, 1], 0.0, atol=1e-6)
@@ -1758,11 +1791,19 @@ class RiverBoundaryTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_inlet_delivers_the_discharge_it_was_asked_for(self) -> None:
         """Q is the control, so the number that matters is the one crossing the
         face -- measured the way the depth step transports it, not as u*h at the
-        edge cell, which returns the request by construction whatever happens."""
+        edge cell, which returns the request by construction whatever happens.
+
+        Read at 30 s, not 10. The channel is primed with water at rest, and on
+        the face grid (v0.15.0) a river at rest accelerates on its own slope
+        rather than being carried along by the average of its neighbours'
+        velocities: measured at this face, 11.36 m3/s at 10 s, 11.65 at 30 s,
+        11.78 at 60 s (the collocated grid read 11.74 / 11.53 / 11.62). The
+        claim is about the discharge the inlet delivers, not how fast a river
+        starting from rest gets up to speed."""
         self._valley(discharge=12.0)
         self.manager.start()
         self._prime(0.79)
-        self._run(10.0)
+        self._run(30.0)
         measured = self.manager.fluid.diagnostics()["inlet_discharge_m3s"]
         self.assertAlmostEqual(measured, 12.0, delta=0.6,
                                msg=f"asked for 12 m3/s, delivered {measured:.2f}")
@@ -1899,14 +1940,23 @@ class RiverBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_closed_part_of_the_edge_is_a_wall(self) -> None:
         """The other half of that claim, with no lateral spreading to hide it:
-        put the water only outside the band and nothing may leave at all."""
+        put the water only outside the band and nothing may leave at all.
+
+        v0.15.0: "no lateral spreading" is now built, not assumed. On the face
+        grid water beside a dry band runs into it within the two seconds and
+        leaves through the open part -- 0.0037 m3 of it, measured -- which is
+        correct and says nothing about the wall. A ridge along both sides of the
+        band keeps the water out of it, so anything that leaves can only have
+        gone through the closed part of the edge."""
         self.manager.apply_water_level(0.0)
         self.manager.apply_river_outlet({"width_m": 20.0})
         self.manager.start()
-        self.manager.fluid._source_enabled = False
         lo, hi = self.manager.fluid.diagnostics()["outflow_rows"]
+        self.manager.world.terrain.heights[[lo - 1, hi + 1], :] = 5.0
+        self.manager.terrain_revision += 1      # uploaded on the next tick
+        self.manager.fluid._source_enabled = False
         depth = np.full((N, N), 1.0, dtype=np.float32)
-        depth[lo:hi + 1, :] = 0.0
+        depth[lo - 1:hi + 2, :] = 0.0
         self.manager.fluid._h.assign(depth.ravel())
         self.manager.fluid._u.assign(np.full(N * N, 1.0, dtype=np.float32))
         self._run(2.0)
