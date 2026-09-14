@@ -3,7 +3,8 @@ import { WorldStore } from './world/WorldStore';
 import { EditorController } from './editor/EditorController';
 import { BackendClient } from './net/BackendClient';
 import { UI } from './ui/UI';
-import type { WorldData } from './world/types';
+import type { OutletKind, WorldData } from './world/types';
+import type { EdgeWaterMode } from './scene/EdgeSkirt';
 import './style.css';
 
 // Backend runs on the same host/port that serves this page.
@@ -11,6 +12,26 @@ const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hos
 
 const store = new WorldStore();
 let currentSimStatus = 'IDLE';
+// The tsunami wavemaker closes the outlet during a pulse, but the sea past
+// that edge is there all the same; the stream alone cannot say so.
+let tsunamiWorld = false;
+
+/**
+ * What the drawn-only skirt past the map edge should do with water (v0.16.0).
+ * East: only across an edge the solver treats as open; a "river" outlet runs
+ * on at its depth, anything else (sea, pool) holds its level. West: a river
+ * inlet arrives from upstream at its depth, a held edge inflow is a level.
+ * North/south are walls in the solver; only a coast's sea runs on past them.
+ */
+function edgeWaterModes(eastOpen: boolean, kind: OutletKind | undefined,
+                        inlet: boolean, edgeInflow: boolean, lava: boolean) {
+  if (lava) return { east: null, west: null, sides: null };
+  const east = eastOpen || tsunamiWorld ? (kind === 'river' ? 'depth' : 'level') : null;
+  const west = inlet ? 'depth' : edgeInflow ? 'level' : null;
+  const sides = tsunamiWorld ? 'level' : null;
+  return { east, west, sides } as
+    { east: EdgeWaterMode; west: EdgeWaterMode; sides: EdgeWaterMode };
+}
 
 const canvas = document.createElement('canvas');
 canvas.id = 'viewport';
@@ -37,6 +58,12 @@ const net = new BackendClient(wsUrl, {
     ui.setSimStats(state);
     // the streaks draw what the solver applies, never the slider position
     sceneManager.setRain(state.fluid?.rain_mm_h ?? 0, state.status === 'RUNNING');
+    const fluid = state.fluid;
+    if (fluid && fluid.outflow_columns !== undefined) {
+      const modes = edgeWaterModes(fluid.outflow_columns > 0, fluid.outlet_kind,
+        fluid.inlet_enabled ?? false, fluid.edge_inflow ?? false, fluid.lava_enabled ?? false);
+      sceneManager.setEdgeWater(modes.east, modes.west, modes.sides);
+    }
     store.applyGaugeStates(state.gauges ?? [], state.gauge_history_capacity ?? 600);
     for (const moved of state.moved_objects) {
       store.updateObject(moved.id,
@@ -137,6 +164,10 @@ function applyWorld(world: WorldData, simStatus: string): void {
   editor.terrainEditingEnabled = simStatus !== 'RUNNING';
   store.replaceWorld(world);
   sceneManager.rebuildTerrain(store.terrain);
+  tsunamiWorld = world.water.tsunami_enabled ?? false;
+  const modes = edgeWaterModes(world.water.outflow_enabled ?? true, world.water.outlet_kind,
+    world.water.inlet_enabled ?? false, world.water.edge_inflow_enabled ?? true, false);
+  sceneManager.setEdgeWater(modes.east, modes.west, modes.sides);
   sceneManager.setWater(store.waterLevel, store.waterVisible);
   sceneManager.clearTracers();
   ui.setReservoirLevel(store.waterLevel);

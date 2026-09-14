@@ -39,7 +39,8 @@ if WARP_IMPORTED:
                        gravity: float, dry: float, manning: wp.array(dtype=float),
                        friction_min_depth: float,
                        max_velocity: float, outflow_columns: int,
-                       outflow_row_lo: int, outflow_row_hi: int):
+                       outflow_row_lo: int, outflow_row_hi: int,
+                       outlet_normal: int, outlet_slope: wp.array(dtype=float)):
         """Local-inertial momentum at cell FACES (v0.15.0, docs/15_cgrid_plan.md).
 
         `u[idx]` is the velocity on the face between cell idx and idx+1, and
@@ -125,9 +126,23 @@ if WARP_IMPORTED:
                 # drawdown. The collocated outlet this replaced had the opposite
                 # fault -- it held 4.3 m of still water in the last two columns,
                 # a dam at the map edge (docs/15_cgrid_plan.md).
+                #
+                # v0.16.0, outlet_kind "river": the ghost cell instead holds the
+                # last cell's DEPTH on a bed that keeps falling at the channel's
+                # own slope (fitted over config.OUTLET_SLOPE_REACH_M), so the
+                # face feels exactly that slope. Gravity along the bed against
+                # Manning friction is uniform flow, and the depth at the edge
+                # settles at normal depth instead of drawing down to critical.
+                # A row whose bed does not fall toward the edge has no normal
+                # depth to run at and keeps the overfall.
                 eta_last = bed[idx] + h[idx]
                 eta_prev = bed[idx - 1] + h[idx - 1]
-                ux = u[idx] + gravity * dt * (eta_prev - eta_last) / dx
+                drive = float(0.0)
+                if outlet_normal != 0 and outlet_slope[j] > 0.0:
+                    drive = outlet_slope[j]
+                else:
+                    drive = (eta_prev - eta_last) / dx
+                ux = u[idx] + gravity * dt * drive
                 cross = v[idx]
                 if j > 0:
                     cross = 0.5 * (cross + v[idx - width])
@@ -1169,6 +1184,15 @@ if WARP_IMPORTED:
                     particles[n] = wp.vec3(nx, bed[next_idx] + h[next_idx] + 0.08, nz)
                 else:
                     particles[n] = wp.vec3(p.x, bed[idx] + h[idx] + 0.08, p.z)
+            else:
+                # Carried off the map: the tracer is gone, and the respawn
+                # rules below pick it up next frame. This branch used to be
+                # missing, so a tracer whose next step crossed the outer ring
+                # was never moved again and never counted as dead -- every one
+                # that reached the river outlet stopped in the last column, and
+                # 36 000 of them drew a white dotted line across the river at
+                # the map edge (v0.16.0, once the river visibly ran on past it).
+                particles[n] = wp.vec3(float(width) * dx, -100.0, p.z)
         elif lava_active != 0:
             # VolcanoLab v0.14.0: a dead tracer respawns at the vent's own
             # disc, not the west edge -- the pre-existing respawn rule below
@@ -1485,6 +1509,11 @@ class WarpShallowWaterSolver(FluidSolver):
         # the 0.8.0 behaviour exactly -- outlet across the whole east edge, no
         # river inlet -- so every world that predates this is unaffected.
         self._outflow_rows = (0, 0)
+        # v0.16.0: what lies beyond the open edge (config.OUTLET_KINDS) and, for
+        # a "river", the bed slope per row it continues at
+        self._outlet_kind = "overfall"
+        self._outlet_slope = None
+        self._outlet_slope_host = np.zeros(0, dtype=np.float32)
         self._inlet_enabled = False
         self._inlet_q = self._inlet_normal_depth = None
         self._inlet_q_host = np.zeros(0, dtype=np.float32)
@@ -1572,6 +1601,7 @@ class WarpShallowWaterSolver(FluidSolver):
         self._count = self._width * self._height
         bed_grid = np.ascontiguousarray(world.terrain.heights, dtype=np.float32)
         self._bed_host = bed_grid.ravel().copy()
+        self._measure_outlet_slope(bed_grid, float(world.terrain.cell_size))
         depth_grid = np.zeros_like(bed_grid, dtype=np.float32)
         source_columns = min(config.FLUID_SOURCE_COLUMNS, self._width)
         water = getattr(world, "water", None)
@@ -1699,7 +1729,8 @@ class WarpShallowWaterSolver(FluidSolver):
                 config.FLUID_OUTFLOW_COLUMNS
                 if bool(getattr(water, "outflow_enabled", True)) else 0,
                 float(getattr(water, "outlet_centre_z", 0.0)),
-                float(getattr(water, "outlet_width_m", 0.0)))
+                float(getattr(water, "outlet_width_m", 0.0)),
+                str(getattr(water, "outlet_kind", "overfall")))
         self._recombine_bed()
         self._measure()
         self._volume_at_start = float(self._diag["volume_m3"])
@@ -1902,6 +1933,7 @@ class WarpShallowWaterSolver(FluidSolver):
         if terrain_revision != self._seen_terrain_revision:
             self._bed_host = np.ascontiguousarray(terrain.heights, dtype=np.float32).ravel().copy()
             self._bed_terrain = wp.array(self._bed_host, dtype=float, device=self.device)
+            self._measure_outlet_slope(terrain.heights, float(terrain.cell_size))
             self._seen_terrain_revision = terrain_revision
             self.terrain_gpu_uploads += 1
             changed = True
@@ -1922,8 +1954,29 @@ class WarpShallowWaterSolver(FluidSolver):
             self._recombine_bed()
             self._measure()
 
+    def _measure_outlet_slope(self, heights, cell: float) -> None:
+        """Per row, the bed slope falling toward the east edge (positive = down).
+
+        A least-squares fit over config.OUTLET_SLOPE_REACH_M of terrain next to
+        the edge -- the terrain, not `_bed`, so a rock dome does not tilt the
+        river beyond the map. Measured rather than carried from terrain_gen's
+        `slope` parameter so a brushed or loaded valley gets its own slope too.
+        Refreshed on every terrain revision; erosion during a run does not move
+        it, which is deliberate: the river past the map is not being eroded.
+        """
+        grid = np.asarray(heights, dtype=np.float64).reshape(self._height, self._width)
+        reach = max(1, min(self._width - 2,
+                           int(round(config.OUTLET_SLOPE_REACH_M / max(cell, 1e-6)))))
+        tail = grid[:, self._width - 1 - reach:]
+        x = np.arange(reach + 1, dtype=np.float64) * cell
+        x -= x.mean()
+        slope = -((tail - tail.mean(axis=1, keepdims=True)) @ x) / float(x @ x)
+        self._outlet_slope_host = slope.astype(np.float32)
+        self._outlet_slope = wp.array(self._outlet_slope_host, dtype=float,
+                                      device=self.device)
+
     def set_outflow(self, columns: int, centre_z: float = 0.0,
-                    width_m: float = 0.0) -> None:
+                    width_m: float = 0.0, kind: str = "overfall") -> None:
         """Width, in cells, of the transmissive outlet on the east edge.
 
         Zero restores the fully closed domain of 0.7.0 -- which is what the
@@ -1947,6 +2000,10 @@ class WarpShallowWaterSolver(FluidSolver):
         """
         if getattr(self, "_tsunami_enabled", False):
             columns = 0
+            # between pulses the edge opens as an outlet onto the SEA, which a
+            # "river" outlet on the sloping sea bed would drain
+            kind = "overfall"
+        self._outlet_kind = kind if kind in config.OUTLET_KINDS else "overfall"
         self._outflow_columns = max(0, int(columns))
         if width_m <= 0.0 or self._height <= 0:
             self._outflow_rows = (0, max(0, self._height - 1))
@@ -2238,7 +2295,9 @@ class WarpShallowWaterSolver(FluidSolver):
                       config.FLUID_DRY_DEPTH, self._manning,
                       config.FLUID_FRICTION_MIN_DEPTH,
                       config.FLUID_MAX_VELOCITY, self._outflow_columns,
-                      self._outflow_rows[0], self._outflow_rows[1]],
+                      self._outflow_rows[0], self._outflow_rows[1],
+                      1 if self._outlet_kind == "river" else 0,
+                      self._outlet_slope],
                       device=self.device)
             self._u, self._next_u = self._next_u, self._u
             self._v, self._next_v = self._next_v, self._v
@@ -2686,6 +2745,7 @@ class WarpShallowWaterSolver(FluidSolver):
                 "inlet_enabled": self._inlet_enabled,
                 "inlet_request_m3s": self._inlet_request["discharge_m3s"],
                 "outflow_rows": list(self._outflow_rows),
+                "outlet_kind": self._outlet_kind,
                 # RainLab-1: what is actually being applied -- 0 in a lava world
                 # whatever the slider says, so the UI never claims rain it is not
                 # delivering

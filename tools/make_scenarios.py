@@ -165,6 +165,7 @@ def build_river(world: WorldState) -> Dict[str, Any]:
     water.inlet_centre_z = 0.0
     water.inlet_width_m = 12.0
     water.inlet_discharge_m3s = 12.0
+    water.outlet_kind = "river"         # the river runs on past the map edge
     return river
 
 
@@ -175,6 +176,7 @@ def build_dam(world: WorldState) -> Dict[str, Any]:
     water.visible = True
     water.erosion_enabled = False
     water.outflow_enabled = True
+    water.outlet_kind = "river"         # below the dam it is the same valley
     water.inlet_enabled = True
     water.inlet_centre_z = 0.0
     water.inlet_width_m = 12.0

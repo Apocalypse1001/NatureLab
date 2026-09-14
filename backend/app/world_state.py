@@ -366,6 +366,12 @@ def rain_intensity(value: Any, name: str = "water.rain_intensity_mm_h") -> float
     return rate
 
 
+def outlet_kind(value: Any, name: str = "water.outlet_kind") -> str:
+    if value not in config.OUTLET_KINDS:
+        raise ValueError(f"{name} must be one of {config.OUTLET_KINDS}")
+    return str(value)
+
+
 @dataclass
 class WaterState:
     level: float = 0.5          # meters above terrain datum
@@ -389,6 +395,10 @@ class WaterState:
     inlet_discharge_m3s: float = 12.0  # prescribed Q -- the level is the answer
     outlet_centre_z: float = 0.0
     outlet_width_m: float = 0.0      # 0 = the whole edge, as before v0.12.0
+    # v0.16.0: what lies beyond the open edge -- "overfall" (a sea or a pool;
+    # every world before this) or "river" (the channel runs on at its own bed
+    # slope). See config.OUTLET_KINDS for why neither can be the other.
+    outlet_kind: str = "overfall"
     # TsunamiLab (docs/13_tsunami2_plan.md). A per-tick BOUNDARY, unlike the
     # one-shot seed this replaced in v0.14.1: the east edge is held at the sea
     # level outside the map, an N-shape in time -- the sea withdraws, then
@@ -451,6 +461,7 @@ class WaterState:
                 "inlet_discharge_m3s": self.inlet_discharge_m3s,
                 "outlet_centre_z": self.outlet_centre_z,
                 "outlet_width_m": self.outlet_width_m,
+                "outlet_kind": self.outlet_kind,
                 "tsunami_enabled": self.tsunami_enabled,
                 "tsunami_amplitude_m": self.tsunami_amplitude_m,
                 "tsunami_period_s": self.tsunami_period_s,
@@ -551,6 +562,7 @@ class WorldState:
                                           "water.outlet_centre_z"),
             outlet_width_m=finite_number(water.get("outlet_width_m", 0.0),
                                          "water.outlet_width_m"),
+            outlet_kind=outlet_kind(water.get("outlet_kind", "overfall")),
             tsunami_enabled=bool(water.get("tsunami_enabled", False)),
             tsunami_amplitude_m=finite_number(water.get("tsunami_amplitude_m", 6.0),
                                               "water.tsunami_amplitude_m"),

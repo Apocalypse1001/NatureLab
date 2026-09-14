@@ -33,6 +33,9 @@ export interface TerrainData {
   heights: number[];    // (width+1) * (height+1), row-major, z rows
 }
 
+/** Beyond the open east edge: a sea or pool (free overfall), or a river running on. */
+export type OutletKind = 'overfall' | 'river';
+
 export interface WorldData {
   version: number;
   terrain: TerrainData;
@@ -42,9 +45,12 @@ export interface WorldData {
            // to be able to put its own numbers back on the controls
            inlet_enabled?: boolean; inlet_width_m?: number;
            inlet_discharge_m3s?: number; outlet_width_m?: number;
+           // v0.16.0: what lies beyond the open east edge
+           outlet_kind?: OutletKind;
            // RainLab-1 (docs/14_rain_plan.md): rain in mm/h (= L/m² per hour),
            // and whether the west edge holds its inflow level at all
-           rain_intensity_mm_h?: number; edge_inflow_enabled?: boolean };
+           rain_intensity_mm_h?: number; edge_inflow_enabled?: boolean;
+           tsunami_enabled?: boolean };
   environment: { gravity: number; wind: number[]; temperature: number };
   objects: ObjectData[];
 }
@@ -75,6 +81,7 @@ export interface SimStateMessage {
             wet_cells?: number; volume_m3?: number; cfl_dt?: number;
             max_depth?: number; max_velocity?: number;
             erosion?: boolean; outflow_columns?: number; cfl_limited?: boolean;
+            outlet_kind?: OutletKind; lava_enabled?: boolean;
             // v0.12.0 river boundaries and their volume ledger
             inlet_enabled?: boolean; inlet_request_m3s?: number;
             inlet_discharge_m3s?: number; added_m3?: number; removed_m3?: number;

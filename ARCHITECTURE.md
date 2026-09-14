@@ -37,6 +37,12 @@ imposed field on faces, evaluated at each face's own position. The open east edg
 the surface slope continued past the map and is capped at critical flow: a free
 overfall, not a normal-depth boundary.
 
+Since v0.16.0 the world says what lies past that edge (`WaterState.outlet_kind`): the
+free overfall ("overfall", default -- a sea or a pool, which it does not drain) or a
+river running on ("river": the edge face feels the bed slope fitted over the last
+`OUTLET_SLOPE_REACH_M` of terrain, so the edge settles at normal depth). The frontend
+draws terrain and water past the map in `EdgeSkirt.ts`; nothing there is simulated.
+
 CFL diagnostics reduce max depth, speed, wave speed, volume and wet count to scalar GPU
 buffers. `FLUID_CFL=0.45` selects internal substeps; `FLUID_MAX_SUBSTEPS` is a guardrail.
 

@@ -9,6 +9,7 @@ import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { TerrainGrid } from '../world/TerrainGrid';
 import { RainField } from './RainField';
+import { EdgeSkirt, type EdgeWaterMode } from './EdgeSkirt';
 import { applyTransform, buildObjectMesh } from '../world/ObjectFactory';
 import type { ObjectData } from '../world/types';
 
@@ -62,6 +63,8 @@ export class SceneManager {
   private rain = new RainField();
   private rainRunning = false;
   private lastRenderMs = performance.now();
+  // v0.16.0: terrain and water continued past the map edge, drawn only
+  private edgeSkirt: EdgeSkirt;
 
   constructor(canvas: HTMLCanvasElement, private terrain: TerrainGrid) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -169,6 +172,10 @@ export class SceneManager {
     this.waterMesh.rotation.x = -Math.PI / 2;
     this.waterMesh.frustumCulled = false;
     this.scene.add(this.waterMesh);
+
+    this.edgeSkirt = new EdgeSkirt(this.groundTexture, this.buildWaterMaterial());
+    this.edgeSkirt.rebuild(this.terrain);
+    this.scene.add(this.edgeSkirt.group);
 
     // particle points buffer (filled from backend binary frames)
     const positions = new Float32Array(1024 * 3);
@@ -294,6 +301,20 @@ export class SceneManager {
     }
     pos.needsUpdate = true;
     geo.computeVertexNormals();
+    this.edgeSkirt.rebuild(terrain);
+    // The helper grid sits at y = 0.05, i.e. under the ground of any map whose
+    // terrain stays above it and on top of the ground of a flat one -- but
+    // floating on the SEA of a coast, where the tsunami world showed it as a
+    // black mesh of 10 m lines over the whole sea (measured: hiding it was the
+    // only change that removed them). Where the ground dips below it, hide it.
+    let lowest = Infinity;
+    for (let i = 0; i < terrain.heights.length; i++) lowest = Math.min(lowest, terrain.heights[i]);
+    this.gridHelper.visible = lowest >= this.gridHelper.position.y - 0.05;
+  }
+
+  /** What the water does past the east outlet, the west inflow and the north/south walls. */
+  setEdgeWater(east: EdgeWaterMode, west: EdgeWaterMode, sides: EdgeWaterMode): void {
+    this.edgeSkirt.setWaterModes(east, west, sides);
   }
 
   /**
@@ -664,6 +685,8 @@ export class SceneManager {
     for (let i = 0; i < pos.count; i++) pos.setZ(i, level);
     pos.needsUpdate = true;
     this.waterMesh.geometry.setDrawRange(0, 0);
+    this.edgeSkirt.setWaterVisible(visible);
+    this.edgeSkirt.clearWater();
   }
 
   setWaterHeights(heights: Float32Array, count: number): boolean {
@@ -693,6 +716,7 @@ export class SceneManager {
     this.waterMesh.geometry.index!.needsUpdate = true;
     this.waterMesh.geometry.setDrawRange(0, used);
     this.waterMesh.geometry.computeVertexNormals();
+    this.edgeSkirt.updateWater(heights, this.waterFlow);
     return true;
   }
 

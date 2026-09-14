@@ -163,10 +163,19 @@ class SimulationManager:
                 "discharge_m3s": water.inlet_discharge_m3s}
 
     def apply_river_outlet(self, fields: Dict[str, Any]) -> Dict[str, Any]:
-        """Narrow the east-edge outlet to a band, or (width 0) open it fully."""
+        """Narrow the east-edge outlet to a band, or (width 0) open it fully.
+
+        `kind` says what lies beyond the edge: "overfall" (a sea or a pool, the
+        default) or "river" (the channel continues at its bed slope) -- see
+        config.OUTLET_KINDS.
+        """
         water = self.world.water
         for key, value in fields.items():
-            if key == "centre_z":
+            if key == "kind":
+                if value not in config.OUTLET_KINDS:
+                    raise ValueError(f"outlet.kind must be one of {config.OUTLET_KINDS}")
+                water.outlet_kind = str(value)
+            elif key == "centre_z":
                 water.outlet_centre_z = finite_number(value, "outlet.centre_z")
             elif key == "width_m":
                 width = finite_number(value, "outlet.width_m")
@@ -175,7 +184,8 @@ class SimulationManager:
                 water.outlet_width_m = width
             else:
                 raise ValueError(f"unknown outlet field: {key!r}")
-        return {"centre_z": water.outlet_centre_z, "width_m": water.outlet_width_m}
+        return {"centre_z": water.outlet_centre_z, "width_m": water.outlet_width_m,
+                "kind": water.outlet_kind}
 
     def apply_rain(self, fields: Dict[str, Any]) -> Dict[str, Any]:
         """RainLab-1: uniform rain over the map, in mm/h (= L/m2 per hour).
@@ -437,7 +447,7 @@ class SimulationManager:
             water = self.world.water
             self.fluid.set_outflow(
                 config.FLUID_OUTFLOW_COLUMNS if water.outflow_enabled else 0,
-                water.outlet_centre_z, water.outlet_width_m)
+                water.outlet_centre_z, water.outlet_width_m, water.outlet_kind)
         if hasattr(self.fluid, "set_river_inlet"):
             # Read live like every other water control, so the discharge can be
             # changed while RUNNING -- which is the whole shape of the flood

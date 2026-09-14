@@ -1788,6 +1788,83 @@ class RiverBoundaryTests(unittest.IsolatedAsyncioTestCase):
     def _depth(self) -> np.ndarray:
         return np.asarray(self.manager.fluid._h.numpy(), dtype=np.float32).reshape(N, N)
 
+    def _edge_profile(self, kind: str, seconds: float = 240.0) -> tuple:
+        """Centreline depth mid-reach and at the edge, and Froude at the edge.
+
+        From dry, not primed: the drawdown toward an overfall is what a person
+        watching the River scenario sees, and it only exists once the river
+        has actually reached the edge and is running off it."""
+        self._valley(discharge=12.0, outlet_width=0.0)
+        self.manager.apply_river_outlet({"kind": kind})
+        self.manager.start()
+        self._run(seconds)
+        h = self._depth()[N // 2]
+        u = np.asarray(self.manager.fluid._uc.numpy(), dtype=np.float32).reshape(N, N)[N // 2]
+        edge = N - 1
+        froude = abs(float(u[edge])) / math.sqrt(9.81 * float(h[edge]))
+        return float(h[N // 2]), float(h[edge]), froude
+
+    async def test_a_river_outlet_runs_on_at_normal_depth(self) -> None:
+        """v0.16.0: the user saw the river "run into the end of the map". On an
+        overfall it draws itself down toward the brink (the next test); a river
+        running on past the map keeps its depth to the edge. Measured, 12 m3/s
+        at 240 s: 0.708 m mid-reach, 0.701 m at the edge, Froude 0.43."""
+        mid, edge, froude = self._edge_profile("river")
+        self.assertGreater(edge, 0.95 * mid, msg=f"mid {mid:.3f} m, edge {edge:.3f} m")
+        self.assertLess(froude, 0.6, msg=f"Froude at the edge {froude:.2f}")
+        self.assertEqual(self.manager.fluid.diagnostics()["outlet_kind"], "river")
+
+    async def test_an_overfall_outlet_draws_the_river_down_to_the_brink(self) -> None:
+        """The default outlet, unchanged: a free overfall. Measured, 12 m3/s at
+        240 s: 0.661 m mid-reach, 0.438 m at the edge, Froude 0.95. This is the
+        right edge for a sea or a pool and the wrong one for a river, which is
+        why the world chooses (config.OUTLET_KINDS)."""
+        mid, edge, froude = self._edge_profile("overfall")
+        self.assertLess(edge, 0.75 * mid, msg=f"mid {mid:.3f} m, edge {edge:.3f} m")
+        self.assertGreater(froude, 0.8, msg=f"Froude at the edge {froude:.2f}")
+
+    async def test_flow_tracers_carried_off_the_map_do_not_pile_up_at_the_edge(self) -> None:
+        """A tracer whose next step crossed the outer ring used to be neither
+        moved nor counted dead, so it stayed in the last column for good.
+        Measured on v0.15.0, 12 m3/s: from 150 s on, 1973 of the 2715 visible
+        tracers sat in column 199 -- a white dotted line across the river right
+        where v0.16.0 draws it running on past the map. With the fix none stay
+        there; the clump leaves and respawns at the inlet."""
+        self._valley(discharge=12.0, outlet_width=0.0)
+        self.manager.apply_river_outlet({"kind": "river"})
+        self.manager.start()
+        self._run(180.0)
+        tracers = self.manager.fluid.get_flow_particles()
+        visible = tracers[tracers[:, 1] > -50.0]
+        cell = self.manager.world.terrain.cell_size
+        column = np.round(visible[:, 0] / cell + (N - 1) * 0.5).astype(int)
+        at_edge = int(np.count_nonzero(column >= N - 3))
+        self.assertGreater(len(visible), 0)
+        self.assertLess(at_edge, 0.05 * len(visible),
+                        msg=f"{at_edge} of {len(visible)} visible tracers at the edge")
+
+    async def test_the_outlet_kind_is_part_of_the_world(self) -> None:
+        self.assertEqual(self.manager.world.water.outlet_kind, "overfall")
+        state = self.manager.apply_river_outlet({"kind": "river"})
+        self.assertEqual(state["kind"], "river")
+        restored = WorldState.from_dict(self.manager.world.to_dict())
+        self.assertEqual(restored.water.outlet_kind, "river")
+        with self.assertRaises(ValueError):
+            self.manager.apply_river_outlet({"kind": "waterfall"})
+        broken = self.manager.world.to_dict()
+        broken["water"]["outlet_kind"] = "waterfall"
+        with self.assertRaises(ValueError):
+            WorldState.from_dict(broken)
+
+    async def test_a_tsunami_edge_is_never_a_river_outlet(self) -> None:
+        """Between pulses the tsunami edge opens onto the SEA; a "river" outlet
+        on the sloping sea bed would drain it."""
+        self.manager.world.water.tsunami_enabled = True
+        self.manager.world.water.outlet_kind = "river"
+        self.manager.start()
+        self._run(0.1)
+        self.assertEqual(self.manager.fluid.diagnostics()["outlet_kind"], "overfall")
+
     async def test_the_inlet_delivers_the_discharge_it_was_asked_for(self) -> None:
         """Q is the control, so the number that matters is the one crossing the
         face -- measured the way the depth step transports it, not as u*h at the

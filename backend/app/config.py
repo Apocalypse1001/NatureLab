@@ -118,6 +118,20 @@ TERRAIN_RESYNC_INTERVAL_S = 1.0  # how often eroded terrain is re-broadcast whil
 # off the edge of the domain is exactly this boundary condition.
 FLUID_OUTFLOW_COLUMNS = 2
 
+# v0.16.0: what lies beyond that open edge, per world (`WaterState.outlet_kind`).
+# One local boundary cannot be right for both (docs/15_cgrid_plan.md 6.2):
+# - "overfall": the surface slope of the last two cells is continued past the
+#   edge, capped at critical flow -- a free overfall. Right for a sea or a pool,
+#   which it does not drain; a river draws itself down toward the brink.
+# - "river": the channel continues past the map at its own bed slope, so the
+#   edge face feels that slope -- a normal-depth boundary. Right for a river;
+#   it would drain a sea standing on a sloping bed, so it is never the default.
+OUTLET_KINDS = ("overfall", "river")
+# The bed slope a "river" outlet continues is fitted over this much of the map
+# next to the edge, not read from the last two cells, so a rock dome or a brush
+# stroke at the edge does not set the slope of the river beyond it.
+OUTLET_SLOPE_REACH_M = 20.0
+
 # A placed DRAIN removes water through a smooth radial sink and spins the flow
 # around it. The spin is NOT a constant: it comes from the ambient circulation
 # the drain measures in the annulus just outside itself, amplified as 1/r by

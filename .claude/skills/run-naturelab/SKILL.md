@@ -193,6 +193,11 @@ Writes `releases/NatureLab_v<version>.zip` (frontend `dist/` included, `.git`/
   {"op":"rain","fields":{"intensity_mm_h":50}}`, plus `send
   {"op":"edge_inflow","enabled":false}` for a rain-only map. The applied rate is streamed
   as `fluid.rain_mm_h` / `rain_m3s`; the streaks are `__NL.sceneManager.rain.lines`.
+- **What lies past the open east edge is a per-world choice (v0.16.0).** `send
+  {"op":"river_outlet","fields":{"kind":"river"}}` makes the edge a normal-depth boundary
+  (the River and Dam scenarios ship with it); `"overfall"` (default) is the free overfall
+  a sea or pool needs. Live in `fluid.outlet_kind`. The terrain and water drawn PAST the
+  map are `frontend/src/scene/EdgeSkirt.ts` -- drawn only, so never read physics off them.
 - **The edge inflow respects terrain.** A hill touching the west edge stays dry if it is
   taller than the level you set — `_apply_source` computes `max(0, level − bed)` per cell.
   This is a fix relative to the pre-0.5.1 solver, which clamped the whole column and

@@ -1,7 +1,7 @@
 /** HUD: top bar, object palette, properties panel, terrain/water controls,
  *  debug strip. Pure DOM — no framework, easy to extend. */
 import { OBJECT_TYPES, type GaugeSample, type GaugeState, type ObjectData,
-  type ObjectType, type SimEvent, type WorldData } from '../world/types';
+  type ObjectType, type OutletKind, type SimEvent, type WorldData } from '../world/types';
 
 export interface UICallbacks {
   play(): void;
@@ -24,7 +24,7 @@ export interface UICallbacks {
   generateRiver(params: { slope: number; bed_width: number; incision: number }): void;
   setRiverInlet(fields: { enabled?: boolean; width_m?: number;
                           discharge_m3s?: number }): void;
-  setRiverOutlet(fields: { width_m?: number }): void;
+  setRiverOutlet(fields: { width_m?: number; kind?: OutletKind }): void;
   setRain(fields: { intensity_mm_h: number }): void;
   setEdgeInflow(enabled: boolean): void;
   loadScenario(name: string): void;
@@ -270,6 +270,18 @@ export class UI {
       this.cb.setRiverOutlet({ width_m: parseFloat(outletWidth.value) });
     };
     flow.append(outletWidth);
+    // v0.16.0: one local edge cannot be right for both a river running on and
+    // a sea it would drain, so the world says which it is. "Sea or pool" is the
+    // free overfall every world had before; a river on it draws itself down
+    // toward the brink as if it ran off a waterfall.
+    flow.insertAdjacentHTML('beforeend', '<label>Beyond the downstream edge</label>');
+    const outletKind = el('select', '') as HTMLSelectElement;
+    outletKind.id = 'river-outlet-kind';
+    outletKind.innerHTML = '<option value="overfall">sea or pool (free overfall)</option>'
+      + '<option value="river">the river runs on</option>';
+    outletKind.onchange = () =>
+      this.cb.setRiverOutlet({ kind: outletKind.value as OutletKind });
+    flow.append(outletKind);
     panel.append(flow);
 
     const erosionRow = el('label', 'slider-row', 'Erosion (river reshapes the bed)');
@@ -531,6 +543,8 @@ export class UI {
     put('#river-discharge', '#river-q-out', water.inlet_discharge_m3s);
     put('#river-inlet-width', '#river-inlet-w-out', water.inlet_width_m);
     put('#river-outlet-width', '#river-outlet-w-out', water.outlet_width_m);
+    const kind = this.root.querySelector<HTMLSelectElement>('#river-outlet-kind');
+    if (kind) kind.value = water.outlet_kind ?? 'overfall';
   }
 
   /** Put a loaded world's rain and edge-inflow settings back on the controls. */
