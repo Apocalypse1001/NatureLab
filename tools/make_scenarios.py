@@ -72,6 +72,12 @@ SEWER_ROUTES = (
 SEWER_HOLLOW_RADIUS = 3.0
 SEWER_HOLLOW_DEPTH = 0.25
 SEWER_RAIN_MM_H = 50.0
+# 150 mm, the usual gully connection. Measured on the graded scene at 50 mm/h
+# (docs/probe_sewer_v1.py crossfall_d150): the pipe behind the north row runs
+# full (11.2 of 11.2 L/s) from 300 s and a pond grows over its grate (28 cm at
+# 600 s); the east pipe carries 8 of 20.8 L/s all along; the west one nears
+# full around 420 s. At 200 mm (24-45 L/s) none of the three ran full in 600 s.
+SEWER_PIPE_DIAMETER_M = 0.15
 
 
 def seat(world: WorldState, obj_type: str, x: float, z: float,
@@ -185,12 +191,36 @@ def build_river(world: WorldState) -> Dict[str, Any]:
     return river
 
 
+SEWER_GRADE_RADIUS = 12.0
+SEWER_GRADE_DEPTH = 0.25
+
+
+def grade_sewer_catchment(world: WorldState, radius: float = SEWER_GRADE_RADIUS,
+                          depth: float = SEWER_GRADE_DEPTH) -> None:
+    """Grade the ground toward every inlet as a street would be: a straight
+    fall of depth/radius (2% at the defaults) from `radius` out down to the
+    grate. A cone, not the cosine brush, whose slope vanishes at the grate
+    and at the rim -- exactly where the water has to keep moving."""
+    t = world.terrain
+    js, is_ = np.mgrid[0:t.heights.shape[0], 0:t.heights.shape[1]]
+    for route in SEWER_ROUTES:
+        x, z = route[0]
+        d = np.hypot(is_ - (x / t.cell_size + t.width / 2),
+                     js - (z / t.cell_size + t.height / 2)) * t.cell_size
+        t.heights[:, :] = (t.heights - depth * np.clip(1.0 - d / radius, 0.0, 1.0)).astype(t.heights.dtype)
+
+
 def build_sewer(world: WorldState) -> Dict[str, Any]:
     """The River scenario's valley in the rain, with hollows dug for the inlets."""
     river = build_river(world)
     for route in SEWER_ROUTES:
         x, z = route[0]
         world.terrain.brush(x, z, SEWER_HOLLOW_RADIUS, -SEWER_HOLLOW_DEPTH)
+    # Measured with docs/probe_sewer_v1.py at 50 mm/h: the valley alone falls
+    # along the river, not toward the grates, so at 60 s each took 1 L/s and
+    # was still climbing at 600 s (8 / 5 / 11 L/s). Graded 2% toward them,
+    # they take 6-7 L/s within the first minute.
+    grade_sewer_catchment(world)
     world.water.rain_intensity_mm_h = SEWER_RAIN_MM_H
     return river
 
@@ -205,7 +235,7 @@ def build_sewer_town(world: WorldState) -> Dict[str, int]:
         pipe.metadata.update({
             "points": [[float(x), float(world.terrain.height_at(x, z)), float(z)]
                        for x, z in route],
-            "diameter_m": 0.2, "from_id": inlet.id, "to_id": outfall.id})
+            "diameter_m": SEWER_PIPE_DIAMETER_M, "from_id": inlet.id, "to_id": outfall.id})
     counts["storm inlet"] = counts["outfall"] = counts["pipe"] = len(SEWER_ROUTES)
     return counts
 

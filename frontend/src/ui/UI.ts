@@ -52,11 +52,12 @@ const SCENARIOS: { name: string; label: string; hint: string }[] = [
         + 'Take Q to the top of the slider and the channel goes bankfull -- '
         + 'about 13 cm of water in the street after some three minutes' },
   { name: 'scenario_sewer', label: 'Sewer',
-    hint: 'The river town in the rain, with a storm sewer: three street inlets '
-        + 'piped down to the river. Water gathers at each grate and goes down it, '
-        + 'runs along the pipe and pours out of the outfall into the river. Click '
-        + 'a pipe to see its flow against what it can carry; raise the rain and '
-        + 'watch it fill; lay your own with "Lay pipe"' },
+    hint: 'The river town in a downpour, with a storm sewer: three street inlets '
+        + 'on 150 mm pipes down to the river. Water runs to each grate, goes down '
+        + 'it and pours out of the outfall into the river. Click a pipe to see its '
+        + 'flow against what it can carry. After about five minutes the pipe behind '
+        + 'the north row runs full and a pond grows over its grate (a faster speed '
+        + 'gets there sooner); lay a wider one with "Lay pipe"' },
   { name: 'scenario_dam', label: 'Dam',
     hint: 'The same town below a dam. At the discharge it ships with, the '
         + 'spillway carries the river and the dam holds. Push Q past about 60 '
