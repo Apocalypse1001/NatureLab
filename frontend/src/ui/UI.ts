@@ -27,7 +27,8 @@ export interface UICallbacks {
   extendPipe(id: string): void;
   updatePipe(id: string, diameterM: number): void;
   setBrush(radius: number, strength: number): void;
-  generateRiver(params: { slope: number; bed_width: number; incision: number }): void;
+  generateRiver(params: { slope: number; bed_width: number; incision: number;
+                          meander_amplitude: number; meander_wavelength: number }): void;
   setRiverInlet(fields: { enabled?: boolean; width_m?: number;
                           discharge_m3s?: number; hydrograph?: Partial<Hydrograph> }): void;
   setRiverOutlet(fields: { width_m?: number; kind?: OutletKind }): void;
@@ -539,6 +540,29 @@ export class UI {
     incision.type = 'range'; incision.min = '0.5'; incision.max = '6.0';
     incision.step = '0.5'; incision.value = '2.0';
     river.append(incision);
+    // v0.18.0: a winding channel by default. The inlet and outlet bands follow
+    // the channel to where it crosses the map edges (terrain_gen.river_valley);
+    // the prepared scenarios keep their straight river, their towns line it.
+    river.insertAdjacentHTML('beforeend',
+      '<label>Meander swing <output id="river-meander-out">20</output> m (0 = straight)</label>');
+    const meander = el('input', '') as HTMLInputElement;
+    meander.id = 'river-meander';
+    meander.type = 'range'; meander.min = '0'; meander.max = '40';
+    meander.step = '2'; meander.value = '20';
+    river.append(meander);
+    river.insertAdjacentHTML('beforeend',
+      '<label>Meander length <output id="river-wave-out">120</output> m</label>');
+    const wave = el('input', '') as HTMLInputElement;
+    wave.id = 'river-meander-length';
+    wave.type = 'range'; wave.min = '60'; wave.max = '300';
+    wave.step = '10'; wave.value = '120';
+    river.append(wave);
+    meander.oninput = () => {
+      this.root.querySelector('#river-meander-out')!.textContent = meander.value;
+    };
+    wave.oninput = () => {
+      this.root.querySelector('#river-wave-out')!.textContent = wave.value;
+    };
     slope.oninput = () => {
       this.root.querySelector('#river-slope-out')!.textContent = slope.value;
     };
@@ -553,6 +577,8 @@ export class UI {
       slope: parseFloat(slope.value) / 100,      // the control is in percent
       bed_width: parseFloat(width.value),
       incision: parseFloat(incision.value),
+      meander_amplitude: parseFloat(meander.value),
+      meander_wavelength: parseFloat(wave.value),
     }));
     generate.id = 'river-generate';
     panel.append(generate);

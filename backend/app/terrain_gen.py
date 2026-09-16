@@ -135,6 +135,12 @@ def river_valley(terrain, params: Dict[str, Any] | None = None) -> Dict[str, flo
     # full: that control prescribes a surface elevation at the west columns, so
     # it is measured from the *inlet* bed, not the outlet's.
     p["inlet_level"] = p["inlet_bed"] + p["operating_depth"]
+    # v0.18.0: where the channel crosses each edge, in world z. A meander moves
+    # it off the map's centreline -- by 17 m at the west edge for 20 m of swing
+    # on a 120 m wavelength -- and an inlet band left at z = 0 would pour the
+    # river onto the floodplain. apply_terrain_river moves the bands here.
+    p["inlet_centre_z"] = float(centre[0] - centre_z)
+    p["outlet_centre_z"] = float(centre[-1] - centre_z)
     return p
 
 

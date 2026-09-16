@@ -1695,6 +1695,58 @@ class RiverValleyTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(np.all(np.diff(centre) < 0.0),
                             "the channel bottom stopped falling downstream")
 
+    async def test_a_meander_moves_the_inlet_and_outlet_bands_onto_the_channel(self) -> None:
+        """v0.18.0: the channel crosses the east edge 17.3 m off the map's
+        centreline for 20 m of swing on a 120 m wavelength. The bands must go
+        where the channel is, or the outlet drains the floodplain."""
+        state = self.manager.apply_terrain_river({"meander_amplitude": 20.0,
+                                                   "meander_wavelength": 120.0})
+        water = self.manager.world.water
+        heights = self.manager.world.terrain.heights
+        cell = self.manager.world.terrain.cell_size
+        for column, centre in ((0, water.inlet_centre_z), (-1, water.outlet_centre_z)):
+            # the middle of the flat bottom, not argmin's first row of it
+            bottom = np.flatnonzero(heights[:, column] <= heights[:, column].min() + 1e-4)
+            middle = (0.5 * (bottom[0] + bottom[-1]) - (N - 1) * 0.5) * cell
+            self.assertAlmostEqual(centre, middle, delta=1.0 * cell)
+        self.assertAlmostEqual(water.outlet_centre_z, -17.32, delta=0.01)
+        self.assertEqual(state["water"]["outlet_centre_z"], water.outlet_centre_z)
+        self.manager.apply_terrain_river({})
+        self.assertEqual((water.inlet_centre_z, water.outlet_centre_z), (0.0, 0.0))
+
+    async def test_a_winding_river_carries_its_discharge_and_keeps_to_its_bed(self) -> None:
+        """Measured (docs/probe_meander_v1.py, 20 m swing, 120 m wavelength, Q 12,
+        300-305 s): gauging lines at five stations read 12.00-12.05 m3/s, no
+        cell outside the channel is wet, the deepest water is 0.88 m against the
+        straight channel's 0.73 -- the bends."""
+        m = self.manager
+        info = m.apply_terrain_river({"meander_amplitude": 20.0, "meander_wavelength": 120.0})["river"]
+        m.apply_water_level(0.0)
+        m.apply_river_inlet({"enabled": True, "width_m": 12.0, "discharge_m3s": 12.0})
+        m.apply_river_outlet({"width_m": 20.0, "kind": "river"})
+        lines = {}
+        for x in (-40.0, 80.0):
+            oid = m.apply_object_add({"type": "SECTION", "position": [x, 0.0, 0.0]})["id"]
+            m.apply_object_update(oid, {"metadata": {"section_width_m": 120.0}})
+            lines[x] = oid
+        m.start()
+        bed = m.fluid.get_terrain_heights().reshape(N, N)
+        m.fluid._h.assign(np.maximum(bed.min(axis=0)[None, :] + 0.7 - bed, 0.0)
+                          .astype(np.float32).ravel())
+        for _ in range(240 * 60):
+            m._step_once()
+        state = {s["id"]: s["latest"] for s in m.section_state()}
+        for x, oid in lines.items():
+            self.assertAlmostEqual(state[oid]["flow_m3s"], 12.0, delta=0.03 * 12.0,
+                                   msg=f"line at x = {x}: {state[oid]}")
+        cell = m.world.terrain.cell_size
+        xs = np.arange(N) * cell
+        zs = (np.arange(N) - (N - 1) * 0.5) * cell
+        centre = 20.0 * np.sin(2.0 * np.pi * xs / 120.0)
+        outside = np.abs(zs[:, None] - centre[None, :]) > info["bed_width"] * 0.5 + info["bank_run"]
+        h = np.asarray(m.fluid._h.numpy()).reshape(N, N)
+        self.assertEqual(int(((h > 0.01) & outside).sum()), 0)
+
     async def test_bad_parameters_are_refused_and_the_terrain_is_left_alone(self) -> None:
         before = self.manager.world.terrain.heights.copy()
         for bad in ({"slope": 0.5}, {"bed_width": 0.0}, {"incision": -1.0},

@@ -475,9 +475,15 @@ class SimulationManager:
             raise ValueError("terrain editing is disabled while simulation is RUNNING")
         effective = river_valley(self.world.terrain, params)
         self.terrain_revision += 1
+        # v0.18.0: keep the river's inlet and outlet bands on the channel, which
+        # a meander moves off z = 0 at the edges (terrain_gen.river_valley)
+        self.world.water.inlet_centre_z = effective["inlet_centre_z"]
+        self.world.water.outlet_centre_z = effective["outlet_centre_z"]
         return {"heights": self.world.terrain.to_list(),
                 "checksum": self.world.terrain.checksum(),
-                "river": effective}
+                "river": effective,
+                "water": {"inlet_centre_z": effective["inlet_centre_z"],
+                          "outlet_centre_z": effective["outlet_centre_z"]}}
 
     def apply_terrain_volcano(self, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """Replace the terrain with a generated volcano cone (v0.13.0)."""
