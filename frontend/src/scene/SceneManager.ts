@@ -1014,6 +1014,19 @@ export class SceneManager {
     return null;
   }
 
+  /** Every object under the pointer, nearest first, each id once. */
+  pickObjectIds(ndc: THREE.Vector2): string[] {
+    this.raycaster.setFromCamera(ndc, this.camera);
+    const ids: string[] = [];
+    for (const hit of this.raycaster.intersectObjects(this.objectsRoot.children, true)) {
+      let node: THREE.Object3D | null = hit.object;
+      while (node && !node.userData.objectId) node = node.parent;
+      const id = node?.userData.objectId as string | undefined;
+      if (id && !ids.includes(id)) ids.push(id);
+    }
+    return ids;
+  }
+
   /** Raycast the terrain surface. */
   pickTerrain(ndc: THREE.Vector2): THREE.Vector3 | null {
     this.raycaster.setFromCamera(ndc, this.camera);

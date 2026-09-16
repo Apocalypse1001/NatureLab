@@ -399,6 +399,63 @@ try {
   assert(laid.buried === 0, `${laid.buried} of ${laid.samples} pipe samples under the terrain`);
   report('Lay pipe: two clicks and Enter lay a pipe on the ground');
 
+  // v0.18.0 Sewer-2: a chain through a manhole, laid by clicking. The first
+  // pipe must END on the manhole when it is clicked (not place an outfall
+  // there), and the second must START from it; the network then carries the
+  // first grate's water through both.
+  await page.evaluate(() => window.__NL.net.send({ op: 'object_add',
+    object: { type: 'MANHOLE',
+              position: [-60, window.__NL.store.terrain.heightAt(-60, 20), 20] } }));
+  await waitFor(() => page.evaluate(() =>
+    [...window.__NL.store.objects.values()].some((o) => o.type === 'MANHOLE')));
+  await page.evaluate(() => {
+    const sm = window.__NL.sceneManager;
+    sm.controls.target.set(-60, window.__NL.store.terrain.heightAt(-60, 22), 22);
+    sm.camera.position.set(-45, 28, 48);
+    sm.controls.update();
+    window.__NL.store.select(null);
+  });
+  await sleep(1500);
+  const screenOf = (points) => page.evaluate((pts) => {
+    const sm = window.__NL.sceneManager;
+    const terrain = window.__NL.store.terrain;
+    sm.camera.updateMatrixWorld();
+    const rect = sm.renderer.domElement.getBoundingClientRect();
+    return pts.map(([x, z]) => {
+      const p = sm.camera.position.clone().set(x, terrain.heightAt(x, z) + 0.1, z).project(sm.camera);
+      return [rect.x + (p.x + 1) / 2 * rect.width, rect.y + (1 - p.y) / 2 * rect.height];
+    });
+  }, points);
+  const pipeCount = () => page.evaluate(() =>
+    [...window.__NL.store.objects.values()].filter((o) => o.type === 'PIPE').length);
+  const before = await pipeCount();
+  const [top, hole, bank] = await screenOf([[-60, 40], [-60, 20], [-60, 6]]);
+  await page.click('#lay-pipe');
+  await page.mouse.click(...top); await sleep(150);
+  await page.mouse.click(...hole);            // clicking the manhole ends the pipe there
+  await waitFor(async () => (await pipeCount()) === before + 1, 10_000);
+  await page.click('#lay-pipe');
+  await page.mouse.click(...hole); await sleep(150);   // and starts the next one
+  await page.mouse.click(...bank); await sleep(150);
+  await page.keyboard.press('Enter');
+  await waitFor(async () => (await pipeCount()) === before + 2, 10_000);
+  const chain = await page.evaluate(() => {
+    const { store, ui } = window.__NL;
+    const manhole = [...store.objects.values()].find((o) => o.type === 'MANHOLE');
+    const links = ui.sewerLinks;
+    const into = links.find((l) => l.to_id === manhole.id);
+    const out = links.find((l) => l.from_id === manhole.id);
+    return { into, out, grate: into && store.objects.get(into.from_id)?.type };
+  });
+  assert(chain.into && chain.out, `chain not joined at the manhole: ${JSON.stringify(chain)}`);
+  assert(chain.grate === 'STORM_INLET' && chain.out.to_type === 'OUTFALL',
+    `chain runs ${chain.grate} -> MANHOLE -> ${chain.out.to_type}`);
+  assert(chain.into.status === 'ok' && chain.out.status === 'ok',
+    `chain status ${chain.into.status} / ${chain.out.status}`);
+  assert(chain.out.upstream_inlets.includes(chain.into.from_id),
+    'the pipe out of the manhole does not carry the first grate');
+  report('Lay pipe: a chain through a manhole, joined by clicking it');
+
   assert(errors.length === 0, errors.join('\n'));
   report('no browser errors');
   // read the version off the running backend rather than hard-coding it, so

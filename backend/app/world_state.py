@@ -56,6 +56,7 @@ class ObjectType(str, enum.Enum):
     STORM_INLET = "STORM_INLET"
     OUTFALL = "OUTFALL"
     PIPE = "PIPE"
+    MANHOLE = "MANHOLE"      # v0.18.0 Sewer-2: where pipes join
 
     @classmethod
     def register(cls, name: str) -> "ObjectType":
@@ -212,6 +213,11 @@ OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
                          "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
                          "is_static": True,
                          "outfall_radius": config.OUTFALL_RADIUS_M,
+                         "foundation_height": 0.0, "damage_resistance": 1.0},
+    ObjectType.MANHOLE: {"mass": 1.0, "friction": 0.0, "buoyancy": 0.0,
+                         "volume_m3": 1.0, "drag_coefficient": 1.0,
+                         "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
+                         "is_static": True,
                          "foundation_height": 0.0, "damage_resistance": 1.0},
     ObjectType.PIPE: {"mass": 1.0, "friction": 0.0, "buoyancy": 0.0,
                       "volume_m3": 1.0, "drag_coefficient": 1.0,

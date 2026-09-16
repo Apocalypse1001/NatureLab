@@ -691,7 +691,7 @@ if WARP_IMPORTED:
                       dry: float, swirl_gain: float, max_velocity: float,
                       area: float, removed_total: wp.array(dtype=float),
                       removed_each: wp.array(dtype=float), take_dregs: int,
-                      impose_flow: int):
+                      impose_flow: int, measure_only: int):
         """Remove water through a localized sink and spin up the flow around it.
 
         v0.17.0: the same kernel runs the storm sewer's inlets. `removed_each`
@@ -709,6 +709,14 @@ if WARP_IMPORTED:
         funnel set the face between them to ~0 every substep -- and the grate
         took 13.1 L/s through a pipe rated 20.8. Without it, the depression the
         removal digs is what draws the water in, down the real slope.
+
+        `measure_only` = 1 books into `removed_each` what each sink WOULD take
+        at these strengths and changes nothing. v0.18.0 runs it with every
+        grate at its whole path's capacity, to learn what the grates want
+        before a shared pipe is split between them: splitting by what they
+        took instead feeds back on itself, because a sink allowed less takes
+        less at the same depth (measured: the west grate held 5 cm and took
+        15.8 of 20.8 L/s).
 
         Removal uses a smooth radial profile and is capped by the water actually
         present, so a drain can never pull a cell below zero or invent negative
@@ -760,6 +768,9 @@ if WARP_IMPORTED:
             # smooth bell, so the sink has no hard rim for the scheme to ring on
             ratio = r / radius
             falloff = 1.0 - ratio * ratio
+            if measure_only != 0:
+                wp.atomic_add(removed_each, n, wp.min(h[idx], strength * falloff * dt) * area)
+                continue
             removed = wp.min(h[idx], strength * falloff * dt)
             h[idx] = h[idx] - removed
             wp.atomic_add(removed_total, 0, removed * area)
@@ -1637,6 +1648,8 @@ class WarpShallowWaterSolver(FluidSolver):
         self._inlet_flow_m3s: list = []
         self._inlet_capacity_m3s: list = []
         self._diag_sewer_in = self._diag_sewer_out = None
+        self._inlet_demand_frame = None
+        self._inlet_demand_m3s = []
         self._sewer_in_m3 = self._sewer_out_m3 = 0.0
         # VolcanoLab (v0.13.0). Lava mode is DERIVED from whether any VENT is
         # placed, the same way a placed SOURCE takes over from the edge inflow
@@ -1767,6 +1780,8 @@ class WarpShallowWaterSolver(FluidSolver):
         self._inlet_count = self._outfall_count = 0
         self._inlet_frame = None
         self._inlet_flow_m3s = []
+        self._inlet_demand_frame = None
+        self._inlet_demand_m3s = []
         self._inlet_capacity_m3s = []
         self._solidified_m3 = 0.0
         # VolcanoLab (v0.13.0). Manning friction defaults to the constant every
@@ -2254,12 +2269,15 @@ class WarpShallowWaterSolver(FluidSolver):
             inside &= self._obstacle_host.reshape(height, width)[jj, ii] == 0
         return float(np.sum((1.0 - (r / radius) ** 2)[inside])) * dx * dx
 
-    def set_sewer(self, inlets: list, outfalls: list) -> None:
+    def set_sewer(self, inlets: list, outfalls: list, measure_demand: bool = False) -> None:
         """v0.17.0 storm sewer, from backend/app/sewer.py's `resolve`.
 
-        `inlets` is (centre_xyz, radius_m, capacity_m3s, outfall_index) and
-        `outfalls` is (centre_xyz, radius_m), read live every tick like
-        SOURCE/DRAIN so any of them can be moved while RUNNING.
+        `inlets` is (centre_xyz, radius_m, capacity_m3s, outfall_index[,
+        path_capacity_m3s]) and `outfalls` is (centre_xyz, radius_m), read live
+        every tick like SOURCE/DRAIN so any of them can be moved while RUNNING.
+        `measure_demand` (v0.18.0, only when grates share a pipe) also books
+        per frame what each grate would take at its path capacity, into
+        `sewer_inlet_demand_m3s`.
 
         An inlet's sink strength is chosen so that, with water to spare, the
         disc takes exactly its pipe's capacity: strength = Q / (area * sum of
@@ -2288,14 +2306,17 @@ class WarpShallowWaterSolver(FluidSolver):
         self._outfall_count = len(outfalls)
         self._inlet_capacity_m3s = []
         if inlets:
-            radii, strengths, targets = [], [], []
-            for centre, radius, capacity, target in inlets:
+            radii, strengths, targets, path_strengths = [], [], [], []
+            for row in inlets:
+                centre, radius, capacity, target = row[:4]
+                path = row[4] if len(row) > 4 else capacity
                 r = max(float(radius), floor_radius)
                 if target < 0 or target >= len(outfalls) or not usable[target]:
-                    capacity, target = 0.0, -1
+                    capacity, path, target = 0.0, 0.0, -1
                 weight = self._sink_weight(centre, r, dx)
                 radii.append(r)
                 strengths.append(float(capacity) / weight if weight > 0.0 else 0.0)
+                path_strengths.append(float(path) / weight if weight > 0.0 else 0.0)
                 targets.append(int(target))
                 self._inlet_capacity_m3s.append(float(capacity))
             self._inlet_centres = wp.array(
@@ -2307,6 +2328,16 @@ class WarpShallowWaterSolver(FluidSolver):
                                              dtype=float, device=self.device)
             self._inlet_targets = wp.array(np.array(targets, dtype=np.int32),
                                            dtype=wp.int32, device=self.device)
+            self._inlet_path_strengths = wp.array(np.array(path_strengths, dtype=np.float32),
+                                                  dtype=float, device=self.device)
+            if not measure_demand:
+                self._inlet_demand_frame = None
+                self._inlet_demand_m3s = []
+            elif (rebuilt or self._inlet_demand_frame is None
+                  or len(self._inlet_demand_frame) != len(inlets)):
+                self._inlet_demand_frame = wp.zeros(len(inlets), dtype=float, device=self.device)
+                self._inlet_demand_scratch = wp.zeros(1, dtype=float, device=self.device)
+                self._inlet_demand_m3s = []
             if rebuilt or self._inlet_frame is None:
                 self._inlet_circulation = wp.zeros(len(inlets), dtype=float, device=self.device)
                 self._inlet_samples = wp.zeros(len(inlets), dtype=float, device=self.device)
@@ -2316,6 +2347,9 @@ class WarpShallowWaterSolver(FluidSolver):
         elif rebuilt:
             self._inlet_frame = None
             self._inlet_flow_m3s = []
+        if not inlets:
+            self._inlet_demand_frame = None
+            self._inlet_demand_m3s = []
         if outfalls:
             self._outfall_centres = wp.array(
                 np.array([item[0] for item in outfalls], dtype=np.float32),
@@ -2612,7 +2646,7 @@ class WarpShallowWaterSolver(FluidSolver):
                                   float(self._terrain.cell_size), dt,
                                   config.FLUID_DRY_DEPTH, config.DRAIN_SWIRL_GAIN,
                                   config.FLUID_MAX_VELOCITY, area,
-                                  self._diag_removed, self._drain_removed_each, 1, 1],
+                                  self._diag_removed, self._drain_removed_each, 1, 1, 0],
                           device=self.device)
             if self._inlet_count and not self._lava_enabled:
                 # v0.17.0 storm sewer (backend/app/sewer.py): inlets take water
@@ -2624,6 +2658,22 @@ class WarpShallowWaterSolver(FluidSolver):
                 # Removal only (impose_flow = 0): the circulation arrays are
                 # passed but never read, so they are not measured either.
                 self._inlet_step.zero_()
+                if self._inlet_demand_frame is not None:
+                    # v0.18.0: what every grate would take at its whole path's
+                    # capacity, before anything is taken -- the demand a shared
+                    # pipe is split by on the next tick (backend/app/sewer.py)
+                    wp.launch(_apply_drains, dim=self._count,
+                              inputs=[self._h, self._u, self._v, self._obstacles,
+                                      self._inlet_centres, self._inlet_radii,
+                                      self._inlet_path_strengths, self._inlet_circulation,
+                                      self._inlet_samples,
+                                      self._inlet_count, self._width, self._height,
+                                      float(self._terrain.cell_size), dt,
+                                      config.FLUID_DRY_DEPTH, config.DRAIN_SWIRL_GAIN,
+                                      config.FLUID_MAX_VELOCITY, area,
+                                      self._inlet_demand_scratch, self._inlet_demand_frame,
+                                      0, 0, 1],
+                              device=self.device)
                 wp.launch(_apply_drains, dim=self._count,
                           inputs=[self._h, self._u, self._v, self._obstacles,
                                   self._inlet_centres, self._inlet_radii,
@@ -2633,7 +2683,7 @@ class WarpShallowWaterSolver(FluidSolver):
                                   float(self._terrain.cell_size), dt,
                                   config.FLUID_DRY_DEPTH, config.DRAIN_SWIRL_GAIN,
                                   config.FLUID_MAX_VELOCITY, area,
-                                  self._diag_sewer_in, self._inlet_step, 0, 0],
+                                  self._diag_sewer_in, self._inlet_step, 0, 0, 0],
                           device=self.device)
                 if self._outfall_count:
                     self._outfall_volume.zero_()
@@ -2833,6 +2883,10 @@ class WarpShallowWaterSolver(FluidSolver):
                 span = max(float(getattr(self, "_frame_dt", 0.0)), 1.0e-9)
                 self._inlet_flow_m3s = (frame / span).tolist()
                 self._inlet_frame.zero_()
+                if self._inlet_demand_frame is not None:
+                    demand = np.asarray(self._inlet_demand_frame.numpy(), dtype=np.float64)
+                    self._inlet_demand_m3s = (demand / span).tolist()
+                    self._inlet_demand_frame.zero_()
 
     def _host_fields(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self._h is None:
@@ -3013,6 +3067,7 @@ class WarpShallowWaterSolver(FluidSolver):
                 "sewer_out_m3": self._sewer_out_m3,
                 "sewer_inlet_flow_m3s": list(self._inlet_flow_m3s),
                 "sewer_inlet_capacity_m3s": list(self._inlet_capacity_m3s),
+                "sewer_inlet_demand_m3s": list(self._inlet_demand_m3s),
                 "sediment_out_m3": self._sediment_out_m3,
                 "lava_enabled": self._lava_enabled,
                 "vents": self._vent_count,

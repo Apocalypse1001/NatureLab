@@ -175,7 +175,7 @@ class RigidStateBuffer:
         return self.volumes / np.maximum(self.ground_areas, 1.0e-6)
 
 
-NON_COLLIDING_TYPES = frozenset({"GAUGE", "STORM_INLET", "OUTFALL", "PIPE"})
+NON_COLLIDING_TYPES = frozenset({"GAUGE", "STORM_INLET", "OUTFALL", "MANHOLE", "PIPE"})
 
 
 def footprint_half_extents(obj: WorldObject) -> np.ndarray:

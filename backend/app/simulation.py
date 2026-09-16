@@ -134,27 +134,39 @@ class SimulationManager:
                     fresh: bool = False) -> List[Dict[str, Any]]:
         """Per PIPE: what it can carry, what it is carrying, and why not.
 
-        Flow is what its inlet actually took over the last frame. Resolved
-        fresh when nothing has run yet, so a pipe laid at IDLE already reports
-        its capacity (or that it runs uphill) before PLAY -- and after every
-        pipe edit (`fresh`): otherwise a pipe laid while RUNNING was missing
-        from its own reply until the next tick re-resolved the network.
+        Flow is what the grates above it actually took over the last frame --
+        for a trunk, the sum over every grate whose chain runs through it.
+        Resolved fresh when nothing has run yet, so a pipe laid at IDLE already
+        reports its capacity (or that it runs uphill) before PLAY -- and after
+        every pipe edit (`fresh`): otherwise a pipe laid while RUNNING was
+        missing from its own reply until the next tick re-resolved the network.
         """
         if fluid is None:
             fluid = self.fluid.diagnostics()
-        if fresh or not getattr(self, "_sewer_links", None) or self.status == self.IDLE:
-            _inlets, _outfalls, links, inlet_ids = sewer.resolve(self.world)
-            self._sewer_links, self._sewer_inlet_ids = links, inlet_ids
-        flows = fluid.get("sewer_inlet_flow_m3s", []) or []
-        row = {oid: k for k, oid in enumerate(self._sewer_inlet_ids)}
+        if fresh or getattr(self, "_sewer_network", None) is None or self.status == self.IDLE:
+            self._sewer_network = sewer.resolve(self.world)
+        network = self._sewer_network
+        taken = self._sewer_taken(fluid)
         out = []
-        for link in self._sewer_links:
+        for link in network.links:
             item = link.to_dict()
-            k = row.get(link.inlet_id)
-            item["flow_m3s"] = (float(flows[k]) if (link.status == "ok" and k is not None
-                                                    and k < len(flows)) else 0.0)
+            item["flow_m3s"] = (sum(taken.get(i, 0.0) for i in link.upstream_inlets)
+                                if link.status == "ok" else 0.0)
             out.append(item)
         return out
+
+    def _sewer_taken(self, fluid: Dict[str, Any]) -> Dict[str, float]:
+        """What each grate took over the last frame, by object id."""
+        return self._sewer_by_inlet(fluid.get("sewer_inlet_flow_m3s", []) or [])
+
+    def _sewer_by_inlet(self, values: list) -> Dict[str, float]:
+        """A per-grate list from the solver, keyed by object id. The solver's
+        rows are the network it was last given, resolved on the last tick; a
+        list that does not match it (the network changed) is not used."""
+        ids = getattr(self, "_sewer_solver_ids", None)
+        if ids is None or len(ids) != len(values):
+            return {}
+        return {i: float(q) for i, q in zip(ids, values)}
 
     def _ground(self, point) -> List[float]:
         x, z = float(point[0]), float(point[2])
@@ -164,9 +176,10 @@ class SimulationManager:
         """Lay a pipe from point A to point B (v0.17.0, backend/app/sewer.py).
 
         `points` is the route the user clicked, first to last. `from_id` joins
-        the pipe to an existing STORM_INLET and `to_id` to an existing OUTFALL;
-        either one missing is created at that end of the route. Every point
-        sits on the ground. Returns every object created or changed.
+        the pipe to an existing STORM_INLET or MANHOLE and `to_id` to an
+        existing MANHOLE or OUTFALL; a missing start is created as a grate and
+        a missing end as an outfall. Every point sits on the ground. Returns
+        every object created or changed.
         """
         if not isinstance(fields, dict):
             raise ValueError("pipe must be a JSON object")
@@ -179,11 +192,13 @@ class SimulationManager:
         points = [self._ground(p) for p in raw]
         created: List[Dict[str, Any]] = []
         inlet = self.world.objects.get(candidate["from_id"]) if candidate["from_id"] else None
-        if candidate["from_id"] and (inlet is None or inlet.type != sewer.INLET_TYPE):
-            raise ValueError(f"not a storm inlet: {candidate['from_id']!r}")
+        if candidate["from_id"] and (inlet is None or inlet.type not in sewer.PIPE_SOURCES):
+            raise ValueError(f"a pipe starts at a storm inlet or a manhole, "
+                             f"not {candidate['from_id']!r}")
         outfall = self.world.objects.get(candidate["to_id"]) if candidate["to_id"] else None
-        if candidate["to_id"] and (outfall is None or outfall.type != sewer.OUTFALL_TYPE):
-            raise ValueError(f"not an outfall: {candidate['to_id']!r}")
+        if candidate["to_id"] and (outfall is None or outfall.type not in sewer.PIPE_TARGETS):
+            raise ValueError(f"a pipe ends at a manhole or an outfall, "
+                             f"not {candidate['to_id']!r}")
         if inlet is None:
             created.append(self.apply_object_add({"type": sewer.INLET_TYPE,
                                                   "position": points[0]}))
@@ -205,7 +220,8 @@ class SimulationManager:
         """Continue a pipe to a new end, or change its diameter.
 
         New `points` replace the route; its outfall moves to the new last point,
-        which is how "carry the pipe on from B to C" works.
+        which is how "carry the pipe on from B to C" works. A manhole at the
+        end stays put -- other pipes meet there -- and the route ends on it.
         """
         if not isinstance(fields, dict):
             raise ValueError("pipe must be a JSON object")
@@ -224,7 +240,9 @@ class SimulationManager:
         if inlet is not None:
             points[0] = list(inlet.position)
         outfall = self.world.objects.get(str(candidate.get("to_id", "")))
-        if outfall is not None and "points" in fields:
+        if outfall is not None and outfall.type == sewer.MANHOLE_TYPE:
+            points[-1] = list(outfall.position)
+        elif outfall is not None and "points" in fields:
             outfall.position = list(points[-1])
             self.rigid.update_body(outfall)
             changed.append(outfall.to_dict())
@@ -581,9 +599,18 @@ class SimulationManager:
             # v0.17.0: resolved from the objects every tick, like SOURCE/DRAIN,
             # so an inlet or outfall dragged while RUNNING re-routes at once and
             # a pipe's capacity follows the ground under its two ends
-            inlets, outfalls, links, inlet_ids = sewer.resolve(self.world)
-            self._sewer_links, self._sewer_inlet_ids = links, inlet_ids
-            self.fluid.set_sewer(inlets, outfalls)
+            # v0.18.0: chains and junctions -- each grate is allowed a share of
+            # the narrowest pipe on its way down, by what it took last tick
+            demand = self._sewer_by_inlet(
+                getattr(self.fluid, "_inlet_demand_m3s", []) or [])
+            network = sewer.resolve(self.world)
+            allowed = sewer.allocate(network, demand)
+            self._sewer_network = network
+            self._sewer_solver_ids = list(network.inlet_ids)
+            rows = [row + (path,) for row, path in
+                    zip(network.inlet_rows(allowed), network.path_capacity)]
+            self.fluid.set_sewer(rows, network.outfalls,
+                                 measure_demand=sewer.shared(network))
         if self._obstacle_snapshot is None:
             self._obstacle_snapshot = self.rigid.obstacle_snapshot()
         self.fluid.set_boundaries(self.world.terrain, self._obstacle_snapshot,

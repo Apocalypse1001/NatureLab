@@ -3,18 +3,27 @@
 export type ObjectType = 'HOUSE' | 'CAR' | 'TREE' | 'BOX' | 'DEBRIS' | 'ROCK'
   | 'BRIDGE' | 'PERSON' | 'ROAD' | 'SOURCE' | 'DRAIN' | 'GAUGE' | 'VENT' | 'BUILDING'
   // v0.17.0 storm sewer (backend/app/sewer.py)
-  | 'STORM_INLET' | 'OUTFALL' | 'PIPE';
+  | 'STORM_INLET' | 'OUTFALL' | 'PIPE'
+  // v0.18.0 Sewer-2: where pipes join
+  | 'MANHOLE';
 
 /** What one PIPE is doing, streamed in sim_state and in the pipe_* replies. */
 export interface SewerLinkState {
   pipe_id: string;
-  inlet_id: string;
-  outfall_id: string;
+  /** a STORM_INLET or MANHOLE */
+  from_id: string;
+  /** a MANHOLE or OUTFALL */
+  to_id: string;
+  to_type: string;
   capacity_m3s: number;
+  /** summed over every grate whose chain runs through this pipe */
   flow_m3s: number;
   length_m: number;
   fall_m: number;
-  status: 'ok' | 'uphill' | 'disconnected' | 'second_pipe';
+  status: 'ok' | 'uphill' | 'disconnected' | 'second_pipe' | 'blocked' | 'dead_end' | 'loop';
+  /** for "blocked": the pipe further down that carries nothing */
+  blocked_by: string;
+  upstream_inlets: string[];
 }
 
 export type ObjectState =
@@ -134,7 +143,7 @@ export interface SimEvent {
 export const OBJECT_TYPES: ObjectType[] = ['HOUSE', 'BUILDING', 'CAR', 'TREE', 'BOX', 'DEBRIS',
   'ROCK', 'BRIDGE', 'PERSON', 'ROAD', 'SOURCE', 'DRAIN', 'GAUGE', 'VENT',
   // a PIPE is laid with the Pipe tool, not dropped on a grid
-  'STORM_INLET', 'OUTFALL'];
+  'STORM_INLET', 'MANHOLE', 'OUTFALL'];
 
 export const OBJECT_COLORS: Record<string, number> = {
   HOUSE: 0xc9a27a,
@@ -149,6 +158,7 @@ export const OBJECT_COLORS: Record<string, number> = {
   SOURCE: 0x4fd8a0,
   STORM_INLET: 0x5b6470,
   OUTFALL: 0x9aa3ad,
+  MANHOLE: 0x3d4248,
   PIPE: 0x8a939c,
   DRAIN: 0xd85f4f,
   GAUGE: 0x62e6ff,

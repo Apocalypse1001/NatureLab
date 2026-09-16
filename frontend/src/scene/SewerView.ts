@@ -98,7 +98,9 @@ export class SewerView {
         this.dots.setMatrixAt(dotCount++, this.matrix);
       }
 
-      const outfall = this.objectsRoot.getObjectByName(link.outfall_id);
+      // only a chain's last pipe pours out; one into a manhole runs on
+      const outfall = link.to_type === 'OUTFALL'
+        ? this.objectsRoot.getObjectByName(link.to_id) : undefined;
       if (outfall && outfalls < MAX_OUTFALLS) {
         outfalls++;
         const end = curve.getPointAt(1, new THREE.Vector3());

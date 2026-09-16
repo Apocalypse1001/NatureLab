@@ -61,7 +61,7 @@ for step in range(1, int(seconds * 60) + 1):
         h = np.asarray(m.fluid._h.numpy()).reshape(n, n)
         parts = []
         for link in sewer:
-            depth = h[masks[link["inlet_id"]]].max() if link["inlet_id"] in masks else 0.0
+            depth = h[masks[link["from_id"]]].max() if link["from_id"] in masks else 0.0
             parts.append(f"{link['flow_m3s'] * 1000:5.1f}/{link['capacity_m3s'] * 1000:4.1f} L/s "
                          f"pit {depth * 100:4.1f} cm")
         print(f"t={step / 60:4.0f}s  " + "  |  ".join(parts), flush=True)

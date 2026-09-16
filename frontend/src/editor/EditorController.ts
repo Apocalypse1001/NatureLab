@@ -166,10 +166,14 @@ export class EditorController {
   }
 
   private addPipePoint(): void {
-    const id = this.scene.pickObject(this.pointer);
-    const obj = id ? this.store.objects.get(id) : undefined;
+    // A pipe joined to a manhole ends on top of its cover, so the nearest hit
+    // there is the pipe; the node under it is what a click means.
+    const obj = this.scene.pickObjectIds(this.pointer)
+      .map((id) => this.store.objects.get(id))
+      .find((o) => o?.type === 'STORM_INLET' || o?.type === 'MANHOLE' || o?.type === 'OUTFALL');
     if (!this.pipePoints.length) {
-      if (obj?.type === 'STORM_INLET') {
+      // v0.18.0: a pipe may also run on from a manhole
+      if (obj?.type === 'STORM_INLET' || obj?.type === 'MANHOLE') {
         this.pipeFrom = obj.id;
         this.pipePoints.push([...obj.position]);
       } else {
@@ -178,7 +182,8 @@ export class EditorController {
         this.pipeFrom = null;          // the backend places an inlet here
         this.pipePoints.push([point.x, point.y, point.z]);
       }
-    } else if (obj?.type === 'OUTFALL' && !this.extendingPipe) {
+    } else if ((obj?.type === 'OUTFALL' || obj?.type === 'MANHOLE') && !this.extendingPipe
+               && obj.id !== this.pipeFrom) {
       this.pipePoints.push([...obj.position]);
       this.finishPipe(obj.id);
       return;
@@ -279,7 +284,7 @@ export class EditorController {
 
   /** Types that live on the ground and may only be moved in the XZ plane. */
   private static readonly GROUND_FIXTURES = new Set(
-    ['SOURCE', 'DRAIN', 'VENT', 'STORM_INLET', 'OUTFALL']);
+    ['SOURCE', 'DRAIN', 'VENT', 'STORM_INLET', 'OUTFALL', 'MANHOLE']);
 
   private pushSelectedTransform(): void {
     const id = this.store.selectedId;

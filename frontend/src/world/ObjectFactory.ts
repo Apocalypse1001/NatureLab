@@ -704,6 +704,28 @@ const builders: Record<string, Builder> = {
     return g;
   },
 
+  MANHOLE: () => {
+    // A round cast-iron cover in a concrete collar, flush with the street. It
+    // is only a junction (backend/app/sewer.py): no ring, because it takes no
+    // water off the surface.
+    const g = new THREE.Group();
+    const collar = new THREE.Mesh(new THREE.CylinderGeometry(0.62, 0.66, 0.08, 28),
+      new THREE.MeshStandardMaterial({ color: 0x8f8a82, roughness: 0.95 }));
+    collar.position.y = 0.04;
+    const cover = new THREE.Mesh(new THREE.CylinderGeometry(0.46, 0.46, 0.06, 28),
+      new THREE.MeshStandardMaterial({ color: OBJECT_COLORS.MANHOLE, metalness: 0.6,
+                                       roughness: 0.5 }));
+    cover.position.y = 0.09;
+    g.add(collar, cover);
+    for (let k = -2; k <= 2; k++) {
+      const rib = new THREE.Mesh(new THREE.BoxGeometry(0.8 - Math.abs(k) * 0.12, 0.02, 0.05),
+        new THREE.MeshStandardMaterial({ color: 0x565c63, metalness: 0.6, roughness: 0.45 }));
+      rib.position.set(0, 0.13, k * 0.14);
+      g.add(rib);
+    }
+    return g;
+  },
+
   PIPE: (obj) => {
     // Laid ON the ground, not buried: the whole point is to see where it runs.
     // The route is decoration on a graph edge (backend/app/sewer.py) -- the

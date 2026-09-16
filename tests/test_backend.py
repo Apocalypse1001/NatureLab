@@ -3279,13 +3279,177 @@ class SewerTests(unittest.IsolatedAsyncioTestCase):
         self._run(360.0)
         h = np.asarray(self.manager.fluid._h.numpy()).reshape(N, N)
         for link in self.manager.sewer_state():
-            inlet = inlets[link["inlet_id"]]
+            inlet = inlets.get(link["from_id"])
+            if inlet is None:
+                continue
             over = float(h[np.hypot(X - inlet.position[0], Z - inlet.position[2]) <= 1.5].max())
             if over > 0.05:
                 self.assertGreater(link["flow_m3s"], 0.95 * link["capacity_m3s"],
                                    msg=f"{over * 100:.1f} cm over {inlet.id}, taking "
                                        f"{link['flow_m3s'] * 1000:.1f} of "
                                        f"{link['capacity_m3s'] * 1000:.1f} L/s")
+
+    # ------------------------------------------------------------ Sewer-2 (v0.18.0)
+    def _network_scene(self, pits: dict) -> None:
+        """The pit scene's ground (2 m plateau, ramp at x 30-40 m, low ground
+        past it) with a 6 m pit at every centre in `pits`; a pit mapped to True
+        holds 40 cm of water. Nothing else adds or removes water."""
+        terrain = self.manager.world.terrain
+        cell = terrain.cell_size
+        x = np.arange(N) * cell - terrain.width * cell / 2
+        self.X, self.Z = np.meshgrid(x, x)
+        heights = np.where(self.X < 30.0, 2.0, 0.0)
+        heights = np.where((self.X >= 30.0) & (self.X < 40.0),
+                           2.0 - (self.X - 30.0) * 0.2, heights)
+        water = np.zeros_like(heights)
+        for (px, pz), filled in pits.items():
+            pit = np.hypot(self.X - px, self.Z - pz) <= 6.0
+            heights = np.where(pit, 1.5, heights)
+            if filled:
+                water = np.where(pit, 0.4, water)
+        terrain.heights[:, :] = heights.astype(np.float32)
+        self.manager.terrain_revision += 1
+        self.manager.apply_edge_inflow(False)
+        self.manager.apply_water_outflow(False)
+        self.manager.apply_water_level(0.0)
+        self._water0 = water.astype(np.float32)
+
+    def _node(self, kind: str, x: float, z: float) -> str:
+        return self.manager.apply_object_add({"type": kind, "position": [x, 0.0, z]})["id"]
+
+    def _pipe(self, a: str, b: str, diameter: float) -> dict:
+        objects = self.manager.world.objects
+        ends = [list(objects[a].position), list(objects[b].position)]
+        return self.manager.apply_pipe_add({"points": ends, "diameter_m": diameter,
+                                            "from_id": a, "to_id": b})
+
+    def _start_network(self) -> None:
+        self.manager.start()
+        self.manager.fluid._h.assign(self._water0.ravel())
+        self._run(3.0)     # past the first frames, where no demand is measured yet
+
+    def _link(self, pipe_id: str) -> dict:
+        return next(l for l in self.manager.sewer_state() if l["pipe_id"] == pipe_id)
+
+    def _taken_over(self, seconds: float) -> float:
+        d0 = self.manager.fluid.diagnostics()
+        self._run(seconds)
+        d1 = self.manager.fluid.diagnostics()
+        self.assertAlmostEqual(d1["sewer_out_m3"] - d0["sewer_out_m3"],
+                               d1["sewer_in_m3"] - d0["sewer_in_m3"], delta=1e-3)
+        return (d1["sewer_in_m3"] - d0["sewer_in_m3"]) / seconds
+
+    async def test_a_chain_carries_what_its_narrowest_pipe_carries(self) -> None:
+        """Grate -> 300 mm -> manhole -> 100 mm -> manhole -> 300 mm -> outfall.
+        The 100 mm pipe in the middle rates 23.1 L/s against 61.6 and 108.1 on
+        either side, and that is what the grate takes -- not the first pipe's."""
+        self._network_scene({(-40.0, 0.0): True})
+        inlet = self._node("STORM_INLET", -40.0, 0.0)
+        m1, m2 = self._node("MANHOLE", 34.0, 0.0), self._node("MANHOLE", 38.0, 0.0)
+        outfall = self._node("OUTFALL", 70.0, 0.0)
+        pipes = [self._pipe(inlet, m1, 0.3), self._pipe(m1, m2, 0.1), self._pipe(m2, outfall, 0.3)]
+        ids = [next(o["id"] for o in p["objects"] if o["type"] == "PIPE") for p in pipes]
+        caps = [self._link(i)["capacity_m3s"] for i in ids]
+        self.assertEqual(min(caps), caps[1])
+        self.assertLess(caps[1] * 2.0, caps[0])
+        self._start_network()
+        taken = self._taken_over(10.0)
+        self.assertAlmostEqual(taken, caps[1], delta=0.02 * caps[1],
+                               msg=f"took {taken * 1000:.1f} L/s; pipes {[round(c * 1000, 1) for c in caps]}")
+        for pipe_id in ids:
+            link = self._link(pipe_id)
+            self.assertEqual(link["status"], "ok")
+            self.assertAlmostEqual(link["flow_m3s"], caps[1], delta=0.03 * caps[1])
+
+    async def test_two_grates_share_a_trunk_by_what_they_want(self) -> None:
+        """Two flooded grates, 300 mm laterals (60 L/s each) into one manhole,
+        a 100 mm trunk (9.4 L/s) to the river: together they take the trunk,
+        about half each, and the trunk reads the sum. Then the same with one
+        grate dry: the flooded one gets the whole trunk, not its half -- a
+        split fixed in advance would leave half the trunk idle while water
+        stands over the other grate."""
+        for dry_second in (False, True):
+            with self.subTest(dry_second=dry_second):
+                if dry_second:
+                    await self.asyncTearDown()
+                    await self.asyncSetUp()
+                self._network_scene({(-40.0, -20.0): True, (-40.0, 20.0): not dry_second})
+                a = self._node("STORM_INLET", -40.0, -20.0)
+                b = self._node("STORM_INLET", -40.0, 20.0)
+                manhole = self._node("MANHOLE", 34.0, 0.0)
+                outfall = self._node("OUTFALL", 70.0, 0.0)
+                self._pipe(a, manhole, 0.3)
+                self._pipe(b, manhole, 0.3)
+                trunk_id = next(o["id"] for o in self._pipe(manhole, outfall, 0.1)["objects"]
+                                if o["type"] == "PIPE")
+                trunk = self._link(trunk_id)["capacity_m3s"]
+                self._start_network()
+                taken = self._taken_over(10.0)
+                self.assertAlmostEqual(taken, trunk, delta=0.03 * trunk,
+                                       msg=f"took {taken * 1000:.2f} L/s through a "
+                                           f"{trunk * 1000:.2f} L/s trunk")
+                link = self._link(trunk_id)
+                self.assertEqual(sorted(link["upstream_inlets"]), sorted([a, b]))
+                self.assertAlmostEqual(link["flow_m3s"], trunk, delta=0.05 * trunk)
+                flows = self.manager.fluid.diagnostics()["sewer_inlet_flow_m3s"]
+                ids = self.manager._sewer_solver_ids
+                by_id = dict(zip(ids, flows))
+                if dry_second:
+                    self.assertLess(by_id[b], 0.02 * trunk)
+                    self.assertGreater(by_id[a], 0.95 * trunk)
+                else:
+                    self.assertAlmostEqual(by_id[a], by_id[b], delta=0.1 * trunk)
+
+    async def test_an_uphill_pipe_down_the_chain_blocks_it_and_says_which(self) -> None:
+        """Grate -> manhole on the ramp -> a pipe back UP to the plateau ->
+        outfall. The middle pipe rises, so the grate takes nothing; the first
+        pipe is fine in itself and must say what blocks it rather than read
+        "ok, 0 L/s"."""
+        self._network_scene({(-40.0, 0.0): True})
+        inlet = self._node("STORM_INLET", -40.0, 0.0)
+        low = self._node("MANHOLE", 38.0, 0.0)
+        high = self._node("MANHOLE", 0.0, 10.0)
+        outfall = self._node("OUTFALL", 70.0, 10.0)
+        first = next(o["id"] for o in self._pipe(inlet, low, 0.3)["objects"] if o["type"] == "PIPE")
+        rising = next(o["id"] for o in self._pipe(low, high, 0.3)["objects"] if o["type"] == "PIPE")
+        self._pipe(high, outfall, 0.3)
+        self.assertEqual(self._link(rising)["status"], "uphill")
+        self.assertEqual(self._link(first)["status"], "blocked")
+        self.assertEqual(self._link(first)["blocked_by"], rising)
+        self._start_network()
+        self.assertLess(self._taken_over(5.0), 1e-6)
+
+    async def test_loops_dead_ends_and_a_second_pipe_out_are_reported_not_followed(self) -> None:
+        self._network_scene({(-40.0, 0.0): False})
+        inlet = self._node("STORM_INLET", -40.0, 0.0)
+        m1, m2 = self._node("MANHOLE", 34.0, 0.0), self._node("MANHOLE", 38.0, 0.0)
+        pid = lambda state: next(o["id"] for o in state["objects"] if o["type"] == "PIPE")
+        into = pid(self._pipe(inlet, m1, 0.3))
+        # a loop: m1 -> m2 -> m1. resolve() runs every tick; it must not hang.
+        # A loop always has a pipe that rises somewhere, and that one says so;
+        # the pipes that are fine in themselves say "loop".
+        down = pid(self._pipe(m1, m2, 0.3))
+        back = pid(self._pipe(m2, m1, 0.3))
+        self.assertEqual(self._link(into)["status"], "loop")
+        self.assertEqual(self._link(down)["status"], "loop")
+        self.assertEqual(self._link(back)["status"], "uphill")
+        # a second pipe out of the same manhole is refused its capacity
+        outfall = self._node("OUTFALL", 70.0, 0.0)
+        second = pid(self._pipe(m1, outfall, 0.3))
+        self.assertEqual(self._link(second)["status"], "second_pipe")
+        # a dead end: a grate into a manhole with no pipe out
+        lone = self._node("STORM_INLET", -40.0, 40.0)
+        stub = self._node("MANHOLE", 34.0, 40.0)
+        self.assertEqual(self._link(pid(self._pipe(lone, stub, 0.3)))["status"], "dead_end")
+        self.manager.start()
+        self._run(1.0)
+        # a pipe cannot start at an outfall or end at a grate
+        with self.assertRaises(ValueError):
+            self._pipe(outfall, m1, 0.3)
+        with self.assertRaises(ValueError):
+            self._pipe(m1, lone, 0.3)
+        restored = WorldState.from_dict(self.manager.world.to_dict())
+        self.assertEqual(restored.objects[stub].type, "MANHOLE")
 
     async def test_a_narrower_pipe_carries_less(self) -> None:
         """Full-pipe capacity goes as d^(8/3): 100 mm carries 0.157 of 200 mm."""

@@ -231,7 +231,9 @@ function syncPipeEnds(end: ObjectData): void {
 
 store.on('object-updated', (id) => {
   const obj = store.objects.get(id as string);
-  if (obj && (obj.type === 'STORM_INLET' || obj.type === 'OUTFALL')) syncPipeEnds(obj);
+  if (obj && (obj.type === 'STORM_INLET' || obj.type === 'OUTFALL' || obj.type === 'MANHOLE')) {
+    syncPipeEnds(obj);
+  }
   if (obj) {
     const rebuilt = sceneManager.setObject(obj);
     // A rebuild (BUILDING's floors changing) tore down the THREE.Object3D

@@ -213,10 +213,12 @@ export class UI {
     pipeRow.append(pipeDiameter);
     panel.append(pipeRow);
     panel.append(el('p', 'hint',
-      'Click a storm inlet, or bare ground to place one; click along the route; '
-      + 'click an outfall, or press Enter (or right-click) to place one at the last '
-      + 'point. Esc cancels, Backspace takes back a point. A pipe only carries water '
-      + 'downhill.'));
+      'Click a storm inlet or a manhole, or bare ground to place an inlet; click '
+      + 'along the route; click a manhole or an outfall, or press Enter (or '
+      + 'right-click) to place an outfall at the last point. Pipes from several '
+      + 'inlets can meet in one manhole and run on in one pipe -- the narrowest pipe '
+      + 'on the way sets what gets through. Esc cancels, Backspace takes back a '
+      + 'point. A pipe only carries water downhill.'));
     this.objectListPlaceholder();
     panel.append(el('h3', '', 'Scene'));
     const list = el('div', 'object-list');
@@ -705,7 +707,8 @@ export class UI {
       ['Scale Y', 'scl_y', obj.scale[1], (v) => this.patchScale(obj.id, 1, v)],
       ['Scale Z', 'scl_z', obj.scale[2], (v) => this.patchScale(obj.id, 2, v)],
     ];
-    const sewerPart = obj.type === 'PIPE' || obj.type === 'STORM_INLET' || obj.type === 'OUTFALL';
+    const sewerPart = obj.type === 'PIPE' || obj.type === 'STORM_INLET'
+      || obj.type === 'OUTFALL' || obj.type === 'MANHOLE';
     // A pipe is its route: moving or scaling it by number would pull the
     // drawing off the points the solver holds, so it gets only its diameter.
     if (obj.type === 'PIPE') fields.length = 0;
@@ -804,20 +807,25 @@ export class UI {
     if (!host) return;
     const id = this.selectedId;
     const mine = this.sewerLinks.filter(
-      (l) => l.pipe_id === id || l.inlet_id === id || l.outfall_id === id);
+      (l) => l.pipe_id === id || l.from_id === id || l.to_id === id);
     if (!mine.length) {
       host.innerHTML = '<div>Not joined to a pipe yet.</div>';
       return;
     }
     const why: Record<string, string> = {
       uphill: 'Runs uphill: a gravity pipe carries nothing.',
-      disconnected: 'Not joined to an inlet and an outfall.',
-      second_pipe: 'This inlet already feeds another pipe.',
+      disconnected: 'Not joined at both ends.',
+      second_pipe: 'A pipe already runs on from its start; only one may.',
+      blocked: 'Carries nothing: a pipe further down runs uphill.',
+      dead_end: 'Carries nothing: the chain ends at a manhole with no pipe out.',
+      loop: 'Carries nothing: the chain runs back into itself.',
     };
     host.innerHTML = mine.map((l) => {
       const ls = (q: number) => (q * 1000).toFixed(1);
       const load = l.capacity_m3s > 0 ? Math.round(100 * l.flow_m3s / l.capacity_m3s) : 0;
-      return `<div>Flow <strong>${ls(l.flow_m3s)} L/s</strong> of `
+      // a manhole shows every pipe that meets it, so each line says which
+      const name = mine.length > 1 ? `<div><em>${l.pipe_id}</em></div>` : '';
+      return `${name}<div>Flow <strong>${ls(l.flow_m3s)} L/s</strong> of `
         + `${ls(l.capacity_m3s)} L/s (${load}%)</div>`
         + `<div>Fall ${l.fall_m.toFixed(2)} m over ${l.length_m.toFixed(0)} m</div>`
         + (why[l.status] ? `<div class="bad">${why[l.status]}</div>` : '');
