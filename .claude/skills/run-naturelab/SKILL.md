@@ -230,8 +230,11 @@ Writes `releases/NatureLab_v<version>.zip` (frontend `dist/` included, `.git`/
   process spawns and kills its own backend, so every run starts at `IDLE, t=0.0s, 0
   objects`. `data/` is empty by default — nothing is auto-loaded.
 
-- **Storm sewer (v0.17.0): a pipe carries water, it does not hold it.** `STORM_INLET`,
-  `PIPE`, `OUTFALL` (`backend/app/sewer.py`); lay one with `send {"op":"pipe_add","pipe":
+- **Storm sewer (v0.17.0; manholes, chains and pipe depth v0.18.0): a pipe carries
+  water, it does not hold it.** `STORM_INLET`, `MANHOLE`, `PIPE`, `OUTFALL`
+  (`backend/app/sewer.py`). Fall is invert to invert: every node's
+  `metadata.invert_depth_m` (default 1 m) below the ground. A shared pipe is split by
+  demand measured on the GPU, never by last tick's takings (that spirals down). Lay one with `send {"op":"pipe_add","pipe":
   {"points":[[x,0,z],[x2,0,z2]],"diameter_m":0.15}}` (missing inlet/outfall are created).
   Per-pipe flow, capacity and status (`ok`/`uphill`/...) arrive in the state message as
   `sewer`. Measure a scene with `python docs/probe_sewer_v1.py base 600`. Two traps:

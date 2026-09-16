@@ -145,6 +145,17 @@ PIPE_DEFAULT_DIAMETER_M = 0.2    # 200 mm, a common street sewer
 PIPE_MIN_DIAMETER_M = 0.05
 PIPE_MAX_DIAMETER_M = 2.0
 PIPE_MAX_POINTS = 64
+# v0.18.0: pipes are buried. Every grate, manhole and outfall carries the depth
+# of the pipe's bottom (its invert) below the ground there, and a pipe's fall is
+# invert to invert -- so a manhole under a street that stands higher than the
+# grates can still take their water if it is dug deeper. One default for every
+# node keeps the fall of a pipe laid without touching depths equal to the fall
+# of the ground, which is what every world before v0.18.0 was measured with.
+SEWER_INVERT_DEPTH_M = 1.0
+SEWER_MAX_INVERT_DEPTH_M = 8.0
+# The slope a "dig it deeper" suggestion aims for: 0.5%, a usual minimum grade
+# for a small storm sewer, not merely "anything above zero".
+SEWER_SUGGESTED_SLOPE = 0.005
 
 # A placed DRAIN removes water through a smooth radial sink and spins the flow
 # around it. The spin is NOT a constant: it comes from the ambient circulation

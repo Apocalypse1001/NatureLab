@@ -8,9 +8,10 @@ down the grate and come out into the river. So this is not a pipe solver:
   radial sink a DRAIN uses, but never more than the network below it can carry;
 - a PIPE is a graph edge from a grate or a manhole to a manhole or an outfall.
   It holds no water. Its waypoints are the route the user drew and are drawn as
-  a tube; nothing reads a gradient off them. What it carries is capped by
-  Manning's formula for a pipe running full, from its diameter and the fall
-  between its two ends;
+  a tube on the ground; nothing reads a gradient off them. What it carries is
+  capped by Manning's formula for a pipe running full, from its diameter and
+  the fall between its two ends -- measured at the pipe's bottom (invert),
+  which every node sets as a depth below the ground there (`invert_depth_m`);
 - a MANHOLE is a junction: pipes run into it and one pipe runs on. It holds no
   water and does not overflow yet (Sewer-4), so what the network below cannot
   carry simply never leaves the grates -- it stays on the street;
@@ -67,6 +68,29 @@ def path_length(points: List[List[float]]) -> float:
     return total
 
 
+def invert_depth(obj) -> float:
+    return float(obj.metadata.get("invert_depth_m", config.SEWER_INVERT_DEPTH_M))
+
+
+def invert_elevation(obj, terrain) -> float:
+    """The height of the pipe bottom at a node: the ground under it minus its
+    depth. The ground, not the object's y, so a fixture nudged off the ground
+    cannot change a fall."""
+    return terrain.height_at(obj.position[0], obj.position[2]) - invert_depth(obj)
+
+
+def validate_node_metadata(metadata: Dict[str, Any]) -> None:
+    """Raise ValueError unless a grate's, manhole's or outfall's depth is sane."""
+    if "invert_depth_m" not in metadata:
+        return
+    depth = metadata["invert_depth_m"]
+    if (isinstance(depth, bool) or not isinstance(depth, (int, float))
+            or not math.isfinite(float(depth))
+            or not 0.0 <= float(depth) <= config.SEWER_MAX_INVERT_DEPTH_M):
+        raise ValueError(f"invert_depth_m must be within "
+                         f"[0, {config.SEWER_MAX_INVERT_DEPTH_M}] m")
+
+
 def validate_pipe_metadata(metadata: Dict[str, Any]) -> None:
     """Raise ValueError unless a PIPE's metadata is well formed."""
     points = metadata.get("points")
@@ -105,9 +129,14 @@ class SewerLink:
     to_type: str
     capacity_m3s: float
     length_m: float
+    # invert to invert: the pipe bottom's height at its start minus at its end
     fall_m: float
     status: str
     blocked_by: str = ""
+    from_invert_m: float = 0.0
+    to_invert_m: float = 0.0
+    # for "uphill": the depth the END node would need for a 0.5% grade, 0 if none
+    suggested_to_depth_m: float = 0.0
     # the grates whose water runs through this pipe
     upstream_inlets: List[str] = field(default_factory=list)
 
@@ -165,12 +194,18 @@ def resolve(world) -> Network:
         route = ([list(start.position)] + [list(p) for p in points[1:-1]]
                  + [list(end.position)])
         length = path_length(route)
-        fall = (terrain.height_at(start.position[0], start.position[2])
-                - terrain.height_at(end.position[0], end.position[2]))
+        top, bottom = invert_elevation(start, terrain), invert_elevation(end, terrain)
+        fall = top - bottom
         q = pipe_capacity_m3s(float(meta.get("diameter_m", config.PIPE_DEFAULT_DIAMETER_M)),
                               fall, length)
         link = SewerLink(pipe.id, start.id, end.id, end.type, q, length, fall,
-                         "ok" if q > 0.0 else "uphill")
+                         "ok" if q > 0.0 else "uphill",
+                         from_invert_m=top, to_invert_m=bottom)
+        if q <= 0.0:
+            wanted = invert_depth(end) + (bottom - (top - config.SEWER_SUGGESTED_SLOPE
+                                                    * max(length, 1.0)))
+            # rounded up to 5 cm, so following the suggestion is enough
+            link.suggested_to_depth_m = round(math.ceil(wanted / 0.05 - 1e-9) * 0.05, 2)
         if start.id in out_link:
             link.status, link.capacity_m3s = "second_pipe", 0.0
         else:

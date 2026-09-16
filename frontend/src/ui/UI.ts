@@ -716,6 +716,13 @@ export class UI {
       ['Diameter (mm)', 'pipe_d', (obj.metadata.diameter_m ?? 0.2) * 1000,
        (v) => this.cb.updatePipe(obj.id, Math.max(50, Math.min(2000, v)) / 1000)],
     );
+    // v0.18.0: pipes are buried; a node's depth sets the height of the pipe
+    // bottom there, and a pipe's fall is bottom to bottom
+    if (sewerPart && obj.type !== 'PIPE') fields.push(
+      ['Pipe depth below ground (m)', 'invert_depth', obj.metadata.invert_depth_m ?? 1,
+       (v) => this.cb.updateObject(obj.id,
+         { metadata: { ...obj.metadata, invert_depth_m: Math.max(0, Math.min(8, v)) } })],
+    );
     if (obj.type !== 'GAUGE' && !sewerPart) fields.push(
       ['Mass (kg)', 'mass', obj.mass, (v) => this.cb.updateObject(obj.id, { mass: v })],
       ['Friction', 'friction', obj.friction, (v) => this.cb.updateObject(obj.id, { friction: v })],
@@ -828,6 +835,9 @@ export class UI {
       return `${name}<div>Flow <strong>${ls(l.flow_m3s)} L/s</strong> of `
         + `${ls(l.capacity_m3s)} L/s (${load}%)</div>`
         + `<div>Fall ${l.fall_m.toFixed(2)} m over ${l.length_m.toFixed(0)} m</div>`
+        + (l.status === 'uphill' && l.suggested_to_depth_m > 0
+          ? `<div>Dig ${l.to_id} to ${l.suggested_to_depth_m.toFixed(2)} m deep `
+            + 'for a 0.5% grade</div>' : '')
         + (why[l.status] ? `<div class="bad">${why[l.status]}`
           + (l.blocked_by ? ` (${l.blocked_by}).` : '') + '</div>' : '');
     }).join('');

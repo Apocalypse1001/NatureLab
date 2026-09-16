@@ -21,8 +21,13 @@ export interface SewerLinkState {
   length_m: number;
   fall_m: number;
   status: 'ok' | 'uphill' | 'disconnected' | 'second_pipe' | 'blocked' | 'dead_end' | 'loop';
-  /** for "blocked": the pipe further down that carries nothing */
+  /** for "blocked": the pipe on the way that carries nothing */
   blocked_by: string;
+  /** v0.18.0: pipe-bottom heights at the two ends; fall_m is their difference */
+  from_invert_m: number;
+  to_invert_m: number;
+  /** for "uphill": how deep the end node would need to be for a 0.5% grade */
+  suggested_to_depth_m: number;
   upstream_inlets: string[];
 }
 

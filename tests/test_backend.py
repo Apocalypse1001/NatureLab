@@ -3470,6 +3470,49 @@ class SewerTests(unittest.IsolatedAsyncioTestCase):
         restored = WorldState.from_dict(self.manager.world.to_dict())
         self.assertEqual(restored.objects[stub].type, "MANHOLE")
 
+    async def test_a_manhole_higher_than_its_grate_works_once_dug_deeper(self) -> None:
+        """Pipes are buried: fall is invert to invert, each node's invert its
+        ground minus `invert_depth_m`. The grate sits in a pit (ground 1.5 m),
+        the manhole on the plateau (2.0 m): at the default 1 m depth both the
+        pipe to it runs uphill, and the panel says how deep the manhole must go
+        for a 0.5% grade. Dug to that depth, the same pipes carry water."""
+        self._network_scene({(-40.0, 0.0): True})
+        inlet = self._node("STORM_INLET", -40.0, 0.0)
+        manhole = self._node("MANHOLE", 0.0, 0.0)
+        outfall = self._node("OUTFALL", 70.0, 0.0)
+        pid = lambda state: next(o["id"] for o in state["objects"] if o["type"] == "PIPE")
+        lateral = pid(self._pipe(inlet, manhole, 0.3))
+        trunk = pid(self._pipe(manhole, outfall, 0.3))
+        link = self._link(lateral)
+        self.assertEqual(link["status"], "uphill")
+        self.assertAlmostEqual(link["fall_m"], -0.5, delta=1e-3)
+        self.assertAlmostEqual(link["from_invert_m"], 0.5, delta=1e-3)
+        # 0.5 m of rise plus a 0.5% grade over 40 m, from a 1 m start: 1.7 m
+        self.assertAlmostEqual(link["suggested_to_depth_m"], 1.7, delta=1e-6)
+        self.assertEqual(self._link(trunk)["status"], "blocked")
+        self.manager.apply_object_update(manhole, {"metadata": {"invert_depth_m": 1.7}})
+        link = self._link(lateral)
+        self.assertEqual(link["status"], "ok")
+        self.assertAlmostEqual(link["fall_m"], 0.2, delta=1e-3)
+        self.assertEqual(self._link(trunk)["status"], "ok")
+        self._start_network()
+        self.assertAlmostEqual(self._taken_over(5.0), link["capacity_m3s"],
+                               delta=0.03 * link["capacity_m3s"])
+        restored = WorldState.from_dict(self.manager.world.to_dict())
+        self.assertAlmostEqual(restored.objects[manhole].metadata["invert_depth_m"], 1.7)
+        for bad in (-0.1, 99.0, "deep", True):
+            with self.assertRaises(ValueError):
+                self.manager.apply_object_update(manhole, {"metadata": {"invert_depth_m": bad}})
+
+    async def test_default_depths_keep_the_fall_of_the_ground(self) -> None:
+        """Every world before v0.18.0 was measured with fall = ground to ground.
+        One default depth for every node must leave that unchanged."""
+        self._network_scene({(-40.0, 0.0): True})
+        state = self.manager.apply_pipe_add({"points": [[-40, 0, 0], [70, 0, 0]]})
+        link = state["sewer"][0]
+        self.assertAlmostEqual(link["fall_m"], 1.5, delta=1e-3)
+        self.assertAlmostEqual(link["capacity_m3s"], 0.0383, delta=0.001)
+
     async def test_a_narrower_pipe_carries_less(self) -> None:
         """Full-pipe capacity goes as d^(8/3): 100 mm carries 0.157 of 200 mm."""
         state = self._pit_scene(diameter=0.1)

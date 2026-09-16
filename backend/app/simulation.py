@@ -406,6 +406,8 @@ class SimulationManager:
                     # a pipe's route and joints are checked before they land,
                     # not discovered broken by the solver a tick later
                     sewer.validate_pipe_metadata({**obj.metadata, **value})
+                elif obj.type in sewer.SEWER_TYPES:
+                    sewer.validate_node_metadata(value)
                 obj.metadata.update(value)
             else:
                 raise ValueError(f"field is not editable: {key}")
