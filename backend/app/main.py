@@ -98,13 +98,25 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         clients.discard(ws)
 
 
+def client_world() -> dict:
+    """The world for the browser: the stored starting water (hundreds of kB of
+    base64 the client never reads) is replaced by whether there is one."""
+    world = manager.world.to_dict()
+    world["water"]["initial_flow"] = world["water"].get("initial_flow") is not None
+    return world
+
+
 async def _dispatch(ws: WebSocket, msg: dict) -> dict | None:
     try:
         op = msg.get("op")
         if not isinstance(op, str):
             raise ValueError("op must be a string")
+        if getattr(manager, "_settling", False) and op not in ("request_world", "set_speed"):
+            # the world is put back when settling ends, so an edit made meanwhile
+            # would silently vanish -- refuse it instead
+            raise ValueError("the river is settling; wait for it to finish")
         if op == "request_world":
-            return {"type": "world", "world": manager.world.to_dict(),
+            return {"type": "world", "world": client_world(),
                     "status": manager.status, "time": manager.sim_time}
         if op == "object_add":
             obj_dict = manager.apply_object_add(msg.get("object", {}))
@@ -160,7 +172,7 @@ async def _dispatch(ws: WebSocket, msg: dict) -> dict | None:
             return {"type": "ack", "op": op, "status": manager.status}
         if op == "reset":
             manager.reset()
-            return {"type": "world", "world": manager.world.to_dict(),
+            return {"type": "world", "world": client_world(),
                     "status": manager.status, "time": manager.sim_time}
         if op == "set_speed":
             manager.set_speed(msg["value"])
@@ -171,8 +183,13 @@ async def _dispatch(ws: WebSocket, msg: dict) -> dict | None:
                     "path": path}
         if op == "load":
             manager.load(str(msg.get("name", "default")))
-            return {"type": "world", "world": manager.world.to_dict(),
+            return {"type": "world", "world": client_world(),
                     "status": manager.status, "time": manager.sim_time}
+        if op == "water_settle":
+            # v0.18.1: start the river flowing; the reply is the settled world
+            result = await manager.apply_water_settle(msg.get("fields") or {})
+            return {"type": "world", "world": client_world(), "status": manager.status,
+                    "time": manager.sim_time, "settle": result}
         return {"type": "error", "error": f"unknown op: {op}"}
     except Exception as exc:
         return {"type": "error", "error": str(exc)}

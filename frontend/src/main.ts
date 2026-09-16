@@ -172,6 +172,7 @@ const ui = new UI(uiHost, {
   setRain: (fields) => net.send({ op: 'rain', fields }),
   setEdgeInflow: (enabled) => net.send({ op: 'edge_inflow', enabled }),
   setFroudeView: (on) => sceneManager.setFroudeView(on, currentGravity),
+  settleRiver: (clear) => net.send({ op: 'water_settle', fields: { clear } }),
   setPipeDiameter: (diameterM) => { editor.pipeDiameter = diameterM; },
   extendPipe: (id) => editor.extendPipe(id),
   updatePipe: (id, diameterM) => net.send({ op: 'pipe_update', pipe: { id, diameter_m: diameterM } }),
@@ -200,6 +201,7 @@ function applyWorld(world: WorldData, simStatus: string): void {
   // A scenario carries its own river boundary; the controls have to show it.
   ui.setRiverControls(world.water);
   ui.setRainControls(world.water);
+  ui.setSettled(!!world.water.initial_flow);
   sceneManager.clearObjects();
   for (const obj of world.objects) sceneManager.setObject(obj);
   ui.refreshObjectList([...store.objects.values()], null);

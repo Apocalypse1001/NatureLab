@@ -536,6 +536,26 @@ SCENARIOS = {
 }
 
 
+# v0.18.1: scenarios that open on a river already flowing. The river is run at
+# its base discharge until the water stops changing (SimulationManager.
+# apply_water_settle) and that water is saved with the world. Not the dam: the
+# reservoir filling up to the spillway is that scenario's story.
+SETTLED = frozenset({"river", "bridge", "sewer"})
+
+
+def settle(name: str) -> dict:
+    import asyncio
+    from app.simulation import SimulationManager
+    manager = SimulationManager()
+    try:
+        manager.load(name)
+        result = asyncio.run(manager.apply_water_settle({}))
+        persistence.save_world(manager.world, name)
+        return result
+    finally:
+        manager.stop()
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--only", choices=sorted(SCENARIOS),
@@ -549,6 +569,10 @@ def main(argv=None) -> int:
         effective = build(world)          # terrain first: objects are seated on it
         counts = build_objects(world)
         path = persistence.save_world(world, name)
+        if key in SETTLED:
+            result = settle(name)
+            print(f"  settled: steady={result['steady']} after {result['after_s']:.0f} s, "
+                  f"{result['volume_m3']:.0f} m3 of water")
 
         print(f"wrote {path}")
         print("  " + ", ".join(f"{n} {kind}" for kind, n in sorted(counts.items())))

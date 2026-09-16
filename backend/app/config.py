@@ -87,6 +87,13 @@ SECTION_MAX_WIDTH_M = 2000.0
 # v0.18.0 flood hydrograph (backend/app/hydrograph.py)
 INLET_MAX_DISCHARGE_M3S = 10_000.0
 HYDROGRAPH_MAX_TIME_S = 36_000.0
+# v0.18.1 start from equilibrium ("settle"): the river is run at its base flow
+# until the water on the map stops changing -- its volume over a window moves
+# by less than this fraction -- or the time limit is reached
+SETTLE_WINDOW_S = 20.0
+SETTLE_TOLERANCE = 0.002
+SETTLE_MIN_S = 60.0
+SETTLE_MAX_S = 900.0
 
 # --------------------------------------------------------------- RiverLab (v0.6.0)
 # Sediment transport / erosion / deposition on the same grid as h/u/v.

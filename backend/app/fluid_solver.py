@@ -1807,10 +1807,22 @@ class WarpShallowWaterSolver(FluidSolver):
                 self._level - bed_grid[:, :source_columns], 0.0)
         depth = depth_grid.ravel()
         zeros = np.zeros(self._count, dtype=np.float32)
+        face_u = face_v = zeros
+        # v0.18.1: a settled world starts with its river already flowing --
+        # depth AND face velocities, so it is at equilibrium from the first
+        # substep instead of accelerating out of still water. Only when the
+        # grid matches; a world whose terrain was resized since starts dry.
+        stored = getattr(water, "initial_flow", None) if water is not None else None
+        if stored and not tsunami_wanted and list(stored.get("shape", [])) == [self._height, self._width]:
+            import base64
+            decode = lambda key: np.frombuffer(base64.b64decode(stored[key]), dtype="<f4")
+            fields = [decode(key) for key in ("h", "u", "v")]
+            if all(f.size == self._count for f in fields):
+                depth, face_u, face_v = (f.astype(np.float32) for f in fields)
         self._obstacle_host = np.zeros(self._count, dtype=np.int32)
         self._h = wp.array(depth, dtype=float, device=self.device)
-        self._u = wp.array(zeros, dtype=float, device=self.device)
-        self._v = wp.array(zeros, dtype=float, device=self.device)
+        self._u = wp.array(face_u, dtype=float, device=self.device)
+        self._v = wp.array(face_v, dtype=float, device=self.device)
         self._next_h = wp.empty(self._count, dtype=float, device=self.device)
         self._next_u = wp.empty(self._count, dtype=float, device=self.device)
         self._next_v = wp.empty(self._count, dtype=float, device=self.device)
@@ -2354,6 +2366,14 @@ class WarpShallowWaterSolver(FluidSolver):
         self._section_area = wp.zeros(count, dtype=float, device=self.device)
         self._section_wet = wp.zeros(count, dtype=float, device=self.device)
         self._section_level = wp.zeros(count, dtype=float, device=self.device)
+
+    def capture_flow(self) -> dict:
+        """v0.18.1: the water on the map now, in WaterState.initial_flow's form."""
+        import base64
+        encode = lambda array: base64.b64encode(
+            np.asarray(array.numpy(), dtype="<f4").tobytes()).decode("ascii")
+        return {"shape": [self._height, self._width],
+                "h": encode(self._h), "u": encode(self._u), "v": encode(self._v)}
 
     def section_readings(self) -> list:
         """Per line, over the last frame: (id, flow m3/s, area m2, wetted width

@@ -12,7 +12,7 @@ import hashlib
 import itertools
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -442,6 +442,10 @@ class WaterState:
     hydrograph_start_s: float = 60.0
     hydrograph_rise_s: float = 120.0
     hydrograph_fall_s: float = 300.0
+    # v0.18.1: the water a world starts with, when it has been settled -- depth
+    # and the two face velocities, float32 base64, grid (rows, cols). None is a
+    # world that starts dry, as every world did before.
+    initial_flow: Optional[Dict[str, Any]] = None
     outlet_centre_z: float = 0.0
     outlet_width_m: float = 0.0      # 0 = the whole edge, as before v0.12.0
     # v0.16.0: what lies beyond the open edge -- "overfall" (a sea or a pool;
@@ -524,7 +528,8 @@ class WaterState:
                 "tsunami_wave2_scale": self.tsunami_wave2_scale,
                 "tsunami_wave3_scale": self.tsunami_wave3_scale,
                 "rain_intensity_mm_h": self.rain_intensity_mm_h,
-                "edge_inflow_enabled": self.edge_inflow_enabled}
+                "edge_inflow_enabled": self.edge_inflow_enabled,
+                "initial_flow": self.initial_flow}
 
 
 @dataclass
@@ -637,6 +642,14 @@ class WorldState:
                                               "water.tsunami_wave3_scale"),
             rain_intensity_mm_h=rain_intensity(water.get("rain_intensity_mm_h", 0.0)),
             edge_inflow_enabled=bool(water.get("edge_inflow_enabled", True)))
+        flow = water.get("initial_flow")
+        if flow is not None:
+            if (not isinstance(flow, dict) or not all(isinstance(flow.get(k), str)
+                                                     for k in ("h", "u", "v"))
+                    or not isinstance(flow.get("shape"), list) or len(flow["shape"]) != 2):
+                raise ValueError("water.initial_flow is malformed")
+            state.water.initial_flow = {"shape": [int(flow["shape"][0]), int(flow["shape"][1])],
+                                        "h": flow["h"], "u": flow["u"], "v": flow["v"]}
         # v0.18.0: a world saved before the hydrograph existed has none
         from . import hydrograph as _hydrograph
         for key, value in _hydrograph.validate(dict(water.get("hydrograph") or {})).items():

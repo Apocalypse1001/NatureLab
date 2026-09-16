@@ -2022,6 +2022,80 @@ class HydrographTests(unittest.IsolatedAsyncioTestCase):
             self.manager.apply_river_inlet({"hydrograph": 5})
 
 
+class SettleTests(unittest.IsolatedAsyncioTestCase):
+    """v0.18.1: a world can start with its river already flowing."""
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    def _river(self) -> str:
+        m = self.manager
+        m.apply_terrain_river({})
+        m.apply_water_level(0.0)
+        m.apply_river_inlet({"enabled": True, "width_m": 12.0, "discharge_m3s": 12.0,
+                             "hydrograph": {"enabled": True, "peak_m3s": 60.0, "start_s": 0.0}})
+        m.apply_river_outlet({"width_m": 20.0, "kind": "river"})
+        m.world.water.rain_intensity_mm_h = 50.0
+        line = m.apply_object_add({"type": "SECTION", "position": [80.0, 0.0, 0.0]})["id"]
+        m.apply_object_update(line, {"metadata": {"section_width_m": 60.0}})
+        return line
+
+    def _flow(self, line: str) -> float:
+        return next(s["latest"]["flow_m3s"] for s in self.manager.section_state() if s["id"] == line)
+
+    async def test_a_settled_river_flows_from_the_first_seconds_and_after_reset(self) -> None:
+        m = self.manager
+        line = self._river()
+        debris = m.apply_object_add({"type": "DEBRIS", "position": [0.0, 1.0, 0.0]})["id"]
+        where = list(m.world.objects[debris].position)
+        result = await m.apply_water_settle({})
+        self.assertTrue(result["steady"], msg=str(result))
+        self.assertLess(result["after_s"], 900.0)
+        water = m.world.water
+        self.assertIsNotNone(water.initial_flow)
+        # what settling switched off is back, and nothing moved or kept its clock
+        self.assertTrue(water.hydrograph_enabled)
+        self.assertEqual(water.rain_intensity_mm_h, 50.0)
+        self.assertEqual(m.world.objects[debris].position, where)
+        self.assertEqual((m.status, m.sim_time), (m.IDLE, 0.0))
+        # base flow only for the check: the flood wave would start at t = 0
+        m.apply_river_inlet({"hydrograph": {"enabled": False}})
+        m.world.water.rain_intensity_mm_h = 0.0
+        for attempt in ("start", "after reset"):
+            if attempt == "after reset":
+                m.reset()
+            m.start()
+            for _ in range(5 * 60):
+                m._step_once()
+            self.assertAlmostEqual(self._flow(line), 12.0, delta=0.03 * 12.0, msg=attempt)
+            m.pause()
+        restored = WorldState.from_dict(m.world.to_dict())
+        self.assertEqual(restored.water.initial_flow, water.initial_flow)
+
+    async def test_settle_is_refused_while_running_and_can_be_cleared(self) -> None:
+        m = self.manager
+        line = self._river()
+        m.start()
+        with self.assertRaises(ValueError):
+            await m.apply_water_settle({})
+        m.reset()
+        await m.apply_water_settle({})
+        await m.apply_water_settle({"clear": True})
+        self.assertIsNone(m.world.water.initial_flow)
+        m.apply_river_inlet({"hydrograph": {"enabled": False}})
+        m.start()
+        for _ in range(5 * 60):
+            m._step_once()
+        self.assertLess(self._flow(line), 1.0, msg="a cleared world starts dry again")
+        with self.assertRaises(ValueError):
+            WorldState.from_dict({**m.world.to_dict(),
+                                  "water": {**m.world.water.to_dict(), "initial_flow": {"h": 1}}})
+
+
 class BridgeBackwaterTests(unittest.IsolatedAsyncioTestCase):
     """v0.18.0: the Bridge scenario as the river's acceptance scene.
 

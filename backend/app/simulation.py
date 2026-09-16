@@ -303,6 +303,89 @@ class SimulationManager:
                 "width_m": water.inlet_width_m,
                 "discharge_m3s": water.inlet_discharge_m3s}
 
+    def settle_step(self) -> None:
+        """One tick of settling: the ordinary tick, nothing else."""
+        self._step_once()
+
+    async def apply_water_settle(self, fields: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        """v0.18.1: start the world with its river already flowing.
+
+        Runs the river at its BASE discharge -- flood wave, rain and erosion off,
+        so what is stored is the ordinary river and not a moment of a storm or
+        a reshaped bed -- until the water on the map stops changing: its volume
+        over `SETTLE_WINDOW_S` moves by less than `SETTLE_TOLERANCE`, after at
+        least `SETTLE_MIN_S`, at most `SETTLE_MAX_S`. Then the depth and face
+        velocities are stored in `water.initial_flow`, every object goes back
+        where it was, and the world is at t = 0 with a flowing river. Load and
+        RESET both start from it. `{"clear": true}` forgets it.
+
+        Yields to the event loop between chunks, so the stream keeps running
+        and the river can be watched filling.
+        """
+        fields = fields or {}
+        if self.status != self.IDLE:
+            raise ValueError("settle the river while the simulation is stopped (IDLE)")
+        if getattr(self, "_settling", False):
+            raise ValueError("already settling")
+        if fields.get("clear"):
+            self.world.water.initial_flow = None
+            self.fluid.initialize(self.world)
+            self.rigid.initialize(self.world, self.fluid, self.events)
+            self._reset_gauges()
+            return {"settled": False, "cleared": True}
+        before = self.world.clone()
+        water = self.world.water
+        saved = (water.hydrograph_enabled, water.rain_intensity_mm_h, water.erosion_enabled)
+        water.hydrograph_enabled, water.rain_intensity_mm_h, water.erosion_enabled = False, 0.0, False
+        water.initial_flow = None
+        self._settling = True
+        steady = False
+        try:
+            self.sim_time = 0.0
+            self.fluid.initialize(self.world)
+            self.rigid.initialize(self.world, self.fluid, self.events)
+            self._reset_gauges()
+            self._obstacle_snapshot = self.rigid.obstacle_snapshot()
+            self.terrain_revision += 1
+            self.obstacle_revision += 1
+            ticks = int(round(config.SETTLE_WINDOW_S / config.FIXED_DT))
+            previous = None
+            while self.sim_time < config.SETTLE_MAX_S:
+                for n in range(ticks):
+                    self.settle_step()
+                    if n % 60 == 59:
+                        await asyncio.sleep(0)
+                volume = float(self.fluid.diagnostics().get("volume_m3", 0.0))
+                if (previous is not None and self.sim_time >= config.SETTLE_MIN_S
+                        and abs(volume - previous) <= config.SETTLE_TOLERANCE * max(volume, 1.0)):
+                    steady = True
+                    break
+                previous = volume
+            flow = self.fluid.capture_flow()
+            settled_after = self.sim_time
+            final_volume = float(self.fluid.diagnostics().get("volume_m3", 0.0))
+        finally:
+            self._settling = False
+            restored = before
+            (restored.water.hydrograph_enabled, restored.water.rain_intensity_mm_h,
+             restored.water.erosion_enabled) = saved
+            self.world = restored
+            self.sim_time = 0.0
+        self.world.water.initial_flow = flow
+        self.initial = None
+        self.fluid.initialize(self.world)
+        self.rigid.initialize(self.world, self.fluid, self.events)
+        self._reset_gauges()
+        self._reset_combustion()
+        self.terrain_revision += 1
+        self.obstacle_revision += 1
+        self._obstacle_snapshot = self.rigid.obstacle_snapshot()
+        self.fluid.set_boundaries(self.world.terrain, self._obstacle_snapshot,
+                                  self.terrain_revision, self.obstacle_revision)
+        self._flush_final_frame = True
+        return {"settled": True, "steady": steady, "after_s": round(settled_after, 1),
+                "volume_m3": round(final_volume, 1)}
+
     def apply_river_outlet(self, fields: Dict[str, Any]) -> Dict[str, Any]:
         """Narrow the east-edge outlet to a band, or (width 0) open it fully.
 
@@ -507,6 +590,8 @@ class SimulationManager:
 
     # ------------------------------------------------------------------ clock control
     def start(self) -> None:
+        if getattr(self, "_settling", False):
+            raise ValueError("the river is settling; wait for it to finish")
         if self.status == self.RUNNING:
             return
         if self.status == self.PAUSED:
@@ -543,6 +628,7 @@ class SimulationManager:
         self.status = self.IDLE
         self.sim_time = 0.0
         self.events.record(self.sim_time, EventType.SIM_RESET, cause="user")
+        self._flush_final_frame = self.world.water.initial_flow is not None
         self.fluid.initialize(self.world)
         self.rigid.initialize(self.world, self.fluid, self.events)
         self._reset_gauges()
@@ -589,6 +675,8 @@ class SimulationManager:
             self.engine.init_particles(config.PARTICLE_COUNT, self.world.water.level)
         self.events.record(self.sim_time, EventType.WORLD_LOADED, cause="user",
                            name=name)
+        # v0.18.1: a settled world shows its river before PLAY
+        self._flush_final_frame = self.world.water.initial_flow is not None
 
     # ------------------------------------------------------------------ physics loop
     def _step_once(self) -> None:
@@ -920,7 +1008,7 @@ class SimulationManager:
         particle_count = 0
         lava_active = bool(getattr(self.fluid, "_lava_enabled", False))
         if self.status == self.RUNNING or self._flush_final_frame:
-            if self.status == self.PAUSED:
+            if self.status in (self.PAUSED, self.IDLE):
                 self._flush_final_frame = False
             positions = self.fluid.get_flow_particles()
             particle_count = len(positions)

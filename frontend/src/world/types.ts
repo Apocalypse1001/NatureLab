@@ -80,6 +80,8 @@ export interface WorldData {
            inlet_discharge_m3s?: number; outlet_width_m?: number;
            // v0.18.0 flood hydrograph on the inlet (backend/app/hydrograph.py)
            hydrograph?: Hydrograph;
+           // v0.18.1: whether the world starts with its river flowing
+           initial_flow?: boolean;
            // v0.16.0: what lies beyond the open east edge
            outlet_kind?: OutletKind;
            // RainLab-1 (docs/14_rain_plan.md): rain in mm/h (= L/m² per hour),

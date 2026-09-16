@@ -36,6 +36,8 @@ export interface UICallbacks {
   setEdgeInflow(enabled: boolean): void;
   // v0.18.0: colour the water by its local Froude number
   setFroudeView(on: boolean): void;
+  // v0.18.1: run the river to a steady state and start from it (or forget it)
+  settleRiver(clear: boolean): void;
   loadScenario(name: string): void;
   getObjects(): ObjectData[];
 }
@@ -51,10 +53,11 @@ export interface UICallbacks {
  */
 const SCENARIOS: { name: string; label: string; hint: string }[] = [
   { name: 'scenario_river', label: 'River',
-    hint: 'A town on the bank of a running river. At the discharge it ships '
-        + 'with, the channel runs about a metre deep and the town stays dry. '
-        + 'Take Q to the top of the slider and the channel goes bankfull -- '
-        + 'about 13 cm of water in the street after some three minutes' },
+    hint: 'A town on the bank of a running river, already flowing when it opens. '
+        + 'At the discharge it ships with, the channel runs about 0.7 m deep and '
+        + 'the town stays dry. Take Q to the top of the slider and the river '
+        + 'leaves its bed: water reaches the street in about a minute and a half '
+        + 'and stands about 8 cm deep there after three minutes' },
   { name: 'scenario_sewer', label: 'Sewer',
     hint: 'The river town in a downpour, with a storm sewer: three street inlets '
         + 'on 150 mm pipes down to the river. Water runs to each grate, goes down '
@@ -64,7 +67,7 @@ const SCENARIOS: { name: string; label: string; hint: string }[] = [
         + 'gets there sooner); lay a wider one with "Lay pipe"' },
   { name: 'scenario_bridge', label: 'Bridge',
     hint: 'The river town with a bridge on five piers, and a gauging line above and '
-        + 'below it. Once the river has filled (a few minutes), click a line: the same '
+        + 'below it; the river is already flowing. Click a line: the same '
         + 'discharge passes both, but the level drops faster across the bridge -- the '
         + 'piers back the water up by about 2 cm and it shoots between them (tick '
         + '"Colour water by Froude number" and look for white and red). Honest limit: '
@@ -313,6 +316,19 @@ export class UI {
       this.drawHydrograph();
     };
     flow.append(discharge);
+
+    // v0.18.1: start from a flowing river instead of a dry channel
+    const settleRow = el('div', 'palette');
+    const settle = btn('Settle river', () => {
+      this.setSettled(false, 'settling, the river is filling (about a minute)...');
+      this.cb.settleRiver(false);
+    });
+    settle.id = 'settle-river';
+    const dry = btn('Start dry', () => this.cb.settleRiver(true));
+    dry.id = 'settle-clear';
+    settleRow.append(settle, dry);
+    flow.append(settleRow);
+    flow.insertAdjacentHTML('beforeend', '<div class="hint" id="settle-state">Starts dry</div>');
 
     // v0.18.0: a flood wave on top of Q -- rises to a peak, falls back
     const hydroRow = el('label', 'slider-row', 'Flood wave (hydrograph on top of Q)');
@@ -669,6 +685,13 @@ export class UI {
     now.setAttribute('x2', x);
     if (text) text.textContent = `Inlet now ${this.hydroAt(this.simTime).toFixed(1)} m³/s`
       + (this.hydro.enabled ? '' : ' (no flood wave)');
+  }
+
+  /** v0.18.1: whether the loaded world starts with its river flowing. */
+  setSettled(settled: boolean, note = ''): void {
+    const text = this.root.querySelector('#settle-state');
+    if (text) text.textContent = (settled ? 'Starts with the river flowing' : 'Starts dry')
+      + (note ? ` -- ${note}` : '');
   }
 
   setRiverInletEnabled(enabled: boolean): void {
