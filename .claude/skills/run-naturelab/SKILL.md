@@ -146,8 +146,9 @@ correct for a fixed scene and is what keeps the upload counters flat.
 ## Test
 
 ```bash
-python tests/test_backend.py          # 21 CUDA/Warp tests, ~8s, needs no server
-node tests/e2e.mjs                    # 17 browser checks, spawns its own backend on 8756
+python tests/test_backend.py          # 137 CUDA/Warp tests, ~12 min, needs no server
+python tests/test_backend.py SewerTests   # one class at a time
+node tests/e2e.mjs                    # 21 browser checks, spawns its own backend on 8756
 ```
 
 Do **not** use `tests/run_all.bat` unless you have produced a PyInstaller build first —
@@ -228,6 +229,18 @@ Writes `releases/NatureLab_v<version>.zip` (frontend `dist/` included, `.git`/
 - **Sim state persists across driver commands, not across driver runs.** Each driver
   process spawns and kills its own backend, so every run starts at `IDLE, t=0.0s, 0
   objects`. `data/` is empty by default — nothing is auto-loaded.
+
+- **Storm sewer (v0.17.0): a pipe carries water, it does not hold it.** `STORM_INLET`,
+  `PIPE`, `OUTFALL` (`backend/app/sewer.py`); lay one with `send {"op":"pipe_add","pipe":
+  {"points":[[x,0,z],[x2,0,z2]],"diameter_m":0.15}}` (missing inlet/outfall are created).
+  Per-pipe flow, capacity and status (`ok`/`uphill`/...) arrive in the state message as
+  `sewer`. Measure a scene with `python docs/probe_sewer_v1.py base 600`. Two traps:
+  a pipe that looks absent may be drawn through the terrain (check the tube against
+  `terrain.heightAt`, not the store), and a grate is only honest if water standing over
+  it means its pipe runs full -- `SewerTests` asserts that on the shipped scenario.
+- **Clicking the 3D view from puppeteer:** set the camera, then wait ~1.5 s before
+  projecting world points to the screen. The orbit controls are damped, and clicks
+  projected at once landed 9 m off.
 
 ## Troubleshooting
 
