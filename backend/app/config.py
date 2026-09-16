@@ -80,6 +80,10 @@ WATER_DENSITY = 1000.0
 RIGID_STOP_SPEED = 1.0e-3
 GAUGE_HISTORY_CAPACITY = 600
 GAUGE_HISTORY_INTERVAL = 0.1
+# v0.18.0 gauging line (backend/app/sections.py): a default long enough to span
+# the River scenario's channel and banks with room to spare
+SECTION_WIDTH_M = 40.0
+SECTION_MAX_WIDTH_M = 2000.0
 
 # --------------------------------------------------------------- RiverLab (v0.6.0)
 # Sediment transport / erosion / deposition on the same grid as h/u/v.

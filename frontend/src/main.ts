@@ -12,6 +12,8 @@ const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hos
 
 const store = new WorldStore();
 let currentSimStatus = 'IDLE';
+// v0.18.0: the loaded world's gravity, for the Froude colouring
+let currentGravity = 9.81;
 // The tsunami wavemaker closes the outlet during a pulse, but the sea past
 // that edge is there all the same; the stream alone cannot say so.
 let tsunamiWorld = false;
@@ -65,6 +67,7 @@ const net = new BackendClient(wsUrl, {
       sceneManager.setEdgeWater(modes.east, modes.west, modes.sides);
     }
     store.applyGaugeStates(state.gauges ?? [], state.gauge_history_capacity ?? 600);
+    ui.updateSections(state.sections ?? []);
     sceneManager.setSewerState(state.sewer ?? [], state.status === 'RUNNING');
     ui.updateSewerReadout(state.sewer ?? []);
     for (const moved of state.moved_objects) {
@@ -168,6 +171,7 @@ const ui = new UI(uiHost, {
   // intensity can be changed while RUNNING
   setRain: (fields) => net.send({ op: 'rain', fields }),
   setEdgeInflow: (enabled) => net.send({ op: 'edge_inflow', enabled }),
+  setFroudeView: (on) => sceneManager.setFroudeView(on, currentGravity),
   setPipeDiameter: (diameterM) => { editor.pipeDiameter = diameterM; },
   extendPipe: (id) => editor.extendPipe(id),
   updatePipe: (id, diameterM) => net.send({ op: 'pipe_update', pipe: { id, diameter_m: diameterM } }),
@@ -180,6 +184,7 @@ const editor = new EditorController(sceneManager, store, net);
 // ---------------------------------------------------------------------- world sync
 function applyWorld(world: WorldData, simStatus: string): void {
   currentSimStatus = simStatus;
+  currentGravity = world.environment?.gravity ?? 9.81;
   editor.terrainEditingEnabled = simStatus !== 'RUNNING';
   store.replaceWorld(world);
   sceneManager.rebuildTerrain(store.terrain);

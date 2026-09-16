@@ -57,6 +57,9 @@ export class SceneManager {
   private static readonly LAVA_TRACER_MAX_C = 1100.0;
   private tracerColors = new Float32Array(0);
   private waterTime = { value: 0 };
+  // v0.18.0: 1 colours the water by its local Froude number
+  private froudeView = { value: 0 };
+  private gravity = { value: 9.81 };
   private _clockStart = performance.now();
   private tracersVisible = true;
   private tracerDisplayLimit = 36000;   // matches config.FLOW_TRACER_COUNT
@@ -341,6 +344,12 @@ export class SceneManager {
     this.scene.add(this.pipePreview);
   }
 
+  /** v0.18.0: colour the water by its local Froude number (or stop). */
+  setFroudeView(on: boolean, gravity = 9.81): void {
+    this.froudeView.value = on ? 1 : 0;
+    this.gravity.value = gravity;
+  }
+
   /** What the water does past the east outlet, the west inflow and the north/south walls. */
   setEdgeWater(east: EdgeWaterMode, west: EdgeWaterMode, sides: EdgeWaterMode): void {
     this.edgeSkirt.setWaterModes(east, west, sides);
@@ -374,6 +383,8 @@ export class SceneManager {
     });
     material.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = this.waterTime;
+      shader.uniforms.uFroudeView = this.froudeView;
+      shader.uniforms.uGravity = this.gravity;
       shader.vertexShader = shader.vertexShader
         .replace('#include <common>', `
           #include <common>
@@ -396,6 +407,8 @@ export class SceneManager {
         .replace('#include <common>', `
           #include <common>
           uniform float uTime;
+          uniform float uFroudeView;
+          uniform float uGravity;
           varying vec2 vFlow;
           varying float vDepth;
           varying float vSpeed;
@@ -461,6 +474,22 @@ export class SceneManager {
           // millimetre over ground is barely visible; fade it in between 1 mm
           // and 1 cm. Lava is untouched -- lavaMix below forces alpha to 1.
           gl_FragColor.a *= smoothstep(0.001, 0.01, vDepth);
+          // v0.18.0: the LOCAL Froude number |u| / sqrt(g h), from the same
+          // streamed velocity and depth everything above reads. Calm water is
+          // blue, water at the critical speed white, water shooting faster
+          // than a surface wave can travel red. Films under 2 cm keep their
+          // ordinary look: |u| over a millimetre of rain is not a river.
+          if (uFroudeView > 0.5) {
+            float fr = vSpeed / sqrt(uGravity * max(vDepth, 0.02));
+            vec3 calm = vec3(0.10, 0.35, 0.85);
+            vec3 critical = vec3(0.95, 0.95, 0.90);
+            vec3 shooting = vec3(0.90, 0.15, 0.10);
+            vec3 ramp = mix(calm, critical, smoothstep(0.3, 1.0, fr));
+            ramp = mix(ramp, shooting, smoothstep(1.0, 1.8, fr));
+            float show = smoothstep(0.02, 0.05, vDepth);
+            gl_FragColor.rgb = mix(gl_FragColor.rgb, ramp, 0.85 * show);
+            gl_FragColor.a = mix(gl_FragColor.a, 0.85, show);
+          }
           // Lava overrides the water treatment above entirely rather than
           // tinting it: foam and blue depth-shading are real-water phenomena
           // that mean nothing for a viscous melt. vLavaTemp is 0 for every
@@ -868,6 +897,16 @@ export class SceneManager {
       group = undefined;
       rebuilt = true;
     }
+    // v0.18.0: a gauging line is drawn from its length and the ground under
+    // its two ends, so moving, turning or lengthening it rebuilds it
+    const sectionKey = obj.type === 'SECTION'
+      ? JSON.stringify([obj.metadata.section_width_m, obj.position, obj.rotation, obj.scale]) : null;
+    if (group && sectionKey !== null && group.userData.sectionKey !== sectionKey) {
+      this.objectsRoot.remove(group);
+      SceneManager.disposeSubtree(group);
+      group = undefined;
+      rebuilt = true;
+    }
     if (group && obj.type === 'BUILDING' && group.userData.floors !== obj.metadata.floors) {
       this.objectsRoot.remove(group);
       SceneManager.disposeSubtree(group);
@@ -878,6 +917,7 @@ export class SceneManager {
       group = buildObjectMesh(obj);
       if (obj.type === 'BUILDING') group.userData.floors = obj.metadata.floors;
       if (pipeKey !== null) group.userData.pipeKey = pipeKey;
+      if (sectionKey !== null) group.userData.sectionKey = sectionKey;
       this.objectsRoot.add(group);
     }
     applyTransform(group, obj);

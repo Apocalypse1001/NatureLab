@@ -57,6 +57,7 @@ class ObjectType(str, enum.Enum):
     OUTFALL = "OUTFALL"
     PIPE = "PIPE"
     MANHOLE = "MANHOLE"      # v0.18.0 Sewer-2: where pipes join
+    SECTION = "SECTION"      # v0.18.0: a gauging line (backend/app/sections.py)
 
     @classmethod
     def register(cls, name: str) -> "ObjectType":
@@ -171,6 +172,12 @@ OBJECT_DEFAULTS: Dict[ObjectType, Dict[str, float]] = {
                        "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
                        "is_static": True,
                        "foundation_height": 0.0, "damage_resistance": 1.0},
+    ObjectType.SECTION: {"mass": 1.0, "friction": 0.0, "buoyancy": 0.0,
+                         "volume_m3": 1.0, "drag_coefficient": 1.0,
+                         "ground_contact_area": 1.0, "cross_sectional_area": 1.0,
+                         "is_static": True,
+                         "section_width_m": config.SECTION_WIDTH_M,
+                         "foundation_height": 0.0, "damage_resistance": 1.0},
     # VolcanoLab (v0.13.0). Placeable vent: a PRESCRIBED-DISCHARGE point source,
     # not a level-held one like SOURCE -- deliberately. A level-held vent would
     # compute `target = level - bed`, and solidified lava piling up around the

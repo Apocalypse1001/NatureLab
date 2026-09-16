@@ -456,6 +456,34 @@ try {
     'the pipe out of the manhole does not carry the first grate');
   report('Lay pipe: a chain through a manhole, joined by clicking it');
 
+  // v0.18.0 gauging line: placed from the palette like any object, it draws,
+  // shows its readout when selected, and sim_state lists it (with no reading
+  // at IDLE -- SectionTests own the numbers).
+  // The Froude colouring is a checkbox on the Water panel.
+  await page.evaluate(() => {
+    const button = [...document.querySelectorAll('.panel.left button')]
+      .find((b) => b.textContent === 'Section');
+    if (!button) throw new Error('no Section button in the object palette');
+    button.click();
+  });
+  await waitFor(() => page.evaluate(() =>
+    [...window.__NL.store.objects.values()].some((o) => o.type === 'SECTION')), 10_000);
+  const sectionId = await page.evaluate(() =>
+    [...window.__NL.store.objects.values()].find((o) => o.type === 'SECTION').id);
+  await page.evaluate((id) => window.__NL.store.select(id), sectionId);
+  await waitFor(() => page.evaluate((id) => {
+    const r = window.__NL.ui.sectionLatest.get(id);
+    return !!document.querySelector('#section-readout') && r !== undefined;
+  }, sectionId), 10_000);
+  const drawn = await page.evaluate((id) => {
+    const group = window.__NL.sceneManager.objectsRoot.getObjectByName(id);
+    return { meshes: group ? group.children.length : 0,
+             froude: !!document.querySelector('#water-froude') };
+  }, sectionId);
+  assert(drawn.meshes >= 5, `gauging line drew ${drawn.meshes} parts`);
+  assert(drawn.froude, 'no Froude colouring checkbox');
+  report('Gauging line: placed, drawn, listed in sim_state; Froude colouring toggle present');
+
   assert(errors.length === 0, errors.join('\n'));
   report('no browser errors');
   // read the version off the running backend rather than hard-coding it, so

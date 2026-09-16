@@ -284,7 +284,7 @@ export class EditorController {
 
   /** Types that live on the ground and may only be moved in the XZ plane. */
   private static readonly GROUND_FIXTURES = new Set(
-    ['SOURCE', 'DRAIN', 'VENT', 'STORM_INLET', 'OUTFALL', 'MANHOLE']);
+    ['SOURCE', 'DRAIN', 'VENT', 'STORM_INLET', 'OUTFALL', 'MANHOLE', 'SECTION']);
 
   private pushSelectedTransform(): void {
     const id = this.store.selectedId;

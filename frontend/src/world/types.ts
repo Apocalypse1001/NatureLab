@@ -5,7 +5,9 @@ export type ObjectType = 'HOUSE' | 'CAR' | 'TREE' | 'BOX' | 'DEBRIS' | 'ROCK'
   // v0.17.0 storm sewer (backend/app/sewer.py)
   | 'STORM_INLET' | 'OUTFALL' | 'PIPE'
   // v0.18.0 Sewer-2: where pipes join
-  | 'MANHOLE';
+  | 'MANHOLE'
+  // v0.18.0: a gauging line across the flow (backend/app/sections.py)
+  | 'SECTION';
 
 /** What one PIPE is doing, streamed in sim_state and in the pipe_* replies. */
 export interface SewerLinkState {
@@ -108,6 +110,7 @@ export interface SimStateMessage {
   moved_objects: { id: string; position: number[]; state: ObjectState; damage: number }[];
   gauge_history_capacity: number;
   gauges: GaugeState[];
+  sections?: SectionState[];
   sewer?: SewerLinkState[];
   fluid?: { solver: string; device?: string; grid?: number[]; substeps: number;
             wet_cells?: number; volume_m3?: number; cfl_dt?: number;
@@ -129,6 +132,27 @@ export interface GaugeSample {
   speed_m_s: number;
 }
 
+/** v0.18.0: what a gauging line reads over one frame. */
+export interface SectionSample {
+  time_s: number;
+  /** net discharge back to front through the line, m3/s (negative = backwards) */
+  flow_m3s: number;
+  area_m2: number;
+  wetted_width_m: number;
+  mean_depth_m: number;
+  mean_velocity_m_s: number;
+  /** the SECTION's Froude number V / sqrt(g A/B), not a local maximum */
+  froude_section: number;
+  level_m: number | null;
+  volume_m3: number;
+}
+
+export interface SectionState {
+  id: string;
+  latest: SectionSample | null;
+  samples: SectionSample[];
+}
+
 export interface GaugeState {
   id: string;
   arrival_time_s: number | null;
@@ -146,7 +170,7 @@ export interface SimEvent {
 
 /** Add new object types here (+ backend defaults) without touching the core. */
 export const OBJECT_TYPES: ObjectType[] = ['HOUSE', 'BUILDING', 'CAR', 'TREE', 'BOX', 'DEBRIS',
-  'ROCK', 'BRIDGE', 'PERSON', 'ROAD', 'SOURCE', 'DRAIN', 'GAUGE', 'VENT',
+  'ROCK', 'BRIDGE', 'PERSON', 'ROAD', 'SOURCE', 'DRAIN', 'GAUGE', 'SECTION', 'VENT',
   // a PIPE is laid with the Pipe tool, not dropped on a grid
   'STORM_INLET', 'MANHOLE', 'OUTFALL'];
 
@@ -167,6 +191,7 @@ export const OBJECT_COLORS: Record<string, number> = {
   PIPE: 0x8a939c,
   DRAIN: 0xd85f4f,
   GAUGE: 0x62e6ff,
+  SECTION: 0xffd23f,
   VENT: 0xff5a1f,
   BUILDING: 0x9aa0ab,
 };

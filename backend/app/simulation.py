@@ -14,7 +14,7 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 import numpy as np
 
-from . import config, protocol, sewer
+from . import config, protocol, sections, sewer
 from .compute_engine import ComputeEngine, create_engine
 from .events import EventLog, EventType
 from .fluid_solver import SOLID_OBSTACLE_TYPES, FluidSolver, create_fluid_solver
@@ -69,6 +69,8 @@ class SimulationManager:
         self._combustion_emitted: Dict[str, str] = {}
         self._velocity_frame = 0
         self._gauges: Dict[str, GaugeRuntime] = {}
+        self._sections: Dict[str, GaugeRuntime] = {}
+        self._section_key = None
         self.selftest_result: Dict[str, Any] = {}
         try:
             self.selftest_result = self.engine.selftest()
@@ -408,6 +410,8 @@ class SimulationManager:
                     sewer.validate_pipe_metadata({**obj.metadata, **value})
                 elif obj.type in sewer.SEWER_TYPES:
                     sewer.validate_node_metadata(value)
+                elif obj.type == sections.SECTION_TYPE:
+                    sections.validate_section_metadata(value)
                 obj.metadata.update(value)
             else:
                 raise ValueError(f"field is not editable: {key}")
@@ -617,6 +621,7 @@ class SimulationManager:
             self._obstacle_snapshot = self.rigid.obstacle_snapshot()
         self.fluid.set_boundaries(self.world.terrain, self._obstacle_snapshot,
                                   self.terrain_revision, self.obstacle_revision)
+        self._sync_sections()
         self.fluid.advance(dt, config.FLUID_MAX_SUBSTEPS, config.FLUID_STABILITY_DT)
         samples = self.fluid.sample_for_bodies(
             self.rigid.buffer.positions, self.rigid.buffer.velocities,
@@ -626,6 +631,7 @@ class SimulationManager:
         self.rigid.step(dt, self.sim_time, samples)
         self.sim_time += dt
         self._update_gauges(self.sim_time)
+        self._update_sections(self.sim_time)
         self._check_bridge_decks(self.sim_time)
         self._check_lava_ignition(dt, self.sim_time)
         self._steps_in_window += 1
@@ -760,6 +766,64 @@ class SimulationManager:
         self._gauges = {oid: GaugeRuntime()
                         for oid, obj in self.world.objects.items()
                         if obj.type == "GAUGE"}
+        # v0.18.0 gauging lines keep their own history; a reset or a load
+        # starts their readings, and their running volume, from zero
+        self._sections: Dict[str, GaugeRuntime] = {}
+        self._section_key = None
+        if hasattr(self.fluid, "set_sections"):
+            self.fluid.set_sections([], key=None)
+
+    def _sync_sections(self) -> None:
+        """Hand the solver the faces of every gauging line, when they change."""
+        if not hasattr(self.fluid, "set_sections"):
+            return
+        width, height = getattr(self.fluid, "_width", 0), getattr(self.fluid, "_height", 0)
+        lines = [o for o in self.world.objects.values() if o.type == sections.SECTION_TYPE]
+        key = (width, height, float(self.world.terrain.cell_size),
+               tuple((o.id, round(o.position[0], 4), round(o.position[2], 4),
+                      round(float(o.rotation[1]), 6), round(sections.section_length(o), 4))
+                     for o in lines))
+        if key == self._section_key:
+            return
+        self._section_key = key
+        self.fluid.set_sections(
+            sections.faces_for(lines, width, height, float(self.world.terrain.cell_size)),
+            key=key)
+        self._sections = {o.id: self._sections.get(o.id, GaugeRuntime()) for o in lines}
+
+    def _update_sections(self, sample_time: float) -> None:
+        if not hasattr(self.fluid, "section_readings"):
+            return
+        gravity = float(self.world.environment.gravity)
+        for sid, flow, area, wet, level, total in self.fluid.section_readings():
+            runtime = self._sections.get(sid)
+            if runtime is None:
+                continue
+            sample = sections.reading(flow, area, wet, level, gravity)
+            sample["time_s"] = round(sample_time, 3)
+            sample["volume_m3"] = total
+            runtime.latest = sample
+            if sample_time + 1.0e-9 >= runtime.next_history_time:
+                runtime.history.append(sample)
+                runtime.pending.append(sample)
+                while runtime.next_history_time <= sample_time + 1.0e-9:
+                    runtime.next_history_time += config.GAUGE_HISTORY_INTERVAL
+
+    def section_state(self, drain: bool = False) -> List[Dict[str, Any]]:
+        """Per gauging line: the latest reading and, when `drain`, the history
+        samples not yet sent."""
+        out = []
+        # every line in the world, read or not yet: one laid at IDLE is listed
+        # (with no reading) before the first tick hands it to the solver
+        for obj in self.world.objects.values():
+            if obj.type != sections.SECTION_TYPE:
+                continue
+            runtime = self._sections.get(obj.id)
+            out.append({"id": obj.id, "latest": runtime.latest if runtime else None,
+                        "samples": list(runtime.pending) if (runtime and drain) else []})
+            if runtime and drain:
+                runtime.pending.clear()
+        return out
 
     def _update_gauges(self, sample_time: float) -> None:
         for oid, runtime in self._gauges.items():
@@ -919,6 +983,7 @@ class SimulationManager:
             "particles": particle_count,
             "gauge_history_capacity": config.GAUGE_HISTORY_CAPACITY,
             "gauges": self._serialize_gauges(),
+            "sections": self.section_state(drain=True),
             "events": self.events.take_pending(),
             "moved_objects": [{"id": oid, "position": [float(round(p, 3)) for p in pos],
                                 "state": state, "damage": round(float(damage), 3)}

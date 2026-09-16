@@ -804,6 +804,47 @@ if WARP_IMPORTED:
 
 
     @wp.kernel
+    def _section_flux(h: wp.array(dtype=float), u: wp.array(dtype=float),
+                      v: wp.array(dtype=float), bed: wp.array(dtype=float),
+                      solid: wp.array(dtype=wp.int32), inlet_q: wp.array(dtype=float),
+                      cell_a: wp.array(dtype=wp.int32), cell_b: wp.array(dtype=wp.int32),
+                      axis: wp.array(dtype=wp.int32), sign: wp.array(dtype=float),
+                      owner: wp.array(dtype=wp.int32),
+                      volume: wp.array(dtype=float), area: wp.array(dtype=float),
+                      wet: wp.array(dtype=float), level: wp.array(dtype=float),
+                      width: int, dx: float, dt: float, dry: float):
+        """v0.18.0 gauging lines (backend/app/sections.py): book, per line, the
+        water its faces carry this substep.
+
+        Launched immediately before `_depth_step`, on the same `h`, `u`, `v`,
+        `bed` it reads, through the same `_upwind_flux` and the same inlet-band
+        branch -- so what a line reports is the discharge continuity moves, not
+        a reconstruction of it. Everything is booked as time integrals (m3,
+        m2*s, m*s) and divided by the frame length when folded.
+        """
+        k = wp.tid()
+        a = cell_a[k]
+        b = cell_b[k]
+        if solid[a] != 0 or solid[b] != 0:
+            return
+        q = float(0.0)
+        if axis[k] == 0:
+            q = _upwind_flux(u[a], h[a], bed[a], h[b], bed[b])
+            j = a // width
+            if a % width == 0 and inlet_q[j] > 0.0:
+                q = wp.min(inlet_q[j], h[a] * dx / dt)
+        else:
+            q = _upwind_flux(v[a], h[a], bed[a], h[b], bed[b])
+        s = owner[k]
+        wp.atomic_add(volume, s, sign[k] * q * dx * dt)
+        depth = 0.5 * (h[a] + h[b])
+        if depth > dry:
+            wp.atomic_add(area, s, depth * dx * dt)
+            wp.atomic_add(wet, s, dx * dt)
+            wp.atomic_add(level, s, 0.5 * (h[a] + bed[a] + h[b] + bed[b]) * dx * dt)
+
+
+    @wp.kernel
     def _sewer_route(step: wp.array(dtype=float), outfall_of: wp.array(dtype=wp.int32),
                      outfall_volume: wp.array(dtype=float), frame: wp.array(dtype=float)):
         """Hand what every storm inlet took this substep to its pipe's outfall.
@@ -1648,6 +1689,10 @@ class WarpShallowWaterSolver(FluidSolver):
         self._inlet_flow_m3s: list = []
         self._inlet_capacity_m3s: list = []
         self._diag_sewer_in = self._diag_sewer_out = None
+        self._section_faces = 0
+        self._section_ids: list = []
+        self._section_key = None
+        self._section_readings: list = []
         self._inlet_demand_frame = None
         self._inlet_demand_m3s = []
         self._sewer_in_m3 = self._sewer_out_m3 = 0.0
@@ -2269,6 +2314,41 @@ class WarpShallowWaterSolver(FluidSolver):
             inside &= self._obstacle_host.reshape(height, width)[jj, ii] == 0
         return float(np.sum((1.0 - (r / radius) ** 2)[inside])) * dx * dx
 
+    def set_sections(self, sections: list, key=None) -> None:
+        """v0.18.0 gauging lines: `sections` is (id, (cell_a, cell_b, axis,
+        sign)) per line, from `sections.faces_for`. Re-uploaded only when `key`
+        changes, so a line read every tick costs one kernel launch, not an
+        upload. Readings restart from zero when the lines change."""
+        if key is not None and key == self._section_key and self._h is not None:
+            return
+        self._section_key = key
+        self._section_ids = [sid for sid, _faces in sections]
+        count = len(sections)
+        self._section_readings = []
+        self._section_cumulative = [0.0] * count
+        parts = [faces for _sid, faces in sections]
+        total = sum(len(f[0]) for f in parts)
+        self._section_faces = int(total)
+        if not total:
+            return
+        owner = np.concatenate([np.full(len(f[0]), n, np.int32) for n, f in enumerate(parts)])
+        cat = lambda k, dtype: np.concatenate([f[k] for f in parts]).astype(dtype)
+        self._section_a = wp.array(cat(0, np.int32), dtype=wp.int32, device=self.device)
+        self._section_b = wp.array(cat(1, np.int32), dtype=wp.int32, device=self.device)
+        self._section_axis = wp.array(cat(2, np.int32), dtype=wp.int32, device=self.device)
+        self._section_sign = wp.array(cat(3, np.float32), dtype=float, device=self.device)
+        self._section_owner = wp.array(owner, dtype=wp.int32, device=self.device)
+        self._section_volume = wp.zeros(count, dtype=float, device=self.device)
+        self._section_area = wp.zeros(count, dtype=float, device=self.device)
+        self._section_wet = wp.zeros(count, dtype=float, device=self.device)
+        self._section_level = wp.zeros(count, dtype=float, device=self.device)
+
+    def section_readings(self) -> list:
+        """Per line, over the last frame: (id, flow m3/s, area m2, wetted width
+        m, mean surface level m or None, cumulative m3 since the lines were
+        set)."""
+        return list(self._section_readings)
+
     def set_sewer(self, inlets: list, outfalls: list, measure_demand: bool = False) -> None:
         """v0.17.0 storm sewer, from backend/app/sewer.py's `resolve`.
 
@@ -2548,6 +2628,17 @@ class WarpShallowWaterSolver(FluidSolver):
                       device=self.device)
             self._u, self._next_u = self._next_u, self._u
             self._v, self._next_v = self._next_v, self._v
+            if self._section_faces:
+                wp.launch(_section_flux, dim=self._section_faces,
+                          inputs=[self._h, self._u, self._v, self._bed, self._obstacles,
+                                  self._inlet_q, self._section_a, self._section_b,
+                                  self._section_axis, self._section_sign,
+                                  self._section_owner, self._section_volume,
+                                  self._section_area, self._section_wet,
+                                  self._section_level, self._width,
+                                  float(self._terrain.cell_size), dt,
+                                  config.FLUID_DRY_DEPTH],
+                          device=self.device)
             wp.launch(_depth_step, dim=self._count, inputs=[self._h, self._u,
                       self._v, self._bed, self._obstacles, self._next_h,
                       self._inlet_q,
@@ -2871,6 +2962,24 @@ class WarpShallowWaterSolver(FluidSolver):
             # up as an unexplained conservation error, not as a feature.
             self._solidified_m3 += float(self._diag_solidified.numpy()[0])
             self._diag_solidified.zero_()
+        if self._section_faces:
+            # v0.18.0 gauging lines: time integrals over this frame -> means
+            span = max(float(getattr(self, "_frame_dt", 0.0)), 1.0e-9)
+            volume = np.asarray(self._section_volume.numpy(), dtype=np.float64)
+            area = np.asarray(self._section_area.numpy(), dtype=np.float64)
+            wet = np.asarray(self._section_wet.numpy(), dtype=np.float64)
+            level = np.asarray(self._section_level.numpy(), dtype=np.float64)
+            readings = []
+            for n, sid in enumerate(self._section_ids):
+                self._section_cumulative[n] += float(volume[n])
+                readings.append((sid, float(volume[n]) / span, float(area[n]) / span,
+                                 float(wet[n]) / span,
+                                 float(level[n] / wet[n]) if wet[n] > 0.0 else None,
+                                 self._section_cumulative[n]))
+            self._section_readings = readings
+            for array in (self._section_volume, self._section_area, self._section_wet,
+                          self._section_level):
+                array.zero_()
         if self._diag_sewer_in is not None:
             # v0.17.0: what the inlets took and what the outfalls poured out,
             # and per inlet the flow over this frame -- what a pipe is carrying

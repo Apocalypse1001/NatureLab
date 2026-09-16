@@ -1,7 +1,7 @@
 /** HUD: top bar, object palette, properties panel, terrain/water controls,
  *  debug strip. Pure DOM — no framework, easy to extend. */
 import { OBJECT_TYPES, type GaugeSample, type GaugeState, type ObjectData,
-  type ObjectType, type OutletKind, type SewerLinkState, type SimEvent,
+  type ObjectType, type OutletKind, type SectionState, type SewerLinkState, type SimEvent,
   type WorldData } from '../world/types';
 
 export interface UICallbacks {
@@ -32,6 +32,8 @@ export interface UICallbacks {
   setRiverOutlet(fields: { width_m?: number; kind?: OutletKind }): void;
   setRain(fields: { intensity_mm_h: number }): void;
   setEdgeInflow(enabled: boolean): void;
+  // v0.18.0: colour the water by its local Froude number
+  setFroudeView(on: boolean): void;
   loadScenario(name: string): void;
   getObjects(): ObjectData[];
 }
@@ -117,6 +119,9 @@ export class UI {
   private propsHost: HTMLElement;
   private selectedId: string | null = null;
   private sewerLinks: SewerLinkState[] = [];
+  // v0.18.0 gauging lines: the latest reading and a discharge history per line
+  private sectionLatest = new Map<string, SectionState['latest']>();
+  private sectionHistory = new Map<string, number[]>();
 
   constructor(root: HTMLElement, private cb: UICallbacks) {
     this.root = root;
@@ -324,6 +329,19 @@ export class UI {
       this.cb.setRiverOutlet({ kind: outletKind.value as OutletKind });
     flow.append(outletKind);
     panel.append(flow);
+
+    // v0.18.0: the local Froude number |u| / sqrt(g h) painted on the water
+    const froudeRow = el('label', 'slider-row', 'Colour water by Froude number');
+    const froude = el('input', '') as HTMLInputElement;
+    froude.id = 'water-froude';
+    froude.type = 'checkbox';
+    froude.onchange = () => this.cb.setFroudeView(froude.checked);
+    froudeRow.append(froude);
+    panel.append(froudeRow);
+    panel.append(el('p', 'hint',
+      'Blue: calm, slower than a surface wave travels (Fr < 1). White: critical '
+      + '(Fr = 1). Red: shooting, faster than a wave can go upstream (Fr > 1) -- '
+      + 'what you see between bridge piers and over a weir.'));
 
     const erosionRow = el('label', 'slider-row', 'Erosion (river reshapes the bed)');
     const erosion = el('input', '') as HTMLInputElement;
@@ -716,6 +734,11 @@ export class UI {
       ['Diameter (mm)', 'pipe_d', (obj.metadata.diameter_m ?? 0.2) * 1000,
        (v) => this.cb.updatePipe(obj.id, Math.max(50, Math.min(2000, v)) / 1000)],
     );
+    if (obj.type === 'SECTION') fields.push(
+      ['Line length (m)', 'section_width', obj.metadata.section_width_m ?? 40,
+       (v) => this.cb.updateObject(obj.id,
+         { metadata: { ...obj.metadata, section_width_m: Math.max(1, Math.min(2000, v)) } })],
+    );
     // v0.18.0: pipes are buried; a node's depth sets the height of the pipe
     // bottom there, and a pipe's fall is bottom to bottom
     if (sewerPart && obj.type !== 'PIPE') fields.push(
@@ -723,7 +746,7 @@ export class UI {
        (v) => this.cb.updateObject(obj.id,
          { metadata: { ...obj.metadata, invert_depth_m: Math.max(0, Math.min(8, v)) } })],
     );
-    if (obj.type !== 'GAUGE' && !sewerPart) fields.push(
+    if (obj.type !== 'GAUGE' && obj.type !== 'SECTION' && !sewerPart) fields.push(
       ['Mass (kg)', 'mass', obj.mass, (v) => this.cb.updateObject(obj.id, { mass: v })],
       ['Friction', 'friction', obj.friction, (v) => this.cb.updateObject(obj.id, { friction: v })],
       ['Sealed buoyancy (0–1)', 'buoyancy', obj.buoyancy,
@@ -775,6 +798,22 @@ export class UI {
       };
       row.append(input);
       host.append(row);
+    }
+    if (obj.type === 'SECTION') {
+      const readout = el('div', 'gauge-readout');
+      readout.id = 'section-readout';
+      readout.innerHTML =
+        '<h3>Gauging line</h3>' +
+        '<div>Discharge <strong id="section-q">--</strong></div>' +
+        '<div>Water width <strong id="section-width">--</strong></div>' +
+        '<div>Mean depth <strong id="section-depth">--</strong></div>' +
+        '<div>Mean speed <strong id="section-speed">--</strong></div>' +
+        '<div>Froude (section) <strong id="section-froude">--</strong></div>' +
+        '<div>Water level <strong id="section-level">--</strong></div>' +
+        '<svg id="section-chart" viewBox="0 0 240 70" role="img" aria-label="Discharge history">' +
+        '<polyline points="" /></svg>';
+      host.append(readout);
+      this.renderSectionReadout();
     }
     if (obj.type === 'GAUGE') {
       const readout = el('div', 'gauge-readout');
@@ -841,6 +880,45 @@ export class UI {
         + (why[l.status] ? `<div class="bad">${why[l.status]}`
           + (l.blocked_by ? ` (${l.blocked_by}).` : '') + '</div>' : '');
     }).join('');
+  }
+
+  /** v0.18.0: gauging line readings from a sim_state message. */
+  updateSections(states: SectionState[]): void {
+    for (const state of states) {
+      this.sectionLatest.set(state.id, state.latest);
+      const history = this.sectionHistory.get(state.id) ?? [];
+      for (const sample of state.samples) history.push(sample.flow_m3s);
+      if (history.length > 600) history.splice(0, history.length - 600);
+      this.sectionHistory.set(state.id, history);
+    }
+    this.renderSectionReadout();
+  }
+
+  private renderSectionReadout(): void {
+    const id = this.selectedId;
+    if (!id || !this.root.querySelector('#section-readout')) return;
+    const r = this.sectionLatest.get(id);
+    const set = (sel: string, text: string) => {
+      const node = this.root.querySelector(sel);
+      if (node) node.textContent = text;
+    };
+    const wet = !!r && r.wetted_width_m > 0;
+    set('#section-q', r ? `${r.flow_m3s.toFixed(2)} m³/s` : '--');
+    set('#section-width', wet ? `${r!.wetted_width_m.toFixed(1)} m` : 'dry');
+    set('#section-depth', wet ? `${r!.mean_depth_m.toFixed(2)} m` : '--');
+    set('#section-speed', wet ? `${r!.mean_velocity_m_s.toFixed(2)} m/s` : '--');
+    set('#section-froude', wet ? r!.froude_section.toFixed(2)
+      + (r!.froude_section < 1 ? ' (calm)' : ' (shooting)') : '--');
+    set('#section-level', wet && r!.level_m != null ? `${r!.level_m.toFixed(2)} m` : '--');
+    const line = this.root.querySelector<SVGPolylineElement>('#section-chart polyline');
+    const history = (this.sectionHistory.get(id) ?? []).slice(-240);
+    if (!line || history.length < 2) return;
+    const top = Math.max(0.001, ...history.map((q) => Math.abs(q)));
+    line.setAttribute('points', history.map((q, i) => {
+      const x = i * 240 / Math.max(1, history.length - 1);
+      const y = 68 - Math.max(0, q) / top * 64;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' '));
   }
 
   updateGaugeReadout(state: GaugeState | undefined, history: GaugeSample[]): void {

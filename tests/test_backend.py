@@ -1742,6 +1742,138 @@ class RiverValleyTests(unittest.IsolatedAsyncioTestCase):
                            "water on a sloped bed did not move downstream")
 
 
+class SectionTests(unittest.IsolatedAsyncioTestCase):
+    """v0.18.0 gauging lines (backend/app/sections.py).
+
+    A line reads the face fluxes continuity moves, so these do not compare it
+    with another estimate of the flow; they compare it with what the water
+    itself did: the volume stored between two lines, the discharge that was
+    set at the inlet, zero along the flow and over dry ground.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    def _river(self) -> None:
+        self.manager.apply_terrain_river({})
+        self.manager.apply_water_level(0.0)
+        self.manager.apply_river_inlet({"enabled": True, "width_m": 12.0,
+                                        "discharge_m3s": 12.0})
+        self.manager.apply_river_outlet({"width_m": 20.0})
+
+    def _line(self, x: float, z: float, yaw: float = 0.0, width: float = 60.0) -> str:
+        oid = self.manager.apply_object_add({"type": "SECTION", "position": [x, 0.0, z]})["id"]
+        self.manager.apply_object_update(oid, {"rotation": [0.0, yaw, 0.0],
+                                               "metadata": {"section_width_m": width}})
+        return oid
+
+    def _start(self, prime: float | None = 0.7) -> None:
+        self.manager.start()
+        if prime is not None:
+            bed = self.manager.fluid.get_terrain_heights().reshape(N, N)
+            surface = bed[N // 2, :] + prime
+            h = np.maximum(surface[None, :] - bed, 0.0).astype(np.float32)
+            self.manager.fluid._h.assign(h.ravel())
+
+    def _run(self, seconds: float) -> None:
+        for _ in range(int(round(seconds * 60))):
+            self.manager._step_once()
+
+    def _latest(self, oid: str) -> dict:
+        return next(s["latest"] for s in self.manager.section_state() if s["id"] == oid)
+
+    async def test_two_lines_differ_by_exactly_the_water_stored_between_them(self) -> None:
+        """Across the whole map at x = -50 and x = +50: what the upstream line
+        let in minus what the downstream one let out is the change in volume
+        between them, to a litre-level tolerance -- the line books the same
+        faces continuity moves, or it would not close."""
+        self._river()
+        up, down = self._line(-50.0, 0.0, width=260.0), self._line(50.0, 0.0, width=260.0)
+        self._start()
+        self._run(5.0)
+        cell = self.manager.world.terrain.cell_size
+        x = (np.arange(N) - (N - 1) * 0.5) * cell
+        between = (x >= -50.0) & (x < 50.0)
+
+        def stored() -> float:
+            h = np.asarray(self.manager.fluid._h.numpy(), dtype=np.float64).reshape(N, N)
+            return float(h[:, between].sum() * cell * cell)
+
+        v0, a0, b0 = stored(), self._latest(up)["volume_m3"], self._latest(down)["volume_m3"]
+        self._run(20.0)
+        v1, a1, b1 = stored(), self._latest(up)["volume_m3"], self._latest(down)["volume_m3"]
+        through = a1 - a0
+        self.assertGreater(through, 100.0, msg="the test needs water moving")
+        self.assertAlmostEqual((a1 - a0) - (b1 - b0), v1 - v0, delta=1e-3 * through,
+                               msg=f"in {through:.2f}, out {b1 - b0:.2f}, stored {v1 - v0:.3f} m3")
+
+    async def test_lines_read_the_set_discharge_across_the_flow_and_nothing_along_it(self) -> None:
+        """One developed river, 150 s after priming (earlier the primed channel
+        is still draining and the inlet's edge cell runs short: measured 10.7
+        m3/s at 4 s, 12.05 at 124 s).
+
+        - Across the inlet's own face it reads the discharge that was set.
+        - One face inside, where the solver's `inlet_discharge_m3s` measures, it
+          agrees with that line to the water column 1 stores -- and NOT with
+          that counter, which pairs the depth after the step with the velocity
+          of it and reads about 1.5% low (11.88 against 12.07 at 124 s).
+        - Mid-reach it reads the river, forwards, subcritical (not yet exactly
+          12: the primed channel is still draining).
+        - Turned 90 degrees into the flow it reads about zero: the only check
+          that catches an axis or sign mix-up. Turned round, it reads backwards.
+        """
+        self._river()
+        cell = self.manager.world.terrain.cell_size
+        west = -(N - 1) * 0.5 * cell
+        inlet = self._line(west + 0.5 * cell, 0.0, width=40.0)
+        inside = self._line(west + 1.5 * cell, 0.0, width=40.0)
+        across = self._line(0.0, 0.0, width=60.0)
+        along = self._line(0.0, 0.0, yaw=math.pi / 2, width=60.0)
+        self._start()
+        self._run(150.0)
+        at_inlet, one_in = self._latest(inlet), self._latest(inside)
+        a, b = self._latest(across), self._latest(along)
+        self.assertAlmostEqual(at_inlet["flow_m3s"], 12.0, delta=0.01 * 12.0, msg=str(at_inlet))
+        self.assertAlmostEqual(one_in["flow_m3s"], at_inlet["flow_m3s"], delta=0.005 * 12.0)
+        # mid-reach the primed channel is still giving up its surplus at 150 s
+        # (12.9 m3/s; 12.6 at 164 s) -- the two-line test owns that balance
+        self.assertGreater(a["flow_m3s"], 10.0, msg=str(a))
+        self.assertLess(a["flow_m3s"], 14.0, msg=str(a))
+        self.assertLess(abs(b["flow_m3s"]), 0.02 * a["flow_m3s"], msg=str(b))
+        self.assertGreater(a["wetted_width_m"], 12.0)
+        self.assertAlmostEqual(a["mean_velocity_m_s"], a["flow_m3s"] / a["area_m2"], places=6)
+        self.assertGreater(a["froude_section"], 0.2)
+        self.assertLess(a["froude_section"], 0.8)
+        self.manager.apply_object_update(across, {"rotation": [0.0, math.pi, 0.0]})
+        self._run(1.0)
+        self.assertAlmostEqual(self._latest(across)["flow_m3s"], -a["flow_m3s"],
+                               delta=0.02 * a["flow_m3s"])
+
+    async def test_a_line_over_dry_ground_reads_zero_and_no_nan(self) -> None:
+        self._river()
+        dry = self._line(0.0, 80.0, width=20.0)
+        self._start()
+        self._run(2.0)
+        r = self._latest(dry)
+        self.assertEqual(r["flow_m3s"], 0.0)
+        self.assertEqual(r["froude_section"], 0.0)
+        self.assertIsNone(r["level_m"])
+        self.assertTrue(all(v is None or math.isfinite(v) for v in r.values()))
+
+    async def test_line_width_is_validated_and_saved(self) -> None:
+        line = self._line(0.0, 0.0, width=33.0)
+        restored = WorldState.from_dict(self.manager.world.to_dict())
+        self.assertEqual(restored.objects[line].type, "SECTION")
+        self.assertAlmostEqual(restored.objects[line].metadata["section_width_m"], 33.0)
+        for bad in (0.0, -5.0, 1e9, "wide", True):
+            with self.assertRaises(ValueError):
+                self.manager.apply_object_update(line, {"metadata": {"section_width_m": bad}})
+
+
 class RiverBoundaryTests(unittest.IsolatedAsyncioTestCase):
     """v0.12.0: the local inlet, the local outlet, and the ledger that proves them.
 

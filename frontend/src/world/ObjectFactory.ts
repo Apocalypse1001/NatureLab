@@ -648,6 +648,44 @@ const builders: Record<string, Builder> = {
     return g;
   },
 
+  SECTION: (obj) => {
+    // A gauging line: a rope between two posts, as long as the line the solver
+    // reads, and an arrow at the middle pointing to the side it counts as
+    // downstream. At rotation 0 the rope runs along z and the arrow points +x.
+    // The posts stand on the ground under each end, not at the centre's height:
+    // a line across a channel has its ends on the banks.
+    const g = new THREE.Group();
+    const length = (obj.metadata.section_width_m ?? 40) * obj.scale[2];
+    const yaw = obj.rotation[1];
+    const paint = new THREE.MeshStandardMaterial({ color: OBJECT_COLORS.SECTION, roughness: 0.5,
+      emissive: 0x3a2a00, emissiveIntensity: 0.6 });
+    const post = new THREE.MeshStandardMaterial({ color: 0xf2f2ee, roughness: 0.7 });
+    const endY = (along: number) => {
+      // local (0, along) turned by yaw, as the group will be
+      const wx = obj.position[0] + Math.sin(yaw) * along;
+      const wz = obj.position[2] + Math.cos(yaw) * along;
+      return (groundHeightAt ? groundHeightAt(wx, wz) : obj.position[1]) - obj.position[1];
+    };
+    const ends = [-length / 2, length / 2].map((along) => new THREE.Vector3(0, endY(along) + 1.6, along));
+    for (const end of ends) {
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 1.8, 10), post);
+      pole.position.set(0, end.y - 0.9, end.z);
+      g.add(pole);
+      const cap = new THREE.Mesh(new THREE.SphereGeometry(0.14, 12, 8), paint);
+      cap.position.copy(end);
+      g.add(cap);
+    }
+    const rope = new THREE.Mesh(new THREE.TubeGeometry(
+      new THREE.LineCurve3(ends[0], ends[1]), 8, 0.035, 6, false), paint);
+    g.add(rope);
+    const mid = ends[0].clone().lerp(ends[1], 0.5);
+    const arrow = new THREE.Mesh(new THREE.ConeGeometry(0.28, 0.8, 16), paint);
+    arrow.rotation.z = -Math.PI / 2;     // the cone's tip, +y, turned to +x
+    arrow.position.set(0.5, mid.y, 0);
+    g.add(arrow);
+    return g;
+  },
+
   // ---------------------------------------------------------- storm sewer (v0.17.0)
   STORM_INLET: (obj) => {
     // A street gully: an iron grate over a dark pit, with a faint ring at the
