@@ -12,7 +12,7 @@ import { RainField } from './RainField';
 import { EdgeSkirt, type EdgeWaterMode } from './EdgeSkirt';
 import { SewerView } from './SewerView';
 import type { SewerLinkState } from '../world/types';
-import { applyTransform, buildObjectMesh } from '../world/ObjectFactory';
+import { applyTransform, buildObjectMesh, setGroundHeightSampler } from '../world/ObjectFactory';
 import type { ObjectData } from '../world/types';
 
 export class SceneManager {
@@ -73,6 +73,8 @@ export class SceneManager {
 
   constructor(canvas: HTMLCanvasElement, private terrain: TerrainGrid) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    // v0.17.0: pipes drape over whatever terrain is loaded at the time they build
+    setGroundHeightSampler((x, z) => this.terrain.heightAt(x, z));
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setClearColor(0x0e1420);
     // Shadows are the one cheap thing that makes an object look like it is ON

@@ -15,6 +15,17 @@ import { OBJECT_COLORS, type ObjectData } from './types';
 type Builder = (obj: ObjectData) => THREE.Group;
 
 /**
+ * v0.17.0: the ground height a PIPE drapes over. A straight segment between
+ * two clicked points runs through any rise between them -- a two-point pipe
+ * from the street down to the river was measured 75% under the terrain, which
+ * reads as "no pipe was laid". SceneManager points this at its terrain grid.
+ */
+let groundHeightAt: ((x: number, z: number) => number) | null = null;
+export function setGroundHeightSampler(sample: (x: number, z: number) => number): void {
+  groundHeightAt = sample;
+}
+
+/**
  * A stable pseudo-random number in [0, 1) per object and channel.
  *
  * Used only where nature is not uniform -- trunk lean, boulder yaw, foliage
@@ -705,16 +716,30 @@ const builders: Record<string, Builder> = {
     const origin = obj.position;
     const local = points.map((p) => new THREE.Vector3(
       p[0] - origin[0], p[1] - origin[1] + lift, p[2] - origin[2]));
+    // Each segment is resampled about every metre and never drawn below the
+    // ground under it, so the tube follows a bank instead of tunnelling it.
+    const draped: THREE.Vector3[] = [local[0]];
+    for (let k = 0; k < points.length - 1; k++) {
+      const a = points[k], b = points[k + 1];
+      const steps = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[2] - a[2])));
+      for (let s = 1; s <= steps; s++) {
+        const t = s / steps;
+        const x = a[0] + (b[0] - a[0]) * t, z = a[2] + (b[2] - a[2]) * t;
+        let y = a[1] + (b[1] - a[1]) * t;
+        if (groundHeightAt) y = Math.max(y, groundHeightAt(x, z));
+        draped.push(new THREE.Vector3(x - origin[0], y - origin[1] + lift, z - origin[2]));
+      }
+    }
     const path = new THREE.CurvePath<THREE.Vector3>();
-    for (let k = 0; k < local.length - 1; k++) {
-      path.add(new THREE.LineCurve3(local[k], local[k + 1]));
+    for (let k = 0; k < draped.length - 1; k++) {
+      path.add(new THREE.LineCurve3(draped[k], draped[k + 1]));
     }
     const material = new THREE.MeshStandardMaterial({
       color: OBJECT_COLORS.PIPE, metalness: 0.25, roughness: 0.55,
       transparent: true, opacity: 0.8,
     });
     const tube = new THREE.Mesh(
-      new THREE.TubeGeometry(path, Math.max(8, (local.length - 1) * 24), radius, 12, false),
+      new THREE.TubeGeometry(path, Math.max(8, (draped.length - 1) * 2), radius, 12, false),
       material);
     tube.name = 'pipe-tube';
     g.add(tube);
