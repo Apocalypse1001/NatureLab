@@ -939,6 +939,19 @@ export class SceneManager {
     this.clearSelection();
   }
 
+  /**
+   * v0.17.0: a PIPE is drawn on the ground as it is when its mesh is built, so
+   * a terrain edit has to rebuild every pipe or leave it floating or buried.
+   */
+  redrawPipes(objects: Iterable<ObjectData>): void {
+    for (const obj of objects) {
+      if (obj.type !== 'PIPE') continue;
+      const group = this.objectsRoot.getObjectByName(obj.id);
+      if (group) group.userData.pipeKey = null;
+      this.setObject(obj);
+    }
+  }
+
   clearObjects(): void {
     for (const child of this.objectsRoot.children) SceneManager.disposeSubtree(child);
     this.objectsRoot.clear();

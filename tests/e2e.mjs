@@ -336,6 +336,69 @@ try {
     && scenario.erosion === false, 'scenario water controls out of sync');
   report('Scenarios button loads the dam world and syncs its controls');
 
+  // v0.17.0 storm sewer: laid the way a person lays it -- the Lay pipe button,
+  // two real mouse clicks on open ground, Enter. The user reported a pipe
+  // "appearing one time in ten": the tool worked, but the tube was drawn as a
+  // straight segment through the terrain between the clicks. So this checks
+  // that the pipe is not only in the store but ON the ground along its length.
+  await page.evaluate(() => {
+    const button = [...document.querySelectorAll('.panel.left button')]
+      .find((b) => b.textContent === 'Sewer');
+    if (!button) throw new Error('no Sewer scenario button');
+    button.click();
+  });
+  await waitFor(() => page.evaluate(() =>
+    [...window.__NL.store.objects.values()].filter((o) => o.type === 'PIPE').length === 3));
+  await page.evaluate(() => {
+    const sm = window.__NL.sceneManager;
+    sm.controls.target.set(-45, window.__NL.store.terrain.heightAt(-45, 22), 22);
+    sm.camera.position.set(-20, 40, 60);
+    sm.controls.update();
+  });
+  await sleep(1500);   // the orbit controls damp towards the new view first
+  const ends = await page.evaluate(() => {
+    const sm = window.__NL.sceneManager;
+    const terrain = window.__NL.store.terrain;
+    sm.camera.updateMatrixWorld();
+    const rect = sm.renderer.domElement.getBoundingClientRect();
+    // street to river bank: a straight segment here is 95% under the terrain
+    return [[-45, 40], [-45, 6]].map(([x, z]) => {
+      const p = sm.camera.position.clone().set(x, terrain.heightAt(x, z), z).project(sm.camera);
+      return [rect.x + (p.x + 1) / 2 * rect.width, rect.y + (1 - p.y) / 2 * rect.height];
+    });
+  });
+  await page.click('#lay-pipe');
+  for (const [x, y] of ends) {
+    await page.mouse.click(x, y);
+    await sleep(150);
+  }
+  await page.keyboard.press('Enter');
+  await waitFor(() => page.evaluate(() =>
+    [...window.__NL.store.objects.values()].filter((o) => o.type === 'PIPE').length === 4), 10_000);
+  const laid = await page.evaluate(() => {
+    const { store, sceneManager: sm } = window.__NL;
+    const pipe = [...store.objects.values()].filter((o) => o.type === 'PIPE').at(-1);
+    const group = sm.objectsRoot.getObjectByName(pipe.id);
+    const curve = group.userData.curve;
+    let buried = 0, samples = 0;
+    for (let t = 0; t <= 1; t += 0.02, samples++) {
+      const p = curve.getPoint(t);
+      const x = p.x + pipe.position[0], z = p.z + pipe.position[2];
+      if (p.y + pipe.position[1] < store.terrain.heightAt(x, z) - 0.05) buried++;
+    }
+    const ids = [pipe.metadata.from_id, pipe.metadata.to_id].map((id) => store.objects.get(id)?.type);
+    return { buried, samples, ids, length: curve.getLength(),
+      points: pipe.metadata.points.map((q) => q.map((v) => +v.toFixed(1))) };
+  });
+  assert(laid.ids[0] === 'STORM_INLET' && laid.ids[1] === 'OUTFALL',
+    `laid pipe joins ${laid.ids.join(' -> ')}`);
+  assert(laid.length > 15, `laid pipe is only ${laid.length.toFixed(1)} m long`);
+  const [first, last] = [laid.points[0], laid.points.at(-1)];
+  assert(Math.hypot(first[0] + 45, first[2] - 40) < 2 && Math.hypot(last[0] + 45, last[2] - 6) < 2,
+    `clicks landed at ${JSON.stringify(first)} and ${JSON.stringify(last)}, not the planned route`);
+  assert(laid.buried === 0, `${laid.buried} of ${laid.samples} pipe samples under the terrain`);
+  report('Lay pipe: two clicks and Enter lay a pipe on the ground');
+
   assert(errors.length === 0, errors.join('\n'));
   report('no browser errors');
   // read the version off the running backend rather than hard-coding it, so

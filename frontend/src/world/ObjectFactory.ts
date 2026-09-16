@@ -714,20 +714,25 @@ const builders: Record<string, Builder> = {
     const radius = Math.max(0.12, (obj.metadata.diameter_m ?? 0.2) / 2);
     const lift = radius + 0.05;
     const origin = obj.position;
-    const local = points.map((p) => new THREE.Vector3(
-      p[0] - origin[0], p[1] - origin[1] + lift, p[2] - origin[2]));
-    // Each segment is resampled about every metre and never drawn below the
-    // ground under it, so the tube follows a bank instead of tunnelling it.
+    // Every sample sits on the ground as it is NOW, not at the heights saved
+    // when the pipe was laid: a straight segment between clicked points ran
+    // through any rise between them (a two-point pipe from the street to the
+    // river was measured 75% under the terrain), and a brush stroke after
+    // laying would leave saved heights floating or buried. SceneManager
+    // redraws pipes whenever the terrain changes.
+    const at = (x: number, y: number, z: number) => new THREE.Vector3(
+      x - origin[0], (groundHeightAt ? groundHeightAt(x, z) : y) - origin[1] + lift,
+      z - origin[2]);
+    const local = points.map((p) => at(p[0], p[1], p[2]));
+    // resampled about every metre, so the tube follows a bank
     const draped: THREE.Vector3[] = [local[0]];
     for (let k = 0; k < points.length - 1; k++) {
       const a = points[k], b = points[k + 1];
       const steps = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[2] - a[2])));
       for (let s = 1; s <= steps; s++) {
         const t = s / steps;
-        const x = a[0] + (b[0] - a[0]) * t, z = a[2] + (b[2] - a[2]) * t;
-        let y = a[1] + (b[1] - a[1]) * t;
-        if (groundHeightAt) y = Math.max(y, groundHeightAt(x, z));
-        draped.push(new THREE.Vector3(x - origin[0], y - origin[1] + lift, z - origin[2]));
+        draped.push(at(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t,
+                       a[2] + (b[2] - a[2]) * t));
       }
     }
     const path = new THREE.CurvePath<THREE.Vector3>();

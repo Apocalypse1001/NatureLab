@@ -101,6 +101,7 @@ const net = new BackendClient(wsUrl, {
   onTerrainPatch: (heights, checksum) => {
     store.terrain.loadHeights(heights);
     sceneManager.rebuildTerrain(store.terrain);
+    sceneManager.redrawPipes(store.objects.values());
     (globalThis as Record<string, unknown>).__terrainChecksum = checksum;
   },
 });
