@@ -341,7 +341,8 @@ if WARP_IMPORTED:
                       sediment: wp.array(dtype=float),
                       solid: wp.array(dtype=wp.int32), width: int, height: int,
                       source_columns: int, level: float, area: float,
-                      capacity_scale: float, added: wp.array(dtype=float)):
+                      capacity_scale: float, added: wp.array(dtype=float),
+                      sediment_in: wp.array(dtype=float)):
         idx = wp.tid()
         if idx < width * height:
             i = idx % width
@@ -358,7 +359,10 @@ if WARP_IMPORTED:
                 # docs/07_river_plan.md. A river arriving at capacity is not
                 # hungry and does not scour its own inlet.
                 speed = wp.sqrt(u[idx] * u[idx] + v[idx] * v[idx])
-                sediment[idx] = capacity_scale * speed * target
+                arriving = capacity_scale * speed * target
+                # v0.18.0: booked, so the sediment ledger can close
+                wp.atomic_add(sediment_in, 0, (arriving - sediment[idx]) * area)
+                sediment[idx] = arriving
 
 
     @wp.kernel
@@ -415,7 +419,8 @@ if WARP_IMPORTED:
                            normal_depth: wp.array(dtype=float),
                            width: int, height: int, dx: float, dt: float,
                            area: float,
-                           capacity_scale: float, added: wp.array(dtype=float)):
+                           capacity_scale: float, added: wp.array(dtype=float),
+                           sediment_in: wp.array(dtype=float)):
         """Local inlet on the west edge, prescribing discharge rather than level.
 
         A river is delivered as a discharge Q; a level is what the channel
@@ -468,7 +473,11 @@ if WARP_IMPORTED:
         # and the difference is a gap the inlet would erode its own bed to
         # close. Equal capacity, zero gap, no self-scour.
         speed = wp.sqrt(u[idx] * u[idx] + v[idx] * v[idx])
-        sediment[idx] = capacity_scale * speed * depth
+        arriving = capacity_scale * speed * depth
+        # v0.18.0: the load the river brings in is assigned, not transported --
+        # booked here so the sediment ledger has a source term to close against
+        wp.atomic_add(sediment_in, 0, (arriving - sediment[idx]) * area)
+        sediment[idx] = arriving
 
 
     @wp.kernel
@@ -1671,6 +1680,7 @@ class WarpShallowWaterSolver(FluidSolver):
         self._added_m3 = 0.0
         self._removed_m3 = 0.0
         self._sediment_out_m3 = 0.0
+        self._sediment_in_m3 = 0.0
         self._volume_at_start = 0.0
         self._source_count = 0
         self._drain_count = 0
@@ -1817,6 +1827,7 @@ class WarpShallowWaterSolver(FluidSolver):
         self._diag_added = wp.zeros(1, dtype=float, device=self.device)
         self._diag_removed = wp.zeros(1, dtype=float, device=self.device)
         self._diag_sediment_out = wp.zeros(1, dtype=float, device=self.device)
+        self._diag_sediment_in = wp.zeros(1, dtype=float, device=self.device)
         self._diag_solidified = wp.zeros(1, dtype=float, device=self.device)
         self._diag_rain = wp.zeros(1, dtype=float, device=self.device)
         self._diag_sewer_in = wp.zeros(1, dtype=float, device=self.device)
@@ -1861,6 +1872,7 @@ class WarpShallowWaterSolver(FluidSolver):
         self._added_m3 = 0.0
         self._removed_m3 = 0.0
         self._sediment_out_m3 = 0.0
+        self._sediment_in_m3 = 0.0
         self._seen_terrain_revision = -1
         self._seen_obstacle_revision = -1
         self.terrain_gpu_uploads = 1
@@ -2674,7 +2686,8 @@ class WarpShallowWaterSolver(FluidSolver):
                                   self._width, self._height,
                                   float(self._terrain.cell_size), dt, area,
                                   config.SEDIMENT_CAPACITY_SCALE,
-                                  self._diag_added], device=self.device)
+                                  self._diag_added, self._diag_sediment_in],
+                          device=self.device)
             elif (self._source_enabled and self._edge_inflow_enabled
                   and not self._source_count):
                 # a placed SOURCE takes over from the edge inflow entirely --
@@ -2685,7 +2698,7 @@ class WarpShallowWaterSolver(FluidSolver):
                           self._obstacles, self._width,
                           self._height, config.FLUID_SOURCE_COLUMNS,
                           self._level, area, config.SEDIMENT_CAPACITY_SCALE,
-                          self._diag_added], device=self.device)
+                          self._diag_added, self._diag_sediment_in], device=self.device)
             if self._source_count:
                 wp.launch(_apply_point_sources, dim=self._count,
                           inputs=[self._h, self._bed, self._obstacles,
@@ -2944,6 +2957,8 @@ class WarpShallowWaterSolver(FluidSolver):
         self._added_m3 += float(self._diag_added.numpy()[0])
         self._removed_m3 += float(self._diag_removed.numpy()[0])
         self._sediment_out_m3 += float(self._diag_sediment_out.numpy()[0])
+        self._sediment_in_m3 += float(self._diag_sediment_in.numpy()[0])
+        self._diag_sediment_in.zero_()
         self._diag_added.zero_()
         self._diag_removed.zero_()
         self._diag_sediment_out.zero_()
@@ -3080,7 +3095,8 @@ class WarpShallowWaterSolver(FluidSolver):
                       self._obstacles, self._width, self._height,
                       config.FLUID_SOURCE_COLUMNS, level,
                       float(self._terrain.cell_size ** 2),
-                      config.SEDIMENT_CAPACITY_SCALE, self._diag_added],
+                      config.SEDIMENT_CAPACITY_SCALE, self._diag_added,
+                      self._diag_sediment_in],
                       device=self.device)
             self._fold_ledger()
         self._level = level
@@ -3178,6 +3194,8 @@ class WarpShallowWaterSolver(FluidSolver):
                 "sewer_inlet_capacity_m3s": list(self._inlet_capacity_m3s),
                 "sewer_inlet_demand_m3s": list(self._inlet_demand_m3s),
                 "sediment_out_m3": self._sediment_out_m3,
+                # v0.18.0: suspended load the inflow boundaries assigned
+                "sediment_in_m3": self._sediment_in_m3,
                 "lava_enabled": self._lava_enabled,
                 "vents": self._vent_count,
                 "solidified_m3": self._solidified_m3,
