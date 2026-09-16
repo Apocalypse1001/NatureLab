@@ -1874,6 +1874,72 @@ class SectionTests(unittest.IsolatedAsyncioTestCase):
                 self.manager.apply_object_update(line, {"metadata": {"section_width_m": bad}})
 
 
+class BridgeBackwaterTests(unittest.IsolatedAsyncioTestCase):
+    """v0.18.0: the Bridge scenario as the river's acceptance scene.
+
+    Read on the shipped world, with its bridge and then with the bridge
+    removed: the gauging lines above and below must carry the same discharge,
+    the level must drop more across the reach with the bridge than without it,
+    and the water between the piers must run faster than a surface wave.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    def _reach(self, with_bridge: bool) -> dict:
+        m = self.manager
+        m.load("scenario_bridge")
+        bridge = next(o for o in m.world.objects.values() if o.type == "BRIDGE")
+        up, down = sorted((o for o in m.world.objects.values() if o.type == "SECTION"),
+                          key=lambda o: o.position[0])
+        under = m.apply_object_add({"type": "SECTION",
+                                    "position": [bridge.position[0], 0.0, 0.0]})["id"]
+        if not with_bridge:
+            m.apply_object_remove(bridge.id)
+        m.start()
+        bed = m.fluid.get_terrain_heights().reshape(N, N)
+        h = np.maximum(bed[N // 2, :][None, :] + 0.7 - bed, 0.0).astype(np.float32)
+        m.fluid._h.assign(h.ravel())
+        for _ in range(240 * 60):
+            m._step_once()
+        sums = {key: np.zeros(3) for key in ("up", "down", "under")}
+        ids = {"up": up.id, "down": down.id, "under": under}
+        for _ in range(300):
+            m._step_once()
+            state = {s["id"]: s["latest"] for s in m.section_state()}
+            for key, oid in ids.items():
+                r = state[oid]
+                sums[key] += (r["flow_m3s"], r["level_m"] or 0.0, r["froude_section"])
+        m.stop()
+        return {key: value / 300.0 for key, value in sums.items()}
+
+    async def test_the_bridge_backs_the_river_up_and_shoots_it_between_the_piers(self) -> None:
+        bridge = self._reach(True)
+        await self.asyncTearDown()
+        await self.asyncSetUp()
+        free = self._reach(False)
+        report = (f"with bridge {({k: v.round(3).tolist() for k, v in bridge.items()})}, "
+                  f"without {({k: v.round(3).tolist() for k, v in free.items()})}")
+        for run in (bridge, free):
+            self.assertAlmostEqual(run["up"][0], run["down"][0], delta=0.02 * run["up"][0],
+                                   msg=report)
+        drop_bridge = bridge["up"][1] - bridge["down"][1]
+        drop_free = free["up"][1] - free["down"][1]
+        # Measured at 240-245 s: the level fell 10.0 cm across the reach with
+        # the bridge and 7.8 cm without (2.2 cm of afflux), and the section
+        # Froude number under the bridge was 1.01 against 0.46 -- the water
+        # between the piers runs at about the speed of a surface wave. A real
+        # bridge narrowing the water by 60% would back it up by tens of cm; the
+        # solver is local-inertial and has no contraction loss (docs/07).
+        self.assertGreater(drop_bridge - drop_free, 0.015, msg=report)
+        self.assertGreater(bridge["under"][2], 0.9, msg=report)
+        self.assertLess(free["under"][2], 0.6, msg=report)
+
+
 class RiverBoundaryTests(unittest.IsolatedAsyncioTestCase):
     """v0.12.0: the local inlet, the local outlet, and the ledger that proves them.
 

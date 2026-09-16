@@ -422,10 +422,12 @@ const builders: Record<string, Builder> = {
     return g;
   },
 
-  BRIDGE: () => {
-    // Deck plus three piers, 24 m across -- the span and pier spacing match
-    // fluid_solver.BRIDGE_SPAN_M and the pier rasterization, so the piers the
-    // water is diverted by are the piers the user can see. Only the piers are
+  BRIDGE: (obj) => {
+    // Deck plus piers, 24 m across -- the span, pier count, pier radius and
+    // spacing are read from the same metadata fluid_solver._rasterize_piers
+    // reads, so the piers the water is diverted by are the piers the user can
+    // see (v0.18.0: until then the mesh always drew three, whatever the water
+    // felt). Only the piers are
     // solid to the flow; the deck is drawn but never rasterized, because a
     // bridge that dams its own river is not a bridge.
     const g = new THREE.Group();
@@ -452,14 +454,18 @@ const builders: Record<string, Builder> = {
         g.add(post);
       }
     }
-    for (const z of [-12, 0, 12]) {
+    const count = Math.max(0, Math.round(obj.metadata.pier_count ?? 3));
+    const radius = obj.metadata.pier_radius ?? 0.9;
+    for (let n = 0; n < count; n++) {
+      // evenly spaced along the span, ends included, as the rasterizer does
+      const z = count === 1 ? 0 : (n / (count - 1) - 0.5) * 24;
       const pier = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.9, 1.1, 3.2, 16), stone);
+        new THREE.CylinderGeometry(radius, radius * 1.22, 3.2, 16), stone);
       pier.position.set(0, 1.6, z);
       // A cap where the pier meets the deck: the piers are what the flow piles
       // debris against, so they should read as structure, not as posts.
       const cap = new THREE.Mesh(
-        new THREE.CylinderGeometry(1.08, 1.08, 0.28, 16), stone);
+        new THREE.CylinderGeometry(radius * 1.2, radius * 1.2, 0.28, 16), stone);
       cap.position.set(0, 3.05, z);
       g.add(pier, cap);
     }

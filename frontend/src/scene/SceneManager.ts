@@ -907,6 +907,15 @@ export class SceneManager {
       group = undefined;
       rebuilt = true;
     }
+    // v0.18.0: a bridge's piers are drawn from its metadata
+    const pierKey = obj.type === 'BRIDGE'
+      ? `${obj.metadata.pier_count}|${obj.metadata.pier_radius}` : null;
+    if (group && pierKey !== null && group.userData.pierKey !== pierKey) {
+      this.objectsRoot.remove(group);
+      SceneManager.disposeSubtree(group);
+      group = undefined;
+      rebuilt = true;
+    }
     if (group && obj.type === 'BUILDING' && group.userData.floors !== obj.metadata.floors) {
       this.objectsRoot.remove(group);
       SceneManager.disposeSubtree(group);
@@ -918,6 +927,7 @@ export class SceneManager {
       if (obj.type === 'BUILDING') group.userData.floors = obj.metadata.floors;
       if (pipeKey !== null) group.userData.pipeKey = pipeKey;
       if (sectionKey !== null) group.userData.sectionKey = sectionKey;
+      if (pierKey !== null) group.userData.pierKey = pierKey;
       this.objectsRoot.add(group);
     }
     applyTransform(group, obj);

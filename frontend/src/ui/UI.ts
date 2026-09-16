@@ -60,6 +60,16 @@ const SCENARIOS: { name: string; label: string; hint: string }[] = [
         + 'flow against what it can carry. After about five minutes the pipe behind '
         + 'the north row runs full and a pond grows over its grate (a faster speed '
         + 'gets there sooner); lay a wider one with "Lay pipe"' },
+  { name: 'scenario_bridge', label: 'Bridge',
+    hint: 'The river town with a bridge on five piers, and a gauging line above and '
+        + 'below it. Once the river has filled (a few minutes), click a line: the same '
+        + 'discharge passes both, but the level drops faster across the bridge -- the '
+        + 'piers back the water up by about 2 cm and it shoots between them (tick '
+        + '"Colour water by Froude number" and look for white and red). Honest limit: '
+        + 'a real bridge narrowing a river this much would raise it by tens of '
+        + 'centimetres; this water model has no loss where a flow narrows and widens, '
+        + 'so it shows the effect, not its size. Change the piers in the bridge’s '
+        + 'properties and watch the numbers' },
   { name: 'scenario_dam', label: 'Dam',
     hint: 'The same town below a dam. At the discharge it ships with, the '
         + 'spillway carries the river and the dam holds. Push Q past about 60 '
@@ -781,6 +791,15 @@ export class UI {
     // (backend/app/config.py building_half_extent_m) -- rounded/clamped here
     // AND on the backend, since this input's generic number handling below
     // would otherwise happily send 2.7 floors.
+    // v0.18.0: the piers are what narrows the river under a bridge
+    if (obj.type === 'BRIDGE') fields.push(
+      ['Piers', 'pier_count', obj.metadata.pier_count ?? 3,
+       (v) => this.cb.updateObject(obj.id,
+         { metadata: { ...obj.metadata, pier_count: Math.max(0, Math.min(9, Math.round(v))) } })],
+      ['Pier radius (m)', 'pier_radius', obj.metadata.pier_radius ?? 0.9,
+       (v) => this.cb.updateObject(obj.id,
+         { metadata: { ...obj.metadata, pier_radius: Math.max(0.3, Math.min(3, v)) } })],
+    );
     if (obj.type === 'BUILDING') fields.push(
       ['Floors', 'floors', obj.metadata.floors ?? 1,
        (v) => this.cb.updateObject(obj.id,

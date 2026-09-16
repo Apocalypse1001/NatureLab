@@ -7,6 +7,7 @@ test, this measures it -- the same valley and inlet as SectionTests, with and
 without a BRIDGE across the channel at x = 0, lines at several x.
 
     python docs/probe_bridge_backwater_v1.py 300
+    python docs/probe_bridge_backwater_v1.py 240 5 1.2 12   # piers, radius m, Q m3/s
 """
 import math
 import sys
@@ -19,6 +20,9 @@ from app.simulation import SimulationManager  # noqa: E402
 
 N = config.TERRAIN_CELLS + 1
 seconds = float(sys.argv[1]) if len(sys.argv) > 1 else 300.0
+PIERS = float(sys.argv[2]) if len(sys.argv) > 2 else 3.0
+RADIUS = float(sys.argv[3]) if len(sys.argv) > 3 else 0.9
+Q = float(sys.argv[4]) if len(sys.argv) > 4 else 12.0
 LINES = (-60.0, -20.0, -6.0, 0.0, 6.0, 20.0, 60.0)
 
 
@@ -34,7 +38,8 @@ def run(bridge: bool, discharge: float = 12.0) -> dict:
         m.apply_object_update(oid, {"metadata": {"section_width_m": 60.0}})
         ids[x] = oid
     if bridge:
-        m.apply_object_add({"type": "BRIDGE", "position": [0.0, 0.0, 0.0]})
+        oid = m.apply_object_add({"type": "BRIDGE", "position": [0.0, 0.0, 0.0]})["id"]
+        m.apply_object_update(oid, {"metadata": {"pier_count": PIERS, "pier_radius": RADIUS}})
     m.start()
     bed = m.fluid.get_terrain_heights().reshape(N, N)
     h = np.maximum(bed[N // 2, :][None, :] + 0.7 - bed, 0.0).astype(np.float32)
@@ -55,8 +60,8 @@ def run(bridge: bool, discharge: float = 12.0) -> dict:
     return {x: sums[x] / 600.0 for x in LINES} | {"solid": solid}
 
 
-with_bridge, without = run(True), run(False)
-print(f"t = {seconds:.0f}-{seconds + 10:.0f} s, Q = 12 m3/s; solid cells "
+with_bridge, without = run(True, Q), run(False, Q)
+print(f"t = {seconds:.0f}-{seconds + 10:.0f} s, Q = {Q:g} m3/s, {PIERS:g} piers r {RADIUS:g} m; solid cells "
       f"{without['solid']} -> {with_bridge['solid']}")
 print("   x     Q no/br      level no/br   (afflux)    Fr no/br     width no/br")
 for x in LINES:

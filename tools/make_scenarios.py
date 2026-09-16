@@ -241,6 +241,32 @@ def build_sewer_town(world: WorldState) -> Dict[str, int]:
     return counts
 
 
+# v0.18.0 bridge scenario (docs/07_river_plan.md, "Створ и число Фруда"). The
+# bridge carries the road spur that runs down to the bank over the river. Five
+# piers, not the default three: with three only the middle one stands in the
+# 15 m of water and the level upstream rose 0.5 cm -- nothing to see. Five
+# (docs/probe_bridge_backwater_v1.py, Q = 12, 240-250 s) narrow the water to 6 m,
+# the section Froude number between them goes 0.52 -> 1.12 (shooting) and the
+# level 6 m upstream rises 2.9 cm. That is still far below a real bridge -- the
+# solver is local-inertial and has no contraction loss, so Yarnell expects tens
+# of centimetres for a 60% blockage -- and the scenario hint says so.
+BRIDGE_AT = (30.0, 0.0)
+BRIDGE_PIERS = 5.0
+BRIDGE_LINES = (10.0, 50.0)          # gauging lines above and below the bridge
+
+
+def build_bridge_town(world: WorldState) -> Dict[str, int]:
+    """The river town, a bridge on the road spur, a gauging line either side."""
+    counts = build_town(world)
+    bridge = seat(world, "BRIDGE", *BRIDGE_AT)
+    bridge.metadata["pier_count"] = BRIDGE_PIERS
+    for x in BRIDGE_LINES:
+        seat(world, "SECTION", x, 0.0)
+    counts["bridge"] = 1
+    counts["gauging line"] = len(BRIDGE_LINES)
+    return counts
+
+
 def build_dam(world: WorldState) -> Dict[str, Any]:
     effective = dam_ridge(world.terrain, None, None)
     water = world.water
@@ -503,6 +529,7 @@ def build_beachfront_town(world: WorldState) -> Dict[str, int]:
 SCENARIOS = {
     "river": ("scenario_river", build_river, build_town),
     "sewer": ("scenario_sewer", build_sewer, build_sewer_town),
+    "bridge": ("scenario_bridge", build_river, build_bridge_town),
     "dam": ("scenario_dam", build_dam, build_town),
     "volcano": ("scenario_volcano", build_volcano, build_volcano_settlement),
     "tsunami": ("scenario_tsunami", build_tsunami, build_beachfront_town),
