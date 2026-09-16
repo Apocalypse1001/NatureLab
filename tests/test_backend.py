@@ -3419,6 +3419,25 @@ class SewerTests(unittest.IsolatedAsyncioTestCase):
         self._start_network()
         self.assertLess(self._taken_over(5.0), 1e-6)
 
+    async def test_a_trunk_fed_by_one_working_chain_stays_ok(self) -> None:
+        """Found in the browser: one lateral into a manhole ran uphill, and the
+        trunk out of it read "blocked" although the other lateral's water went
+        through it. Which grate the walk met first decided the label."""
+        self._network_scene({(-40.0, -20.0): True, (-40.0, 20.0): True})
+        good = self._node("STORM_INLET", -40.0, -20.0)
+        bad = self._node("STORM_INLET", 36.0, 20.0)       # on the ramp, below the manhole
+        manhole = self._node("MANHOLE", 34.0, 0.0)
+        outfall = self._node("OUTFALL", 70.0, 0.0)
+        pid = lambda state: next(o["id"] for o in state["objects"] if o["type"] == "PIPE")
+        rising = pid(self._pipe(bad, manhole, 0.3))
+        self._pipe(good, manhole, 0.3)
+        trunk = pid(self._pipe(manhole, outfall, 0.3))
+        self.assertEqual(self._link(rising)["status"], "uphill")
+        self.assertEqual(self._link(trunk)["status"], "ok")
+        self._start_network()
+        self.assertGreater(self._taken_over(5.0), 0.01)
+        self.assertGreater(self._link(trunk)["flow_m3s"], 0.01)
+
     async def test_loops_dead_ends_and_a_second_pipe_out_are_reported_not_followed(self) -> None:
         self._network_scene({(-40.0, 0.0): False})
         inlet = self._node("STORM_INLET", -40.0, 0.0)

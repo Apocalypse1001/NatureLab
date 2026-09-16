@@ -93,9 +93,11 @@ class SewerLink:
 
     status: "ok"; "uphill" (this pipe rises); "disconnected" (an end is not a
     node a pipe may join); "second_pipe" (its start already has a pipe running
-    on); "blocked" (fine itself, but a pipe further down carries nothing --
-    `blocked_by` names it); "dead_end" (the chain stops at a manhole with no
-    pipe out); "loop" (the chain comes back on itself).
+    on); "blocked" (fine itself, but no grate's water reaches the river
+    through it because a pipe on the way carries nothing -- `blocked_by` names
+    it, above or below); "dead_end" (the chain stops at a manhole with no pipe
+    out); "loop" (the chain comes back on itself). The last three are given
+    only when every grate above the pipe is cut off.
     """
     pipe_id: str
     from_id: str
@@ -177,6 +179,7 @@ def resolve(world) -> Network:
 
     path_capacity: List[float] = []
     outfall_of: List[int] = []
+    failures: Dict[str, Tuple[str, str]] = {}   # grate id -> (why, the pipe at fault)
     for inlet in inlet_objs:
         chain: List[SewerLink] = []
         seen = {inlet.id}
@@ -203,19 +206,26 @@ def resolve(world) -> Network:
         if chain and ending == "ok" and narrowest > 0.0:
             path_capacity.append(narrowest)
             outfall_of.append(outfall_index[chain[-1].to_id])
+        else:
+            failures[inlet.id] = (ending, next((l.pipe_id for l in chain
+                                                if l.capacity_m3s <= 0.0), ""))
+            path_capacity.append(0.0)
+            outfall_of.append(-1)
+
+    # A pipe that is fine in itself but carries no grate's water says why, so
+    # the panel never reads "ok, 0.0 L/s" without a reason -- but only when
+    # EVERY grate above it is cut off: a trunk still fed by one working chain
+    # is ok, whatever a second chain into it does.
+    for link in links:
+        if link.status != "ok" or not link.upstream_inlets:
             continue
-        # This grate's water goes nowhere: say why on every pipe that is fine
-        # in itself, so the panel never reads "ok, 0.0 L/s" without a reason.
-        for link in chain:
-            if link.status != "ok":
-                continue
-            if ending != "ok":
-                link.status = ending
-            else:
-                link.status = "blocked"
-                link.blocked_by = next(l.pipe_id for l in chain if l.capacity_m3s <= 0.0)
-        path_capacity.append(0.0)
-        outfall_of.append(-1)
+        if not all(i in failures for i in link.upstream_inlets):
+            continue
+        ending, culprit = failures[link.upstream_inlets[0]]
+        if ending != "ok":
+            link.status = ending
+        else:
+            link.status, link.blocked_by = "blocked", culprit
 
     return Network(
         inlet_ids=[o.id for o in inlet_objs],

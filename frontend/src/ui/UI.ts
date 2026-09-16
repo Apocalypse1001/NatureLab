@@ -816,7 +816,7 @@ export class UI {
       uphill: 'Runs uphill: a gravity pipe carries nothing.',
       disconnected: 'Not joined at both ends.',
       second_pipe: 'A pipe already runs on from its start; only one may.',
-      blocked: 'Carries nothing: a pipe further down runs uphill.',
+      blocked: 'Carries nothing: a pipe on the way carries nothing',
       dead_end: 'Carries nothing: the chain ends at a manhole with no pipe out.',
       loop: 'Carries nothing: the chain runs back into itself.',
     };
@@ -828,7 +828,8 @@ export class UI {
       return `${name}<div>Flow <strong>${ls(l.flow_m3s)} L/s</strong> of `
         + `${ls(l.capacity_m3s)} L/s (${load}%)</div>`
         + `<div>Fall ${l.fall_m.toFixed(2)} m over ${l.length_m.toFixed(0)} m</div>`
-        + (why[l.status] ? `<div class="bad">${why[l.status]}</div>` : '');
+        + (why[l.status] ? `<div class="bad">${why[l.status]}`
+          + (l.blocked_by ? ` (${l.blocked_by}).` : '') + '</div>' : '');
     }).join('');
   }
 
