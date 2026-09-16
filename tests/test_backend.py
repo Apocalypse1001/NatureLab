@@ -3261,6 +3261,32 @@ class SewerTests(unittest.IsolatedAsyncioTestCase):
         flow = self.manager.sewer_state()[0]["flow_m3s"]
         self.assertAlmostEqual(flow, capacity, delta=0.02 * capacity)
 
+    async def test_water_never_stands_over_a_grate_its_pipe_could_still_take(self) -> None:
+        """Read on the shipped Sewer scenario, because a small graded test scene
+        did not reproduce it (the same slope, hollow and off-centre grate took
+        its capacity with the old kernel too). Before the fix, at 360 s: 15.9 cm
+        piled in the west grate's own cell, the cell east of it -- 0.2 cm LOWER
+        -- stayed dry, and the grate took 13.1 L/s through a 20.8 L/s pipe: the
+        drain kernel's imposed funnel held the face between them at ~0 every
+        substep. A pond over a grate is only right once its pipe runs full."""
+        self.manager.load("scenario_sewer")
+        self.manager.start()
+        world = self.manager.world
+        cell = world.terrain.cell_size
+        x = (np.arange(N) - (N - 1) * 0.5) * cell
+        X, Z = np.meshgrid(x, x)
+        inlets = {o.id: o for o in world.objects.values() if o.type == "STORM_INLET"}
+        self._run(360.0)
+        h = np.asarray(self.manager.fluid._h.numpy()).reshape(N, N)
+        for link in self.manager.sewer_state():
+            inlet = inlets[link["inlet_id"]]
+            over = float(h[np.hypot(X - inlet.position[0], Z - inlet.position[2]) <= 1.5].max())
+            if over > 0.05:
+                self.assertGreater(link["flow_m3s"], 0.95 * link["capacity_m3s"],
+                                   msg=f"{over * 100:.1f} cm over {inlet.id}, taking "
+                                       f"{link['flow_m3s'] * 1000:.1f} of "
+                                       f"{link['capacity_m3s'] * 1000:.1f} L/s")
+
     async def test_a_narrower_pipe_carries_less(self) -> None:
         """Full-pipe capacity goes as d^(8/3): 100 mm carries 0.157 of 200 mm."""
         state = self._pit_scene(diameter=0.1)

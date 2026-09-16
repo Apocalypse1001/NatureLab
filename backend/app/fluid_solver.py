@@ -690,7 +690,8 @@ if WARP_IMPORTED:
                       count: int, width: int, height: int, dx: float, dt: float,
                       dry: float, swirl_gain: float, max_velocity: float,
                       area: float, removed_total: wp.array(dtype=float),
-                      removed_each: wp.array(dtype=float), take_dregs: int):
+                      removed_each: wp.array(dtype=float), take_dregs: int,
+                      impose_flow: int):
         """Remove water through a localized sink and spin up the flow around it.
 
         v0.17.0: the same kernel runs the storm sewer's inlets. `removed_each`
@@ -699,6 +700,15 @@ if WARP_IMPORTED:
         where it is, so an inlet on a wet street cannot take more than its pipe
         carries by sweeping up films (at 60 substeps a second, the dregs of a
         few cells alone come to tens of litres a second).
+
+        `impose_flow` = 0 (storm inlets) removes water and nothing else. The
+        imposed field below is an ideal funnel centred on the grate; on a real
+        pond it overrode the surface slope face by face. Measured on the Sewer
+        scenario at 360 s: the cell east of the west grate, 0.2 cm LOWER than
+        the grate's own cell, stayed dry beside a 15.9 cm column, because the
+        funnel set the face between them to ~0 every substep -- and the grate
+        took 13.1 L/s through a pipe rated 20.8. Without it, the depression the
+        removal digs is what draws the water in, down the real slope.
 
         Removal uses a smooth radial profile and is capped by the water actually
         present, so a drain can never pull a cell below zero or invent negative
@@ -762,6 +772,8 @@ if WARP_IMPORTED:
                 h[idx] = 0.0
                 u[idx] = 0.0
                 v[idx] = 0.0
+                continue
+            if impose_flow == 0:
                 continue
             mean_tangential = circulation[n] / wp.max(1.0, samples[n])
             # Inside the sink the drain owns the flow, so this is assigned, not
@@ -2600,7 +2612,7 @@ class WarpShallowWaterSolver(FluidSolver):
                                   float(self._terrain.cell_size), dt,
                                   config.FLUID_DRY_DEPTH, config.DRAIN_SWIRL_GAIN,
                                   config.FLUID_MAX_VELOCITY, area,
-                                  self._diag_removed, self._drain_removed_each, 1],
+                                  self._diag_removed, self._drain_removed_each, 1, 1],
                           device=self.device)
             if self._inlet_count and not self._lava_enabled:
                 # v0.17.0 storm sewer (backend/app/sewer.py): inlets take water
@@ -2609,17 +2621,9 @@ class WarpShallowWaterSolver(FluidSolver):
                 # its own two counters, not added/removed: the water is moved,
                 # not created or destroyed, and the HUD should not say otherwise.
                 # Skipped in a lava world for the reason rain is.
+                # Removal only (impose_flow = 0): the circulation arrays are
+                # passed but never read, so they are not measured either.
                 self._inlet_step.zero_()
-                self._inlet_circulation.zero_()
-                self._inlet_samples.zero_()
-                wp.launch(_measure_drain_circulation, dim=self._count,
-                          inputs=[self._uc, self._vc, self._h, self._obstacles,
-                                  self._inlet_centres, self._inlet_radii,
-                                  self._inlet_circulation, self._inlet_samples,
-                                  self._inlet_count,
-                                  self._width, self._height,
-                                  float(self._terrain.cell_size),
-                                  config.FLUID_DRY_DEPTH], device=self.device)
                 wp.launch(_apply_drains, dim=self._count,
                           inputs=[self._h, self._u, self._v, self._obstacles,
                                   self._inlet_centres, self._inlet_radii,
@@ -2629,7 +2633,7 @@ class WarpShallowWaterSolver(FluidSolver):
                                   float(self._terrain.cell_size), dt,
                                   config.FLUID_DRY_DEPTH, config.DRAIN_SWIRL_GAIN,
                                   config.FLUID_MAX_VELOCITY, area,
-                                  self._diag_sewer_in, self._inlet_step, 0],
+                                  self._diag_sewer_in, self._inlet_step, 0, 0],
                           device=self.device)
                 if self._outfall_count:
                     self._outfall_volume.zero_()

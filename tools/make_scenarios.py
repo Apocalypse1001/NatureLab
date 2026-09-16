@@ -74,9 +74,10 @@ SEWER_HOLLOW_DEPTH = 0.25
 SEWER_RAIN_MM_H = 50.0
 # 150 mm, the usual gully connection. Measured on the graded scene at 50 mm/h
 # (docs/probe_sewer_v1.py crossfall_d150): the pipe behind the north row runs
-# full (11.2 of 11.2 L/s) from 300 s and a pond grows over its grate (28 cm at
-# 600 s); the east pipe carries 8 of 20.8 L/s all along; the west one nears
-# full around 420 s. At 200 mm (24-45 L/s) none of the three ran full in 600 s.
+# full (11.2 of 11.2 L/s) from 300 s and a pond grows over its grate (29 cm at
+# 600 s); the east pipe carries 8 of 20.8 L/s all along; the west one runs full
+# from about 540 s. At 200 mm (24-45 L/s) none of the three ran full in 600 s.
+# (Re-measured after storm inlets stopped imposing a funnel flow field.)
 SEWER_PIPE_DIAMETER_M = 0.15
 
 
