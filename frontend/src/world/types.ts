@@ -78,6 +78,8 @@ export interface WorldData {
            // to be able to put its own numbers back on the controls
            inlet_enabled?: boolean; inlet_width_m?: number;
            inlet_discharge_m3s?: number; outlet_width_m?: number;
+           // v0.18.0 flood hydrograph on the inlet (backend/app/hydrograph.py)
+           hydrograph?: Hydrograph;
            // v0.16.0: what lies beyond the open east edge
            outlet_kind?: OutletKind;
            // RainLab-1 (docs/14_rain_plan.md): rain in mm/h (= L/m² per hour),
@@ -130,6 +132,15 @@ export interface GaugeSample {
   water_depth_m: number;
   surface_elevation_m: number | null;
   speed_m_s: number;
+}
+
+/** v0.18.0: a flood on top of the inlet's base discharge, in sim seconds. */
+export interface Hydrograph {
+  enabled: boolean;
+  peak_m3s: number;
+  start_s: number;
+  rise_s: number;
+  fall_s: number;
 }
 
 /** v0.18.0: what a gauging line reads over one frame. */

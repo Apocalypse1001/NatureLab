@@ -435,6 +435,13 @@ class WaterState:
     inlet_centre_z: float = 0.0      # world z of the inlet band's centre
     inlet_width_m: float = 12.0      # how much of the edge the river occupies
     inlet_discharge_m3s: float = 12.0  # prescribed Q -- the level is the answer
+    # v0.18.0 flood hydrograph (backend/app/hydrograph.py): when on, the inlet
+    # carries a flood on top of `inlet_discharge_m3s`, in simulation seconds
+    hydrograph_enabled: bool = False
+    hydrograph_peak_m3s: float = 40.0
+    hydrograph_start_s: float = 60.0
+    hydrograph_rise_s: float = 120.0
+    hydrograph_fall_s: float = 300.0
     outlet_centre_z: float = 0.0
     outlet_width_m: float = 0.0      # 0 = the whole edge, as before v0.12.0
     # v0.16.0: what lies beyond the open edge -- "overfall" (a sea or a pool;
@@ -501,6 +508,11 @@ class WaterState:
                 "inlet_centre_z": self.inlet_centre_z,
                 "inlet_width_m": self.inlet_width_m,
                 "inlet_discharge_m3s": self.inlet_discharge_m3s,
+                "hydrograph": {"enabled": self.hydrograph_enabled,
+                               "peak_m3s": self.hydrograph_peak_m3s,
+                               "start_s": self.hydrograph_start_s,
+                               "rise_s": self.hydrograph_rise_s,
+                               "fall_s": self.hydrograph_fall_s},
                 "outlet_centre_z": self.outlet_centre_z,
                 "outlet_width_m": self.outlet_width_m,
                 "outlet_kind": self.outlet_kind,
@@ -625,6 +637,10 @@ class WorldState:
                                               "water.tsunami_wave3_scale"),
             rain_intensity_mm_h=rain_intensity(water.get("rain_intensity_mm_h", 0.0)),
             edge_inflow_enabled=bool(water.get("edge_inflow_enabled", True)))
+        # v0.18.0: a world saved before the hydrograph existed has none
+        from . import hydrograph as _hydrograph
+        for key, value in _hydrograph.validate(dict(water.get("hydrograph") or {})).items():
+            setattr(state.water, f"hydrograph_{key}", value)
         env = data.get("environment", {})
         state.environment = EnvironmentState(
             gravity=finite_number(env.get("gravity", 9.81), "environment.gravity"),

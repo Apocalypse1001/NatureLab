@@ -1,7 +1,8 @@
 /** HUD: top bar, object palette, properties panel, terrain/water controls,
  *  debug strip. Pure DOM — no framework, easy to extend. */
 import { OBJECT_TYPES, type GaugeSample, type GaugeState, type ObjectData,
-  type ObjectType, type OutletKind, type SectionState, type SewerLinkState, type SimEvent,
+  type Hydrograph, type ObjectType, type OutletKind, type SectionState, type SewerLinkState,
+  type SimEvent,
   type WorldData } from '../world/types';
 
 export interface UICallbacks {
@@ -28,7 +29,7 @@ export interface UICallbacks {
   setBrush(radius: number, strength: number): void;
   generateRiver(params: { slope: number; bed_width: number; incision: number }): void;
   setRiverInlet(fields: { enabled?: boolean; width_m?: number;
-                          discharge_m3s?: number }): void;
+                          discharge_m3s?: number; hydrograph?: Partial<Hydrograph> }): void;
   setRiverOutlet(fields: { width_m?: number; kind?: OutletKind }): void;
   setRain(fields: { intensity_mm_h: number }): void;
   setEdgeInflow(enabled: boolean): void;
@@ -129,6 +130,11 @@ export class UI {
   private propsHost: HTMLElement;
   private selectedId: string | null = null;
   private sewerLinks: SewerLinkState[] = [];
+  // v0.18.0 flood hydrograph: what the controls hold, for the chart
+  private hydro: Hydrograph = { enabled: false, peak_m3s: 40, start_s: 60, rise_s: 120,
+                                fall_s: 300 };
+  private baseDischarge = 12;
+  private simTime = 0;
   // v0.18.0 gauging lines: the latest reading and a discharge history per line
   private sectionLatest = new Map<string, SectionState['latest']>();
   private sectionHistory = new Map<string, number[]>();
@@ -302,8 +308,47 @@ export class UI {
     discharge.oninput = () => {
       this.root.querySelector('#river-q-out')!.textContent = discharge.value;
       this.cb.setRiverInlet({ discharge_m3s: parseFloat(discharge.value) });
+      this.baseDischarge = parseFloat(discharge.value);
+      this.drawHydrograph();
     };
     flow.append(discharge);
+
+    // v0.18.0: a flood wave on top of Q -- rises to a peak, falls back
+    const hydroRow = el('label', 'slider-row', 'Flood wave (hydrograph on top of Q)');
+    const hydroOn = el('input', '') as HTMLInputElement;
+    hydroOn.id = 'hydro-enabled';
+    hydroOn.type = 'checkbox';
+    hydroOn.onchange = () => {
+      this.hydro.enabled = hydroOn.checked;
+      this.cb.setRiverInlet({ hydrograph: { enabled: hydroOn.checked } });
+      this.drawHydrograph();
+    };
+    hydroRow.append(hydroOn);
+    flow.append(hydroRow);
+    const hydroSlider = (id: string, label: string, unit: string, key: keyof Hydrograph,
+                         min: number, max: number, step: number) => {
+      flow.insertAdjacentHTML('beforeend',
+        `<label>${label} <output id="${id}-out">${this.hydro[key]}</output> ${unit}</label>`);
+      const input = el('input', '') as HTMLInputElement;
+      input.id = id;
+      input.type = 'range'; input.min = String(min); input.max = String(max);
+      input.step = String(step); input.value = String(this.hydro[key]);
+      input.oninput = () => {
+        this.root.querySelector(`#${id}-out`)!.textContent = input.value;
+        (this.hydro as unknown as Record<string, number>)[key] = parseFloat(input.value);
+        this.cb.setRiverInlet({ hydrograph: { [key]: parseFloat(input.value) } });
+        this.drawHydrograph();
+      };
+      flow.append(input);
+    };
+    hydroSlider('hydro-peak', 'Peak Q', 'm³/s', 'peak_m3s', 1, 80, 1);
+    hydroSlider('hydro-start', 'Flood starts at', 's', 'start_s', 0, 900, 10);
+    hydroSlider('hydro-rise', 'Rises over', 's', 'rise_s', 10, 900, 10);
+    hydroSlider('hydro-fall', 'Falls over', 's', 'fall_s', 10, 1800, 10);
+    flow.insertAdjacentHTML('beforeend',
+      '<svg id="hydro-chart" viewBox="0 0 240 70" role="img" aria-label="Inlet discharge over time">'
+      + '<polyline points="" /><line id="hydro-now" x1="0" y1="0" x2="0" y2="70" /></svg>'
+      + '<div class="hint" id="hydro-now-q"></div>');
     flow.insertAdjacentHTML('beforeend',
       '<label>Inlet width <output id="river-inlet-w-out">12</output> m</label>');
     const inletWidth = el('input', '') as HTMLInputElement;
@@ -561,8 +606,43 @@ export class UI {
 
   setClock(time: number, status: string): void {
     this.clockEl.textContent = `t = ${time.toFixed(1)}s`;
+    this.simTime = time;
+    this.drawHydrograph();
     this.statusEl.textContent = status;
     this.statusEl.className = status === 'RUNNING' ? 'ok' : '';
+  }
+
+  /** The inlet's discharge over time -- the same curve as hydrograph.py. */
+  private hydroAt(t: number): number {
+    const { enabled, peak_m3s, start_s, rise_s, fall_s } = this.hydro;
+    const base = this.baseDischarge;
+    let tau = t - start_s;
+    if (!enabled || tau <= 0) return base;
+    if (tau < rise_s) return base + (peak_m3s - base) * Math.sin(0.5 * Math.PI * tau / rise_s) ** 2;
+    tau -= rise_s;
+    if (tau < fall_s) return base + (peak_m3s - base) * Math.cos(0.5 * Math.PI * tau / fall_s) ** 2;
+    return base;
+  }
+
+  private drawHydrograph(): void {
+    const line = this.root.querySelector<SVGPolylineElement>('#hydro-chart polyline');
+    const now = this.root.querySelector<SVGLineElement>('#hydro-now');
+    const text = this.root.querySelector('#hydro-now-q');
+    if (!line || !now) return;
+    const span = Math.max(60, this.hydro.start_s + this.hydro.rise_s + this.hydro.fall_s + 60,
+                          this.simTime + 10);
+    const top = Math.max(1, this.hydro.peak_m3s, this.baseDischarge) * 1.1;
+    const points: string[] = [];
+    for (let k = 0; k <= 120; k++) {
+      const t = span * k / 120;
+      points.push(`${(k * 2).toFixed(1)},${(68 - this.hydroAt(t) / top * 64).toFixed(1)}`);
+    }
+    line.setAttribute('points', points.join(' '));
+    const x = Math.min(240, this.simTime / span * 240).toFixed(1);
+    now.setAttribute('x1', x);
+    now.setAttribute('x2', x);
+    if (text) text.textContent = `Inlet now ${this.hydroAt(this.simTime).toFixed(1)} m³/s`
+      + (this.hydro.enabled ? '' : ' (no flood wave)');
   }
 
   setRiverInletEnabled(enabled: boolean): void {
@@ -610,6 +690,17 @@ export class UI {
     };
     this.setRiverInletEnabled(water.inlet_enabled ?? false);
     put('#river-discharge', '#river-q-out', water.inlet_discharge_m3s);
+    if (water.inlet_discharge_m3s !== undefined) this.baseDischarge = water.inlet_discharge_m3s;
+    if (water.hydrograph) {
+      this.hydro = { ...water.hydrograph };
+      const box = this.root.querySelector<HTMLInputElement>('#hydro-enabled');
+      if (box) box.checked = water.hydrograph.enabled;
+      put('#hydro-peak', '#hydro-peak-out', water.hydrograph.peak_m3s);
+      put('#hydro-start', '#hydro-start-out', water.hydrograph.start_s);
+      put('#hydro-rise', '#hydro-rise-out', water.hydrograph.rise_s);
+      put('#hydro-fall', '#hydro-fall-out', water.hydrograph.fall_s);
+    }
+    this.drawHydrograph();
     put('#river-inlet-width', '#river-inlet-w-out', water.inlet_width_m);
     put('#river-outlet-width', '#river-outlet-w-out', water.outlet_width_m);
     const kind = this.root.querySelector<HTMLSelectElement>('#river-outlet-kind');

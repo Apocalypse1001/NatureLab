@@ -484,6 +484,23 @@ try {
   assert(drawn.froude, 'no Froude colouring checkbox');
   report('Gauging line: placed, drawn, listed in sim_state; Froude colouring toggle present');
 
+  // v0.18.0 flood hydrograph: the checkbox reaches the world, and the chart
+  // draws the same curve the backend runs (peak 40 at 60 + 120 s by default)
+  await page.evaluate(() => {
+    const box = document.querySelector('#hydro-enabled');
+    if (!box) throw new Error('no flood wave checkbox');
+    box.click();
+  });
+  const hydro = await page.evaluate(() => {
+    const points = document.querySelector('#hydro-chart polyline')?.getAttribute('points') ?? '';
+    const ys = points.split(' ').filter(Boolean).map((p) => parseFloat(p.split(',')[1]));
+    return { count: ys.length, lowest: Math.min(...ys), highest: Math.max(...ys),
+             text: document.querySelector('#hydro-now-q')?.textContent ?? '' };
+  });
+  assert(hydro.count === 121 && hydro.highest - hydro.lowest > 20,
+    `flood chart did not draw a wave: ${JSON.stringify(hydro)}`);
+  report('Flood wave: checkbox on, chart draws the hydrograph');
+
   assert(errors.length === 0, errors.join('\n'));
   report('no browser errors');
   // read the version off the running backend rather than hard-coding it, so

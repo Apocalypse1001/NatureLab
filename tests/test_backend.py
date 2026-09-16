@@ -1874,6 +1874,102 @@ class SectionTests(unittest.IsolatedAsyncioTestCase):
                 self.manager.apply_object_update(line, {"metadata": {"section_width_m": bad}})
 
 
+class HydrographTests(unittest.IsolatedAsyncioTestCase):
+    """v0.18.0 flood hydrograph on the river inlet (backend/app/hydrograph.py)."""
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    async def test_the_shape_starts_and_ends_at_base_and_holds_its_volume(self) -> None:
+        from app import hydrograph
+        q = lambda t: hydrograph.discharge_at(t, 12.0, 30.0, 150.0, 30.0, 60.0)
+        self.assertEqual(q(0.0), 12.0)
+        self.assertEqual(q(150.0), 12.0)
+        self.assertAlmostEqual(q(180.0), 30.0, places=9)
+        self.assertEqual(q(240.0), 12.0)
+        self.assertEqual(q(1000.0), 12.0)
+        ts = np.arange(0.0, 400.0, 0.01)
+        volume = float(np.sum([q(t) - 12.0 for t in ts]) * 0.01)
+        self.assertAlmostEqual(volume, hydrograph.flood_volume_m3(12.0, 30.0, 30.0, 60.0),
+                               delta=0.5)
+
+    async def test_a_flood_enters_whole_and_flattens_as_it_travels(self) -> None:
+        """Measured (docs/probe_hydrograph_v1.py, base 12, peak 30 at 150 + 30 s,
+        falling over 60 s, primed valley settled for 150 s first -- starting the
+        flood at 20 s booked the primed channel's own transient against it):
+
+          inlet line  +17.96 m3/s at 181.6 s   flood volume 810.1 of 810.0 m3
+          x = -50     +16.23 at 195.6 s
+          x = +80     +12.79 at 229.0 s
+
+        So the inlet delivers the hydrograph's volume, and downstream the peak
+        arrives later and lower -- attenuation, measured above each line's own
+        flow just before the flood, since a primed channel still drains.
+        """
+        from app import hydrograph
+        m = self.manager
+        m.apply_terrain_river({})
+        m.apply_water_level(0.0)
+        m.apply_river_inlet({"enabled": True, "width_m": 12.0, "discharge_m3s": 12.0,
+                             "hydrograph": {"enabled": True, "peak_m3s": 30.0,
+                                            "start_s": 150.0, "rise_s": 30.0, "fall_s": 60.0}})
+        m.apply_river_outlet({"width_m": 20.0})
+        cell = m.world.terrain.cell_size
+        west = -(N - 1) * 0.5 * cell
+        lines = {}
+        for name, x in (("inlet", west + 0.5 * cell), ("up", -50.0), ("down", 80.0)):
+            oid = m.apply_object_add({"type": "SECTION", "position": [x, 0.0, 0.0]})["id"]
+            m.apply_object_update(oid, {"metadata": {"section_width_m": 60.0}})
+            lines[name] = oid
+        m.start()
+        bed = m.fluid.get_terrain_heights().reshape(N, N)
+        m.fluid._h.assign(np.maximum(bed[N // 2, :][None, :] + 0.7 - bed, 0.0)
+                          .astype(np.float32).ravel())
+        rows = {name: [] for name in lines}
+        for _ in range(330 * 60):
+            m._step_once()
+            state = {s["id"]: s["latest"] for s in m.section_state()}
+            for name, oid in lines.items():
+                r = state[oid]
+                rows[name].append((m.sim_time, r["flow_m3s"], r["volume_m3"]))
+        series = {name: np.array(v) for name, v in rows.items()}
+        inlet = series["inlet"]
+        k0 = int(np.searchsorted(inlet[:, 0], 145.0))
+        flood = (inlet[-1, 2] - inlet[k0, 2]) - 12.0 * (inlet[-1, 0] - inlet[k0, 0])
+        self.assertAlmostEqual(flood, hydrograph.flood_volume_m3(12.0, 30.0, 30.0, 60.0),
+                               delta=0.01 * 810.0)
+        peaks = {}
+        for name, a in series.items():
+            before = a[int(np.searchsorted(a[:, 0], 150.0)), 1]
+            k = int(np.argmax(a[:, 1]))
+            peaks[name] = (a[k, 1] - before, a[k, 0])
+        self.assertAlmostEqual(peaks["inlet"][0], 18.0, delta=0.3, msg=str(peaks))
+        self.assertTrue(179.0 <= peaks["inlet"][1] <= 184.0, msg=str(peaks))
+        self.assertLess(peaks["inlet"][1], peaks["up"][1], msg=str(peaks))
+        self.assertLess(peaks["up"][1], peaks["down"][1], msg=str(peaks))
+        self.assertLess(peaks["down"][0], peaks["up"][0], msg=str(peaks))
+        self.assertLess(peaks["up"][0], peaks["inlet"][0], msg=str(peaks))
+        self.assertAlmostEqual(inlet[-1, 1], 12.0, delta=0.05)
+
+    async def test_hydrograph_is_validated_saved_and_off_by_default(self) -> None:
+        water = self.manager.world.water
+        self.assertFalse(water.hydrograph_enabled)
+        self.manager.apply_river_inlet({"hydrograph": {"enabled": True, "peak_m3s": 55.0}})
+        restored = WorldState.from_dict(self.manager.world.to_dict())
+        self.assertTrue(restored.water.hydrograph_enabled)
+        self.assertEqual(restored.water.hydrograph_peak_m3s, 55.0)
+        for bad in ({"peak_m3s": -1.0}, {"rise_s": 0.0}, {"start_s": "soon"},
+                    {"wobble": 1.0}, {"fall_s": float("inf")}):
+            with self.assertRaises(ValueError):
+                self.manager.apply_river_inlet({"hydrograph": bad})
+        with self.assertRaises(ValueError):
+            self.manager.apply_river_inlet({"hydrograph": 5})
+
+
 class BridgeBackwaterTests(unittest.IsolatedAsyncioTestCase):
     """v0.18.0: the Bridge scenario as the river's acceptance scene.
 

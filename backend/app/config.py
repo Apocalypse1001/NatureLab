@@ -84,6 +84,9 @@ GAUGE_HISTORY_INTERVAL = 0.1
 # the River scenario's channel and banks with room to spare
 SECTION_WIDTH_M = 40.0
 SECTION_MAX_WIDTH_M = 2000.0
+# v0.18.0 flood hydrograph (backend/app/hydrograph.py)
+INLET_MAX_DISCHARGE_M3S = 10_000.0
+HYDROGRAPH_MAX_TIME_S = 36_000.0
 
 # --------------------------------------------------------------- RiverLab (v0.6.0)
 # Sediment transport / erosion / deposition on the same grid as h/u/v.

@@ -14,7 +14,7 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 import numpy as np
 
-from . import config, protocol, sections, sewer
+from . import config, hydrograph, protocol, sections, sewer
 from .compute_engine import ComputeEngine, create_engine
 from .events import EventLog, EventType
 from .fluid_solver import SOLID_OBSTACLE_TYPES, FluidSolver, create_fluid_solver
@@ -259,6 +259,16 @@ class SimulationManager:
         """Open/close the downstream map edge. Read live each tick."""
         self.world.water.outflow_enabled = bool(enabled)
 
+    def inlet_discharge_now(self) -> float:
+        """The discharge the inlet carries at this moment: the base flow, or
+        the flood hydrograph on top of it (v0.18.0)."""
+        water = self.world.water
+        if not water.hydrograph_enabled:
+            return water.inlet_discharge_m3s
+        return hydrograph.discharge_at(self.sim_time, water.inlet_discharge_m3s,
+                                       water.hydrograph_peak_m3s, water.hydrograph_start_s,
+                                       water.hydrograph_rise_s, water.hydrograph_fall_s)
+
     def apply_river_inlet(self, fields: Dict[str, Any]) -> Dict[str, Any]:
         """Configure the prescribed-discharge inlet on the west edge.
 
@@ -279,9 +289,14 @@ class SimulationManager:
                 water.inlet_width_m = width
             elif key == "discharge_m3s":
                 q = finite_number(value, "inlet.discharge_m3s")
-                if not 0.0 <= q <= 10_000.0:
+                if not 0.0 <= q <= config.INLET_MAX_DISCHARGE_M3S:
                     raise ValueError("inlet.discharge_m3s out of range")
                 water.inlet_discharge_m3s = q
+            elif key == "hydrograph":
+                if not isinstance(value, dict):
+                    raise ValueError("inlet.hydrograph must be an object")
+                for name, number in hydrograph.validate(value).items():
+                    setattr(water, f"hydrograph_{name}", number)
             else:
                 raise ValueError(f"unknown inlet field: {key!r}")
         return {"enabled": water.inlet_enabled, "centre_z": water.inlet_centre_z,
@@ -588,7 +603,7 @@ class SimulationManager:
             # hydrograph that comes next.
             water = self.world.water
             self.fluid.set_river_inlet(water.inlet_enabled, water.inlet_centre_z,
-                                       water.inlet_width_m, water.inlet_discharge_m3s)
+                                       water.inlet_width_m, self.inlet_discharge_now())
         if hasattr(self.fluid, "set_rain"):
             # RainLab-1: live, so the slider acts while RUNNING
             self.fluid.set_rain(self.world.water.rain_intensity_mm_h)

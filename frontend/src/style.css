@@ -86,6 +86,9 @@ select {
 .gauge-readout > #sewer-lines { display: block; margin: 0; color: #9db3ca; }
 #sewer-lines > div { margin: 3px 0; }
 #sewer-lines em { display: block; margin-top: 8px; color: #c9d6e3; font-style: normal; }
+#hydro-chart { width: 100%; height: 70px; margin-top: 6px; background: #08141d; }
+#hydro-chart polyline { fill: none; stroke: #7fd4ff; stroke-width: 2; vector-effect: non-scaling-stroke; }
+#hydro-chart line { stroke: #ffd23f; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 #gauge-chart polyline, #section-chart polyline { fill: none; stroke: #62e6ff; stroke-width: 2; vector-effect: non-scaling-stroke; }
 
 .bottombar {
