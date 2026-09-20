@@ -62,11 +62,12 @@ const SCENARIOS: { name: string; label: string; hint: string }[] = [
     hint: 'The river town in a downpour, with a storm sewer: three street inlets '
         + 'on 150 mm pipes down to the river. Water runs to each grate, goes down '
         + 'it and pours out of the outfall into the river. Click a pipe to see its '
-        + 'flow against what it can carry. At about seven minutes the pipe behind '
-        + 'the north row is carrying every one of the 11 l/s it can, and a pond '
-        + 'starts to grow over its grate -- a centimetre at first, a hand deep by '
-        + 'ten minutes (a faster speed gets there sooner); lay a wider one with '
-        + '"Lay pipe"' },
+        + 'flow against what it can carry. The roofs shed their rain onto the '
+        + 'ground around them, so the houses feed the street too. At about six '
+        + 'minutes the pipe behind the north row is carrying every one of the '
+        + '11 l/s it can, and a pond starts to grow over its grate -- a centimetre '
+        + 'by seven minutes, a hand deep by ten (a faster speed gets there '
+        + 'sooner); lay a wider one with "Lay pipe"' },
   { name: 'scenario_bridge', label: 'Bridge',
     hint: 'The river town with a bridge on five piers, and a gauging line above and '
         + 'below it; the river is already flowing. Click a line: the same '

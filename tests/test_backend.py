@@ -3614,9 +3614,12 @@ class RainTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(diag["rain_m3s"],
                                36.0 / 3.6e6 * N * N * config.TERRAIN_CELL_SIZE ** 2)
 
-    async def test_rain_does_not_land_inside_a_building(self) -> None:
-        """A wall is not ground. Until roofs exist (RainLab-2) rain on a house is
-        not delivered, and the ledger must not count it as if it were."""
+    async def test_rain_does_not_stand_on_a_roof_but_is_not_lost_either(self) -> None:
+        """A wall is not ground, so no water stands on it -- that part is as it
+        was. What changed in RainLab-2 (docs/18_roof_plan.md) is the other half:
+        the rain that lands on the house is no longer thrown away, so the ledger
+        now counts the WHOLE map. Until then this test asserted the defect,
+        counting N*N minus the footprint and calling that honest."""
         self._closed_dry()
         self.manager.apply_object_add({"type": "HOUSE", "position": [0.0, 0.0, 0.0]})
         self.manager.apply_rain({"intensity_mm_h": 36.0})
@@ -3626,7 +3629,7 @@ class RainTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(int(solid.sum()), 0, "the house is not in the mask")
         self.assertEqual(float(self._depth()[solid].max()), 0.0)
         diag = self.manager.fluid.diagnostics()
-        fallen = self._fallen_m3(diag, 36.0, 5.0, N * N - int(solid.sum()))
+        fallen = self._fallen_m3(diag, 36.0, 5.0, N * N)
         self.assertAlmostEqual(diag["rain_added_m3"], fallen, delta=fallen * 1.0e-3)
 
     async def test_changing_the_intensity_acts_while_running(self) -> None:
@@ -3698,6 +3701,107 @@ class RainTests(unittest.IsolatedAsyncioTestCase):
         self._run(1.0)
         self.assertEqual(float(self._depth()[:, :config.FLUID_SOURCE_COLUMNS].max()), 0.0)
         self.assertFalse(self.manager.fluid.diagnostics()["edge_inflow"])
+
+
+class RoofTests(unittest.IsolatedAsyncioTestCase):
+    """RainLab-2 (docs/18_roof_plan.md): a house sheds its rain, it does not eat it.
+
+    Up to v0.19.0 the rain kernel returned early on a solid cell, so the water
+    that fell on a roof never existed anywhere. On the shipped Sewer scene that
+    was 3.5 l/s at 50 mm/h -- a third of the north pipe's capacity, thrown away
+    exactly where the town and its drains are.
+
+    What is asked here is the promise, not the mechanism: does the same rain
+    over the same map deliver the same water whether or not a town stands on
+    it, and does that water arrive on the ground AROUND the houses. "Is
+    `_roof_share` populated" could not fail for the right reason.
+    """
+
+    RAIN_MM_H = 100.0
+    SECONDS = 20.0
+    # 5 houses of 5 x 5 m, spread so their eaves rings do not merge: 125 cells,
+    # 0.3% of the map. Small on purpose -- the assertions below are about where
+    # the water goes, and a footprint big enough to flatter a conservation test
+    # would also change the flow it is supposed to leave alone.
+    HOUSES = [(-40.0, -40.0), (-20.0, 20.0), (0.0, 0.0), (25.0, -25.0), (40.0, 35.0)]
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    def _rain_on_flat_ground(self, with_houses: bool) -> tuple:
+        m = self.manager
+        m.world.terrain.heights[:, :] = 0.0
+        m.terrain_revision += 1
+        if with_houses:
+            for x, z in self.HOUSES:
+                m.apply_object_add({"type": "HOUSE", "position": [x, 0.0, z]})
+        m.apply_water_level(0.0)
+        m.apply_water_outflow(False)
+        m.apply_edge_inflow(False)
+        m.apply_rain({"intensity_mm_h": self.RAIN_MM_H})
+        m.start()
+        for _ in range(int(round(self.SECONDS / config.FIXED_DT))):
+            m._step_once()
+        depth = np.asarray(m.fluid._h.numpy(), dtype=np.float64).reshape(N, N)
+        share = np.asarray(m.fluid._roof_share_host, dtype=np.float64).reshape(N, N)
+        solid = m.fluid._obstacle_host.reshape(N, N) != 0
+        return depth, share, solid, m.fluid.diagnostics()
+
+    async def test_a_town_in_the_rain_gains_as_much_water_as_bare_ground(self) -> None:
+        """The defect stated as a number. Every drop that falls on the map is on
+        the map afterwards, town or no town -- before RainLab-2 the town was
+        short by exactly its footprint."""
+        depth, share, solid, diag = self._rain_on_flat_ground(True)
+        footprint = int(solid.sum())
+        self.assertGreater(footprint, 100, "the houses are not in the mask")
+        self.assertEqual(diag["roof_orphan_cells"], 0,
+                         "a roof was left with nowhere to drain")
+        self.assertEqual(float(share.sum()), float(footprint),
+                         "the roofs shed a different number of cells than they cover")
+
+        area = config.TERRAIN_CELL_SIZE ** 2
+        whole_map = ((self.RAIN_MM_H / 3.6e6 * self.SECONDS - diag["rain_pending_m"])
+                     * N * N * area)
+        self.assertAlmostEqual(diag["rain_added_m3"], whole_map,
+                               delta=whole_map * 1.0e-3,
+                               msg="the rain the ledger booked is not the rain that fell "
+                                   "on the whole map")
+        self.assertAlmostEqual(float(depth.sum()) * area, whole_map,
+                               delta=whole_map * 2.0e-3,
+                               msg="the water booked is not the water present")
+        # ... and the old behaviour would have failed it by the footprint:
+        without_roofs = whole_map * (1.0 - footprint / (N * N))
+        self.assertGreater(abs(whole_map - without_roofs), whole_map * 1.0e-3,
+                           "this test cannot tell the defect from the fix")
+
+    async def test_the_roof_water_lands_on_the_ground_around_the_house(self) -> None:
+        """Where it goes, which is what a person watching sees: the eaves ring
+        stands deeper than the same ground in a town-free world, and the roof
+        itself stays dry, because rain does not pond on a wall."""
+        wet_town, share, solid, _ = self._rain_on_flat_ground(True)
+        ring = share > 0
+        self.assertGreater(int(ring.sum()), 0, "no cell catches any roof")
+        self.assertEqual(float(wet_town[solid].max()), 0.0,
+                         "water is standing on a roof")
+
+        await self.asyncTearDown()
+        self.manager = SimulationManager()
+        bare, _, _, _ = self._rain_on_flat_ground(False)
+
+        town, plain = float(np.median(wet_town[ring])), float(np.median(bare[ring]))
+        self.assertGreater(town, 1.4 * plain,
+                           f"the eaves ring is no deeper for the house above it: "
+                           f"{100 * town:.3f} cm against {100 * plain:.3f} cm")
+        # Flat ground, so the rest of the map is untouched by the houses: the
+        # roof water stays where it was shed instead of spreading over the town.
+        far = (~ring) & (~solid)
+        self.assertAlmostEqual(float(np.median(wet_town[far])),
+                               float(np.median(bare[far])),
+                               delta=0.05 * float(np.median(bare[far])))
 
 
 class SewerTests(unittest.IsolatedAsyncioTestCase):

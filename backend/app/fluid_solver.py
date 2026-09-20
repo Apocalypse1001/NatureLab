@@ -574,6 +574,7 @@ if WARP_IMPORTED:
 
     @wp.kernel
     def _apply_rain(h: wp.array(dtype=float), solid: wp.array(dtype=wp.int32),
+                    share: wp.array(dtype=float),
                     depth: float, area: float, added: wp.array(dtype=float)):
         """RainLab-1: uniform rain, one poured portion `depth` on every open cell.
 
@@ -585,14 +586,23 @@ if WARP_IMPORTED:
         float32, and on a deep cell a small add is rounded. Booking the request
         would turn that rounding into an unexplained conservation error; booking
         the increment keeps `volume_error_m3` honest about the water that is
-        really there. Solid cells receive nothing -- until roofs exist
-        (RainLab-2) rain on a building is not delivered at all.
+        really there.
+
+        RainLab-2 (docs/18_roof_plan.md): a solid cell still takes nothing
+        directly -- rain does not stand on a roof -- but it no longer swallows
+        the water either. `share[idx]` is how many roof cells drip onto this
+        open cell, computed on the host in `_build_roof_share` whenever the
+        obstacles change, so a house sheds its rain onto the ground around it
+        the way a house without a downpipe does. Carried as a share rather than
+        an atomic add into a neighbour's cell precisely to keep the line above
+        exact: every cell is still written by its own thread and books its own
+        real increment.
         """
         idx = wp.tid()
         if solid[idx] != 0:
             return
         before = h[idx]
-        h[idx] = before + depth
+        h[idx] = before + depth * (1.0 + share[idx])
         wp.atomic_add(added, 0, (h[idx] - before) * area)
 
 
@@ -1723,6 +1733,9 @@ class WarpShallowWaterSolver(FluidSolver):
         self._temperature = self._next_temperature = None
         self._manning = None
         self._manning_host = np.zeros(0, dtype=np.float32)
+        self._roof_share = None
+        self._roof_share_host = np.zeros(0, dtype=np.float32)
+        self._roof_orphan_cells = 0
         self._vent_count = 0
         self._vent_centres = self._vent_radii = None
         self._vent_discharges = self._vent_temps = None
@@ -1874,6 +1887,12 @@ class WarpShallowWaterSolver(FluidSolver):
         self._manning_host = np.full(self._count, self._base_manning, dtype=np.float32)
         self._manning = wp.array(self._manning_host.copy(),
                                  dtype=float, device=self.device)
+        # RainLab-2: no obstacles are known yet, so no roof sheds anything --
+        # set_boundaries fills this the moment a mask arrives.
+        self._roof_share_host = np.zeros(self._count, dtype=np.float32)
+        self._roof_share = wp.array(self._roof_share_host.copy(),
+                                    dtype=float, device=self.device)
+        self._roof_orphan_cells = 0
         self._temperature = wp.array(
             np.full(self._count, config.LAVA_AMBIENT_TEMP_C + 273.15, dtype=np.float32),
             dtype=float, device=self.device)
@@ -2055,6 +2074,58 @@ class WarpShallowWaterSolver(FluidSolver):
                  & (np.abs(local_z) <= float(half_extents[index][1]))] = surface_n
         return field
 
+    def _build_roof_share(self, mask: np.ndarray) -> tuple:
+        """Roof cells draining onto each open cell, and the orphans (RainLab-2).
+
+        Rain on a building used to be dropped on the floor: the kernel returned
+        early for solid cells and the water simply never existed, which on the
+        shipped Sewer scene threw away 3.5 l/s -- a third of the north pipe's
+        capacity -- exactly where the town and its drains are (docs/18, §2).
+
+        A house sheds to its eaves, so every solid cell is assigned the open
+        cell that reaches it first in a multi-source breadth-first sweep
+        outward from open ground; `share` then counts, per open cell, how many
+        roof cells drip into it. Each wave takes the SMALLEST source index
+        among the neighbours that reached it, so the answer does not depend on
+        the order of the directions, of the objects, or of anything else.
+
+        Returns (share, orphans). An orphan is a solid cell no open cell can
+        reach -- impossible unless the map is walled solid, and counted rather
+        than dropped so the ledger can say so out loud instead of quietly
+        losing water the way the old early return did.
+        """
+        grid = mask.reshape(self._height, self._width)
+        solid = grid != 0
+        share = np.zeros(self._count, dtype=np.float32)
+        if not solid.any():
+            return share, 0
+        unreachable = np.iinfo(np.int64).max
+        target = np.where(solid, -1, np.arange(self._count).reshape(grid.shape))
+        while True:
+            open_yet = target < 0
+            if not open_yet.any():
+                break
+            best = np.full(grid.shape, unreachable, dtype=np.int64)
+            for axis, roll in ((0, 1), (0, -1), (1, 1), (1, -1)):
+                shifted = np.roll(target, roll, axis=axis)
+                # the map edge is a wall, not a wrap: a roof on the border
+                # drips inward, never onto the far side of the world
+                if axis == 0:
+                    (shifted[0, :] if roll == 1 else shifted[-1, :]).fill(-1)
+                else:
+                    (shifted[:, 0] if roll == 1 else shifted[:, -1]).fill(-1)
+                best = np.where((shifted >= 0) & (shifted < best), shifted, best)
+            newly = open_yet & (best < unreachable)
+            if not newly.any():
+                break
+            target[newly] = best[newly]
+        drained = target[solid]
+        orphans = int((drained < 0).sum())
+        if drained.size > orphans:
+            counts = np.bincount(drained[drained >= 0], minlength=self._count)
+            share = counts.astype(np.float32)
+        return share, orphans
+
     def _build_bed_offset(self, terrain, obstacles: dict) -> np.ndarray:
         """Raised-bed domes for riverbed bodies (ROCK), in grid order.
 
@@ -2189,6 +2260,13 @@ class WarpShallowWaterSolver(FluidSolver):
                 self._remap_obstacles(new_mask)
                 self._obstacle_host = new_mask
                 self._obstacles = wp.array(new_mask, dtype=wp.int32, device=self.device)
+                # Who catches each roof's rain moves with the roofs, and with
+                # nothing else -- so it is rebuilt here and never per frame.
+                new_share, orphans = self._build_roof_share(new_mask)
+                self._roof_orphan_cells = orphans
+                if not np.array_equal(new_share, self._roof_share_host):
+                    self._roof_share_host = new_share
+                    self._roof_share.assign(new_share)
             new_offset = self._build_bed_offset(terrain, obstacles)
             if not np.array_equal(new_offset, self._bed_offset_host):
                 self._bed_offset_host = new_offset
@@ -2803,7 +2881,7 @@ class WarpShallowWaterSolver(FluidSolver):
                 self._rain_pending_m += self._rain_mm_h / 3.6e6 * dt
                 if self._rain_pending_m >= config.RAIN_APPLY_STEP_M:
                     wp.launch(_apply_rain, dim=self._count,
-                              inputs=[self._h, self._obstacles,
+                              inputs=[self._h, self._obstacles, self._roof_share,
                                       float(self._rain_pending_m), area,
                                       self._diag_rain], device=self.device)
                     self._rain_pending_m = 0.0
@@ -3284,11 +3362,20 @@ class WarpShallowWaterSolver(FluidSolver):
                 # whatever the slider says, so the UI never claims rain it is not
                 # delivering
                 "rain_mm_h": (self._rain_mm_h if not self._lava_enabled else 0.0),
+                # Every cell the rain reaches, which since RainLab-2 includes the
+                # roofs: their water is delivered to the ground around them, so
+                # counting open cells alone would now under-report what is
+                # actually falling on the map by the footprint of the town.
                 "rain_m3s": ((self._rain_mm_h / 3.6e6
-                              * float(np.count_nonzero(self._obstacle_host == 0))
+                              * float(np.count_nonzero(self._obstacle_host == 0)
+                                      + self._roof_share_host.sum())
                               * float(self._terrain.cell_size ** 2))
                              if (not self._lava_enabled and self._terrain is not None)
                              else 0.0),
+                # Solid cells no open cell can reach: their rain is the only
+                # water RainLab-2 still does not deliver, and it is named rather
+                # than lost silently.
+                "roof_orphan_cells": self._roof_orphan_cells,
                 "rain_added_m3": self._rain_added_m3,
                 "rain_pending_m": self._rain_pending_m,
                 "edge_inflow": self._edge_inflow_enabled,
