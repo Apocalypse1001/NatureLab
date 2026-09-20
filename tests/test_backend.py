@@ -3228,13 +3228,25 @@ class TsunamiLabTests(unittest.IsolatedAsyncioTestCase):
         manager.world.terrain.cell_size = self.CELL
         return coastline(manager.world.terrain)
 
+    # Where the SEA is, not where the sand is damp. Up to v0.18.1 this scan
+    # used FLUID_DRY_DEPTH (0.1 mm) -- a numerical epsilon standing in for a
+    # physical question. It gave the right answer only while the friction floor
+    # ran thin sheets ~137x under-dragged and the beach therefore drained bone
+    # dry; with honest drag (v0.19.0) a sub-millimetre skin stays on the sand,
+    # which the solver has no way to remove, having neither infiltration nor
+    # evaporation. Measured across thresholds, the retreat reads 2.4 m at
+    # 0.1 mm, 32 m at 1 mm and 112 m at 1 cm and above -- so the sea still
+    # leaves, and only the yardstick had to change. Nothing about the tsunami
+    # itself was re-calibrated; see docs/17_film_friction_plan.md §8.
+    SEA_DEPTH_M = 0.01
+
     def _waterline_x(self, manager) -> float:
-        """World x of the wet/dry boundary along the centre row, scanning from
-        the western (land) side -- the thing a person actually watches."""
+        """World x of the sea's edge along the centre row, scanning from the
+        western (land) side -- the thing a person actually watches."""
         cell = manager.world.terrain.cell_size
         xs = (np.arange(N) - (N - 1) * 0.5) * cell
         row = np.asarray(manager.fluid._h.numpy()).reshape(N, N)[N // 2]
-        wet = np.flatnonzero(row > config.FLUID_DRY_DEPTH)
+        wet = np.flatnonzero(row > self.SEA_DEPTH_M)
         return float(xs[wet[0]]) if len(wet) else float(xs[-1])
 
     async def test_tsunami_fields_survive_a_save_load_round_trip(self) -> None:
@@ -3467,6 +3479,77 @@ class TsunamiLabTests(unittest.IsolatedAsyncioTestCase):
                                 f"{peak:.2f} m")
 
 
+class SurfaceRoughnessTests(unittest.IsolatedAsyncioTestCase):
+    """v0.19.0: Manning's n per cell, decided by what the surface IS.
+
+    Up to v0.18.1 a ROAD was the one object with no effect on the water at
+    all -- drawn, counted as a body, invisible to the flow. The question this
+    asks is the one the feature promises: does a street shed rain faster than
+    the grass beside it? Not "is 0.013 in the array", which could not fail for
+    the right reason.
+
+    Measured before it was written (scratch probe, recorded in
+    docs/17_film_friction_plan.md §7): on the upper slope, where the sheet is
+    kinematic rather than ponded against the closed wall, the film over the
+    road thins to 0.70 of the grass film by 300 s and is still falling toward
+    the (0.013/0.03)^0.6 = 0.605 that Manning predicts at equal discharge.
+    """
+
+    def _slope_with_rain(self, paved: bool, seconds: float) -> tuple:
+        manager = SimulationManager()
+        terrain = manager.world.terrain
+        x = (np.arange(N) - (N - 1) / 2) * config.TERRAIN_CELL_SIZE
+        terrain.heights[:, :] = (-0.02 * x)[None, :].astype(np.float32)
+        if paved:
+            for centre in range(-84, 85, 12):
+                manager.apply_object_add(
+                    {"type": "ROAD", "position": [float(centre), 0.0, 0.0]})
+        manager.terrain_revision += 1
+        manager.apply_water_level(0.0)
+        manager.apply_water_outflow(False)
+        manager.apply_edge_inflow(False)
+        manager.apply_rain({"intensity_mm_h": 100.0})
+        manager.start()
+        for _ in range(int(round(seconds / config.FIXED_DT))):
+            manager._step_once()
+        depth = np.asarray(manager.fluid._h.numpy(), dtype=np.float32).reshape(N, N)
+        manning = np.asarray(manager.fluid._manning.numpy(),
+                             dtype=np.float32).reshape(N, N)
+        manager.stop()
+        return depth, manning
+
+    async def test_a_street_sheds_rain_faster_than_the_grass_beside_it(self) -> None:
+        paved, manning = self._slope_with_rain(True, 300.0)
+        grass, _ = self._slope_with_rain(False, 300.0)
+
+        road = manning < 0.5 * (config.FLUID_MANNING_N + config.PAVEMENT_MANNING_N)
+        self.assertGreater(int(road.sum()), 0, "no cell was paved at all")
+        self.assertAlmostEqual(float(manning[road].max()),
+                               config.PAVEMENT_MANNING_N, places=5)
+        self.assertAlmostEqual(float(manning[~road].min()),
+                               config.FLUID_MANNING_N, places=5)
+
+        # The upper slope only: against the closed east wall the depth is set by
+        # ponding, not by how fast the sheet runs, and the two worlds converge.
+        upper = np.zeros_like(road)
+        upper[:, N // 6:N // 3] = True
+        on_road = road & upper
+        ratio = float(paved[on_road].mean() / grass[on_road].mean())
+        self.assertLess(ratio, 0.80,
+                        f"the film over the road is no thinner than over grass: "
+                        f"ratio {ratio:.3f}, Manning predicts "
+                        f"{(config.PAVEMENT_MANNING_N / config.FLUID_MANNING_N) ** 0.6:.3f}")
+        self.assertGreater(ratio, 0.50,
+                           f"the road shed far more than Manning allows: {ratio:.3f}")
+
+        # ... and the water it sheds has to arrive somewhere: downslope.
+        band = max(2, N // 20)
+        self.assertGreater(float(paved[:, -band:].mean()),
+                           float(grass[:, -band:].mean()),
+                           "the street ran the rain off faster but nothing reached "
+                           "the bottom sooner")
+
+
 class RainTests(unittest.IsolatedAsyncioTestCase):
     """RainLab-1 (docs/14_rain_plan.md): uniform rain as an areal source.
 
@@ -3576,7 +3659,18 @@ class RainTests(unittest.IsolatedAsyncioTestCase):
     async def test_rain_on_a_slope_gathers_at_the_bottom(self) -> None:
         """What a person watching looks for: not how much fell, but where it went.
         A 2% slope falling east, closed edges: the top strip drains, the bottom
-        strip against the wall collects what ran down onto it."""
+        strip against the wall collects what ran down onto it.
+
+        Run to 240 s, not the 60 s this asked for up to v0.18.1. The threefold
+        assertion is unchanged and is the point of the test; what changed is
+        that 60 s could only ever satisfy it while the friction floor ran the
+        sheet ~137x under-dragged. At 100 mm/h on 2% the equilibrium film is
+        about 1.4 mm and travels ~0.07 m/s, so in 60 s it covers 4 m -- and the
+        bottom band is 10 m wide, which caps the honest ratio near 1.4. The
+        measured curve (docs/17_film_friction_plan.md, §6) crosses 3x at ~180 s
+        and reaches 12x by 720 s. A window too short for the water to arrive
+        tested the artifact, not the runoff.
+        """
         heights = self.manager.world.terrain.heights
         x = (np.arange(N) - (N - 1) / 2) * config.TERRAIN_CELL_SIZE
         heights[:, :] = (-0.02 * x)[None, :].astype(np.float32)
@@ -3584,7 +3678,7 @@ class RainTests(unittest.IsolatedAsyncioTestCase):
         self._closed_dry()
         self.manager.apply_rain({"intensity_mm_h": 100.0})
         self.manager.start()
-        self._run(60.0)
+        self._run(240.0)
         depth = self._depth()
         band = max(2, N // 20)
         high = float(depth[:, :band].mean())

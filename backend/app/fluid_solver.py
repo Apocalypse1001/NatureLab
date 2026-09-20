@@ -1550,6 +1550,12 @@ SOLID_OBSTACLE_TYPES = frozenset({"HOUSE", "BRIDGE", "BUILDING"})
 # the opposite of what a bridge does.
 BRIDGE_PIER_TYPES = frozenset({"BRIDGE"})
 
+# Bodies that are not walls but do change the bed they stand on. A ROAD is not
+# solid -- water runs over a street, it does not stop at one -- so it never
+# enters the obstacle mask; what it changes is roughness. Kept as a mapping
+# rather than a type check so the next paved thing is one line, not a branch.
+SURFACE_MANNING_TYPES = {"ROAD": config.PAVEMENT_MANNING_N}
+
 # A ROCK of scale 1 raises the bed over this radius, in metres. Matches the
 # radius of the ROCK mesh in frontend/src/world/ObjectFactory.ts so what the
 # user sees is what the water feels.
@@ -1716,6 +1722,7 @@ class WarpShallowWaterSolver(FluidSolver):
         self._lava_enabled = False
         self._temperature = self._next_temperature = None
         self._manning = None
+        self._manning_host = np.zeros(0, dtype=np.float32)
         self._vent_count = 0
         self._vent_centres = self._vent_radii = None
         self._vent_discharges = self._vent_temps = None
@@ -1864,9 +1871,9 @@ class WarpShallowWaterSolver(FluidSolver):
         # looked better.
         self._base_manning = (config.SEABED_MANNING_N if tsunami_wanted
                               else config.FLUID_MANNING_N)
-        self._manning = wp.array(
-            np.full(self._count, self._base_manning, dtype=np.float32),
-            dtype=float, device=self.device)
+        self._manning_host = np.full(self._count, self._base_manning, dtype=np.float32)
+        self._manning = wp.array(self._manning_host.copy(),
+                                 dtype=float, device=self.device)
         self._temperature = wp.array(
             np.full(self._count, config.LAVA_AMBIENT_TEMP_C + 273.15, dtype=np.float32),
             dtype=float, device=self.device)
@@ -2010,6 +2017,44 @@ class WarpShallowWaterSolver(FluidSolver):
             return False
         return obj_type in SOLID_OBSTACLE_TYPES
 
+    def _build_manning_map(self, terrain, obstacles: dict) -> np.ndarray:
+        """Manning's n per cell, decided by what each cell's surface IS.
+
+        Filled with this world's baseline, then overwritten under the footprint
+        of every body in SURFACE_MANNING_TYPES. Deliberately separate from the
+        obstacle mask: "does the water stop here" and "how rough is the bed
+        here" are different questions, and for a street the answers are no and
+        much smoother. The footprints are the same half extents the rigid
+        system already reports to the solver, so a road rasterizes at the size
+        it is drawn.
+        """
+        base = getattr(self, "_base_manning", config.FLUID_MANNING_N)
+        field = np.full(self._count, base, dtype=np.float32)
+        positions = obstacles.get("positions", []) if obstacles else []
+        if len(positions) == 0:
+            return field
+        types = obstacles.get("types", [])
+        rotations = obstacles.get("rotations", [])
+        half_extents = obstacles.get("half_extents", [])
+        grid = field.reshape(self._height, self._width)
+        yy, xx = np.mgrid[0:self._height, 0:self._width]
+        world_x = (xx - terrain.width / 2) * terrain.cell_size
+        world_z = (yy - terrain.height / 2) * terrain.cell_size
+        for index, position in enumerate(positions):
+            surface_n = SURFACE_MANNING_TYPES.get(
+                types[index] if index < len(types) else "")
+            if surface_n is None or index >= len(half_extents):
+                continue
+            yaw = float(rotations[index][1]) if index < len(rotations) else 0.0
+            cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+            dx = world_x - float(position[0])
+            dz = world_z - float(position[2])
+            local_x = cos_yaw * dx + sin_yaw * dz
+            local_z = -sin_yaw * dx + cos_yaw * dz
+            grid[(np.abs(local_x) <= float(half_extents[index][0]))
+                 & (np.abs(local_z) <= float(half_extents[index][1]))] = surface_n
+        return field
+
     def _build_bed_offset(self, terrain, obstacles: dict) -> np.ndarray:
         """Raised-bed domes for riverbed bodies (ROCK), in grid order.
 
@@ -2148,6 +2193,15 @@ class WarpShallowWaterSolver(FluidSolver):
             if not np.array_equal(new_offset, self._bed_offset_host):
                 self._bed_offset_host = new_offset
                 self._bed_offset = wp.array(new_offset, dtype=float, device=self.device)
+            new_manning = self._build_manning_map(terrain, obstacles)
+            if not np.array_equal(new_manning, self._manning_host):
+                self._manning_host = new_manning
+                # While lava runs, `_lava_manning` owns this array and rewrites
+                # every cell each substep from mu(T); the surface map is kept on
+                # the host and handed back when lava stops. The two never apply
+                # at once, which costs nothing real: a volcano has no asphalt.
+                if not self._lava_enabled:
+                    self._manning.assign(new_manning)
             self._seen_obstacle_revision = obstacle_revision
             self.obstacle_gpu_uploads += 1
             changed = True
@@ -2509,12 +2563,15 @@ class WarpShallowWaterSolver(FluidSolver):
                 np.array([float(item[3]) + 273.15 for item in vents], dtype=np.float32),
                 dtype=float, device=self.device)
         elif was_enabled and self._manning is not None:
-            # Back to this WORLD's baseline, not unconditionally to the river
-            # channel's -- a tsunami world's bed is a sea bed and stays one.
-            self._manning.assign(
-                np.full(self._count,
-                        getattr(self, "_base_manning", config.FLUID_MANNING_N),
-                        dtype=np.float32))
+            # Back to this WORLD's own surfaces, not unconditionally to the
+            # river channel's constant -- a tsunami world's bed is a sea bed
+            # and stays one, and a street stays paved.
+            self._manning.assign(self._manning_host if self._manning_host.size
+                                 == self._count else
+                                 np.full(self._count,
+                                         getattr(self, "_base_manning",
+                                                 config.FLUID_MANNING_N),
+                                         dtype=np.float32))
 
     def set_erosion(self, enabled: bool) -> None:
         """RiverLab erosion on/off, read live each tick by SimulationManager.

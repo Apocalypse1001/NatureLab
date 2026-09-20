@@ -68,13 +68,27 @@ FLUID_MAX_VELOCITY = 20.0
 # channel and a 5 cm sheet the identical answer, and no value of it could
 # produce the difference -- see FrictionLawTests.
 FLUID_MANNING_N = 0.03           # s/m^(1/3): a clean, straight natural channel
-# Depth floor for the friction term. This is a physics knob, not a guard against
-# dividing by zero: it alone decides how fast a wetting front creeps forward, and
-# it sets the depth below which the new law brakes HARDER than the old damping
-# did -- about 0.12 m at 1 m/s and 0.20 m at 2 m/s. Above that the new law is the
-# weaker of the two (17x weaker at 1 m depth), so the change is not "more drag"
-# or "less drag": it is drag that finally reads the depth.
-FLUID_FRICTION_MIN_DEPTH = 0.02  # m
+# Roughness by what the surface IS, the same reasoning that gave a tsunami world
+# SEABED_MANNING_N instead of a river's channel value. A ROAD used to be the one
+# object with no effect on the water at all -- drawn, and counted as a body, and
+# otherwise invisible to the flow. Now a street sheds rain faster than the grass
+# beside it, which is the whole reason a town has streets.
+PAVEMENT_MANNING_N = 0.013       # asphalt in fair repair; Chow's tables: 0.012-0.016
+# Depth floor for the friction term -- a physics knob, not a guard against
+# dividing by zero. Held at 0.02 up to v0.18.1, which was a tuned number: every
+# cell of the street that has to carry rain to a storm grate is thinner than
+# that, so their drag was computed at 2 cm instead of half a millimetre.
+# Measured against the discharge the street actually carries (docs/17, §3b): at
+# 0.02 the sheet stood 0.60 mm deep while Manning needs 2.54 mm for that flow --
+# four times too thin.
+#
+# This value is not retuned, it is RETIRED. Swept over 900 s runs, the answer
+# stops depending on it below half a millimetre: 0.0005 and 0.00025 agree to
+# 0.01 mm at every sample. It is set at the top of that converged range, so the
+# number no longer chooses anything -- which is the only honest state for a
+# constant that has no entry in any table. Re ~ 41 on such a film, so there is
+# nothing to gain by driving it lower either.
+FLUID_FRICTION_MIN_DEPTH = 0.0005  # m
 FLUID_SOURCE_COLUMNS = 2     # prescribed inflow starts at the left map edge
 WATER_DENSITY = 1000.0
 RIGID_STOP_SPEED = 1.0e-3
