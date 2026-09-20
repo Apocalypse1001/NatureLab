@@ -34,3 +34,8 @@ releases/*/
 
 # third-party reference implementations (study material, not project source)
 reference/
+
+# reading material parked in the tree, not part of the product (tools/make_release.py
+# skips these too, so a release never carries them)
+Shauberg PAtent - Claude.html
+Shauberg PAtent - Claude_files/

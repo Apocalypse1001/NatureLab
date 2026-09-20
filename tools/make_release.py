@@ -31,10 +31,16 @@ SKIP_DIRS = {".git", "node_modules", "__pycache__", "releases", "build",
              # third-party reference implementations kept for study, not part of
              # the product -- 69 MB of DEM samples and demo GIFs that would
              # otherwise dominate a 0.3 MB release
-             "reference"}
+             "reference",
+             # a saved web page of the Schauberger patent reading, parked in the
+             # tree between releases. It was carried out by hand before 0.17.0
+             # and 0.18.0; "remember to move it" is the kind of rule that gets
+             # forgotten once, so the packer skips it instead. 4.4 MB in 36
+             # files against a 0.3 MB release.
+             "Shauberg PAtent - Claude_files"}
 # Paths (relative to ROOT) pruned specifically. `dist/` at the root is
 # PyInstaller output; `frontend/dist/` is the served bundle and IS included.
-SKIP_PATHS = {Path("dist")}
+SKIP_PATHS = {Path("dist"), Path("Shauberg PAtent - Claude.html")}
 SKIP_SUFFIXES = {".pyc", ".pyo", ".zip", ".exe", ".log", ".err"}
 
 
@@ -60,6 +66,15 @@ def wanted(path: Path) -> bool:
     if relative in SKIP_PATHS or any(part in SKIP_DIRS for part in relative.parts):
         return False
     if relative.parts and relative.parts[0] == "dist":
+        return False
+    # data/ holds two different things: the prepared scenarios, which are product
+    # content a fresh unpack needs, and whatever world somebody last saved while
+    # working. git draws that line already (data/*.json ignored except
+    # scenario_*.json); the packer reads the filesystem, not git, so it has to
+    # draw it too -- every release since 0.16.0 has shipped seven saved test
+    # worlds for want of these four lines.
+    if (len(relative.parts) == 2 and relative.parts[0] == "data"
+            and relative.suffix == ".json" and not relative.name.startswith("scenario_")):
         return False
     return path.suffix not in SKIP_SUFFIXES
 
