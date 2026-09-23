@@ -213,6 +213,7 @@ function applyWorld(world: WorldData, simStatus: string, op?: string,
   // first connection -- but never on RESET or Settle river, which hand back
   // the same world while the user may be looking somewhere on purpose.
   if (op === undefined || op === 'load' || op === 'request_world') {
+    ui.showScenario(op === 'load' ? name ?? null : null);
     const frame = op === 'load' ? SCENARIOS.find((s) => s.name === name)?.frame : undefined;
     if (frame === 'map') sceneManager.frameBox(null, unobstructedWidth());
     else if (frame) sceneManager.frameBox(frame, unobstructedWidth());

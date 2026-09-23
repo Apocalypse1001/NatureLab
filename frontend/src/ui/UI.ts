@@ -166,7 +166,7 @@ export class UI {
     this.root = root;
     this.root.innerHTML = '';
     this.root.append(this.buildTopBar(), this.buildLeft(), this.buildRight(),
-                     this.buildBottom());
+                     this.buildBottom(), this.buildScenarioCard());
     this.clockEl = this.root.querySelector('#clock')!;
     this.statusEl = this.root.querySelector('#sim-status')!;
     this.fpsEl = this.root.querySelector('#dbg-fps')!;
@@ -628,6 +628,35 @@ export class UI {
     generate.id = 'river-generate';
     panel.append(generate);
     return panel;
+  }
+
+  /**
+   * What a scenario is for, on screen once it has loaded. The text used to
+   * live only in its button's hover tooltip: gone the moment the pointer
+   * moved, and never there at all on a touch screen -- so after a load
+   * nothing said what to watch or what to try. Closable; loading the
+   * scenario again brings it back.
+   */
+  private buildScenarioCard(): HTMLElement {
+    const card = el('div', 'scenario-card');
+    card.id = 'scenario-card';
+    card.hidden = true;
+    const close = btn('×', () => { card.hidden = true; });
+    close.className = 'close';
+    close.title = 'Close';
+    close.setAttribute('aria-label', 'Close the scenario description');
+    card.append(close, el('h2', ''), el('p', ''));
+    return card;
+  }
+
+  /** Show the card for a prepared scenario, or hide it for any other world. */
+  showScenario(name: string | null): void {
+    const card = this.root.querySelector<HTMLElement>('#scenario-card')!;
+    const scenario = SCENARIOS.find((s) => s.name === name);
+    card.hidden = !scenario;
+    if (!scenario) return;
+    card.querySelector('h2')!.textContent = `Scenario: ${scenario.label}`;
+    card.querySelector('p')!.textContent = scenario.hint + '.';
   }
 
   private buildBottom(): HTMLElement {

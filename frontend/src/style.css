@@ -12,7 +12,8 @@ body {
 #viewport { position: absolute; inset: 0; display: block; }
 
 #ui-chrome { position: absolute; inset: 0; pointer-events: none; }
-#ui-chrome .topbar, #ui-chrome .panel, #ui-chrome .bottombar { pointer-events: auto; }
+#ui-chrome .topbar, #ui-chrome .panel, #ui-chrome .bottombar,
+#ui-chrome .scenario-card { pointer-events: auto; }
 
 .topbar {
   position: absolute; top: 0; left: 0; right: 0; height: 44px;
@@ -110,3 +111,21 @@ select {
 .bottombar .events { margin-left: auto; color: #d0b060; }
 .bottombar .ok { color: #7fd07f; }
 .bottombar .bad { color: #d06060; }
+
+/* what a loaded scenario is for: over the 3D view, between the side panels */
+.scenario-card {
+  position: absolute; top: 52px; left: 256px; right: 256px;
+  margin: 0 auto; max-width: 560px; max-height: 40vh; overflow-y: auto;
+  padding: 10px 34px 10px 14px; z-index: 11;
+  background: rgba(16, 22, 34, 0.9); border: 1px solid #2a3648;
+  border-left: 3px solid #7fd07f; border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+.scenario-card[hidden] { display: none; }
+.scenario-card h2 { font-size: 12px; color: #7fd07f; letter-spacing: 1px; margin-bottom: 6px; }
+.scenario-card p { color: #c9d6e3; font-size: 12.5px; line-height: 1.5; }
+.scenario-card .close {
+  position: absolute; top: 6px; right: 6px; padding: 0 7px;
+  background: transparent; border: none; color: #93a3b8; font-size: 16px; line-height: 1.4;
+}
+.scenario-card .close:hover { color: #dfe6ee; background: #263244; }
