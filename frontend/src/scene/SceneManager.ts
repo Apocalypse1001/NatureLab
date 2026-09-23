@@ -445,9 +445,11 @@ export class SceneManager {
           varying float vDepth;
           varying float vSpeed;
           varying float vLavaTemp;
+          varying vec2 vWaterXZ;
         `)
         .replace('#include <begin_vertex>', `
           #include <begin_vertex>
+          vWaterXZ = (modelMatrix * vec4(transformed, 1.0)).xz;
           vFlow = aFlow;
           vDepth = aDepth;
           vSpeed = length(aFlow);
@@ -463,6 +465,7 @@ export class SceneManager {
           varying float vDepth;
           varying float vSpeed;
           varying float vLavaTemp;
+          varying vec2 vWaterXZ;
 
           // cheap value noise, enough for surface texture at this scale
           float hash(vec2 p) {
@@ -498,13 +501,35 @@ export class SceneManager {
         `)
         .replace('#include <dithering_fragment>', `
           #include <dithering_fragment>
-          // Ripples advected along the real current: the sample point is pushed
-          // backwards along the flow, so the pattern travels downstream at the
-          // water's own speed. Still water gets a still surface, for free.
-          vec2 world = vec2(vViewPosition.x, vViewPosition.z);
-          vec2 drift = vFlow * uTime * 0.6;
-          float ripple = noise(gl_FragCoord.xy * 0.05 - drift * 4.0)
-                       + 0.5 * noise(gl_FragCoord.xy * 0.11 + drift * 2.0);
+          // Ripples advected along the real current, in WORLD metres: aFlow is
+          // the streamed velocity in m/s, so the pattern travels downstream at
+          // the water's own speed and stays on the water when the camera moves.
+          // (It used to be sampled from gl_FragCoord -- screen pixels -- so it
+          // slid across the river whenever the view turned.) Pushing one
+          // pattern along a velocity that varies from place to place tears it
+          // apart as time grows, so two copies take turns: each is advected
+          // for one period, fades out, and restarts from where it began while
+          // the other one, half a period out of step, carries the look.
+          // Still water gets a still surface, for free.
+          const float kRipple = 0.8;          // 1/m: ~1.3 m swells ...
+          const float kChop = 1.9;            // ... and ~0.5 m chop on top
+          const float flowPeriod = 2.0;       // s each copy is advected for
+          float ph0 = fract(uTime / flowPeriod);
+          float ph1 = fract(uTime / flowPeriod + 0.5);
+          float w0 = 1.0 - abs(1.0 - 2.0 * ph0);   // 0 when copy 0 restarts
+          float w1 = 1.0 - w0;                     // 0 when copy 1 restarts
+          vec2 p0 = vWaterXZ - vFlow * ph0 * flowPeriod;
+          vec2 p1 = vWaterXZ - vFlow * ph1 * flowPeriod + vec2(3.7, 9.2);
+          float r0 = noise(p0 * kRipple) + 0.5 * noise(p0 * kChop + vec2(17.3, 5.1));
+          float r1 = noise(p1 * kRipple) + 0.5 * noise(p1 * kChop + vec2(17.3, 5.1));
+          // blending two copies flattens the contrast mid-way; put it back so
+          // the foam does not pulse with the flow period
+          float ripple = 0.75 + (w0 * r0 + w1 * r1 - 0.75) / sqrt(w0 * w0 + w1 * w1);
+          // Far off, a 1 m pattern is smaller than a pixel and would shimmer:
+          // fade it to its mean once a swell spans only a few pixels.
+          vec2 rippleScreen = fwidth(vWaterXZ * kRipple);
+          ripple = mix(0.75, ripple,
+                       1.0 - smoothstep(0.15, 0.4, max(rippleScreen.x, rippleScreen.y)));
           // Foam where the water is genuinely fast, and more of it where fast
           // water is also shallow -- that is where white water actually breaks.
           float shallow = 1.0 - smoothstep(0.05, 0.6, vDepth);
@@ -553,10 +578,15 @@ export class SceneManager {
           // cold (<920C) read smooth. Built from the same value noise as the
           // water ripples above rather than screen-space derivatives, which
           // this software-rendered target cannot be relied on to support.
+          // Sampled in world metres like the ripples, so the crust stays put
+          // under a moving camera, and faded where the veins would alias.
           float crustBand = smoothstep(920.0, 980.0, vLavaTemp)
                            * (1.0 - smoothstep(980.0, 1040.0, vLavaTemp));
-          float crackNoise = noise(gl_FragCoord.xy * 0.22 + vLavaTemp * 0.015);
-          float crack = smoothstep(0.47, 0.5, crackNoise) * crustBand;
+          const float kCrack = 2.5;           // 1/m: ~0.4 m crust plates
+          float crackNoise = noise(vWaterXZ * kCrack + vLavaTemp * 0.015);
+          vec2 crackScreen = fwidth(vWaterXZ * kCrack);
+          float crack = smoothstep(0.47, 0.5, crackNoise) * crustBand
+                      * (1.0 - smoothstep(0.2, 0.5, max(crackScreen.x, crackScreen.y)));
           hotColor = mix(hotColor, vec3(0.03, 0.01, 0.01), crack);
           gl_FragColor.rgb = mix(gl_FragColor.rgb, hotColor, lavaMix);
           gl_FragColor.a = mix(gl_FragColor.a, 1.0, lavaMix);
