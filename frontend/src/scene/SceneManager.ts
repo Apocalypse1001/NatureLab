@@ -39,6 +39,9 @@ export class SceneManager {
   private composer: EffectComposer;
   private bloomPass: UnrealBloomPass;
   private skyDome: THREE.Mesh;
+  // what the water reflects: the sky dome itself, prefiltered (see the
+  // constructor), instead of the studio the rest of the scene is lit by
+  private skyEnvironment: THREE.Texture;
   private groundTexture: THREE.CanvasTexture;
   private raycaster = new THREE.Raycaster();
   private _selectionHelper: THREE.BoxHelper | null = null;
@@ -132,6 +135,16 @@ export class SceneManager {
     // horizon stop matches the fog colour exactly so the dome and the
     // fog-swallowed terrain hand off with no seam.
     this.skyDome = this.buildSkyDome();
+    // Water reflects the sky, not the studio. scene.environment above is a
+    // RoomEnvironment -- right for the glint on a car, wrong for a river: at a
+    // grazing angle smooth water mirrored one of its rectangular light panels
+    // as a sharp-edged white slab across the channel. Prefiltering a copy of
+    // the dome gives the water the haze-to-blue gradient it should mirror.
+    const skyScene = new THREE.Scene();
+    skyScene.add(this.buildSkyDome());
+    const skyPmrem = new THREE.PMREMGenerator(this.renderer);
+    this.skyEnvironment = skyPmrem.fromScene(skyScene, 0).texture;
+    skyPmrem.dispose();
     this.scene.add(this.skyDome);
     this.updateSkyDome(span);
 
@@ -457,8 +470,13 @@ export class SceneManager {
    */
   private buildWaterMaterial(): THREE.MeshStandardMaterial {
     const material = new THREE.MeshStandardMaterial({
+      // roughness 0.35, not 0.2: at 0.2 the sun's reflection on a flat reach
+      // blew out into a white slab over the whole end of the river and a
+      // white disc on the tsunami sea; a slightly rougher surface keeps a
+      // glint without erasing the water under it
       color: 0x2f7fd0, transparent: true, opacity: 0.45,
-      roughness: 0.2, metalness: 0.1, depthWrite: false, side: THREE.DoubleSide,
+      roughness: 0.35, metalness: 0.1, depthWrite: false, side: THREE.DoubleSide,
+      envMap: this.skyEnvironment,
     });
     material.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = this.waterTime;
@@ -521,10 +539,14 @@ export class SceneManager {
             vec3 dark   = vec3(0.05, 0.01, 0.01);
             vec3 cherry = vec3(0.55, 0.07, 0.02);
             vec3 orange = vec3(0.95, 0.35, 0.05);
-            vec3 white  = vec3(1.00, 0.95, 0.65);
+            // Incandescence charts put ~1100-1200 C at light orange to yellow;
+            // white heat is ~1300 C, hotter than anything this model erupts,
+            // so the top of the ramp is yellow-orange, not white. (It used to
+            // be white, and the whole lava lake read as a blank disc.)
+            vec3 yellow = vec3(1.00, 0.62, 0.18);
             vec3 c = mix(dark, cherry, smoothstep(700.0, 980.0, tC));
             c = mix(c, orange, smoothstep(980.0, 1080.0, tC));
-            c = mix(c, white, smoothstep(1080.0, 1150.0, tC));
+            c = mix(c, yellow, smoothstep(1080.0, 1150.0, tC));
             return c;
           }
         `)
@@ -566,11 +588,16 @@ export class SceneManager {
           foam *= smoothstep(0.55, 1.15, ripple);
           gl_FragColor.rgb = mix(gl_FragColor.rgb, vec3(0.92, 0.96, 1.0), foam * 0.85);
           // depth colour: shallow margins read lighter and greener than the
-          // channel, which is what makes a river's shape legible from above
+          // channel, which is what makes a river's shape legible from above;
+          // deep water is darker and more solid, so a channel reads as a
+          // channel and not as a pale ribbon laid on the grass. Shallow water
+          // keeps its extra opacity on purpose: a few centimetres over a street
+          // is what the Sewer scenario asks the reader to see.
           float deep = smoothstep(0.0, 1.6, vDepth);
-          gl_FragColor.rgb *= mix(1.28, 0.82, deep);
+          gl_FragColor.rgb *= mix(1.28, 0.62, deep);
           gl_FragColor.rgb += vec3(0.0, 0.05, 0.02) * (1.0 - deep);
-          gl_FragColor.a = clamp(gl_FragColor.a + foam * 0.5 + 0.12 * (1.0 - deep), 0.0, 1.0);
+          gl_FragColor.a = clamp(gl_FragColor.a + foam * 0.5 + 0.12 * (1.0 - deep)
+                                 + 0.25 * deep, 0.0, 1.0);
           // RainLab-1: a film is not a flood. Rain wets every cell past the
           // solver's 0.1 mm dry threshold within seconds, and the lines above
           // make shallow water MORE opaque, so 45 s of a downpour (a 0.6 mm
