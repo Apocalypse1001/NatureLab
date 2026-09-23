@@ -5,7 +5,12 @@ import { BackendClient } from './net/BackendClient';
 import { SCENARIOS, UI } from './ui/UI';
 import type { ObjectData, OutletKind, WorldData } from './world/types';
 import type { EdgeWaterMode } from './scene/EdgeSkirt';
+import { i18nKeys, i18nMissing, lang, setLang, takeCarry } from './i18n';
 import './style.css';
+
+document.documentElement.lang = lang;
+// the view a language switch left behind, put back on the first world
+let carry = takeCarry();
 
 // Backend runs on the same host/port that serves this page.
 const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
@@ -137,6 +142,11 @@ const ui = new UI(uiHost, {
   // `load` op and comes back as an ordinary `world` message -- the same path
   // the LOAD button uses. See tools/make_scenarios.py.
   loadScenario: (name) => net.send({ op: 'load', name }),
+  setLanguage: (next) => setLang(next, {
+    camera: sceneManager.camera.position.toArray(),
+    target: sceneManager.controls.target.toArray(),
+    ...ui.viewState(),
+  }),
   setSpeed: (v) => net.send({ op: 'set_speed', value: v }),
   add: (type) => editor.addObject(type),
   select: (id) => store.select(id),
@@ -213,7 +223,14 @@ function applyWorld(world: WorldData, simStatus: string, op?: string,
   // Frame the camera on a world that has just ARRIVED -- a scenario, LOAD, the
   // first connection -- but never on RESET or Settle river, which hand back
   // the same world while the user may be looking somewhere on purpose.
-  if (op === undefined || op === 'load' || op === 'request_world') {
+  if (op === 'request_world' && carry) {
+    // back from a language switch: same camera, panel and scenario card
+    sceneManager.camera.position.fromArray(carry.camera);
+    sceneManager.controls.target.fromArray(carry.target);
+    sceneManager.controls.update();
+    ui.restoreView(carry);
+    carry = null;
+  } else if (op === undefined || op === 'load' || op === 'request_world') {
     ui.showScenario(op === 'load' ? name ?? null : null);
     const frame = op === 'load' ? SCENARIOS.find((s) => s.name === name)?.frame : undefined;
     if (frame === 'map') sceneManager.frameBox(null, unobstructedWidth());
@@ -311,7 +328,7 @@ window.addEventListener('load', () => sceneManager.resize());
 
 // Debug/test API (used by TEST_REPORT automation and manual inspection).
 (globalThis as Record<string, unknown>).__NL = {
-  store, net, sceneManager, editor, ui,
+  store, net, sceneManager, editor, ui, lang, i18nKeys, i18nMissing,
 };
 
 net.connect();

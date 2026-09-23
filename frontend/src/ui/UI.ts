@@ -4,6 +4,7 @@ import { OBJECT_TYPES, type GaugeSample, type GaugeState, type ObjectData,
   type Hydrograph, type ObjectType, type OutletKind, type SectionState, type SewerLinkState,
   type SimEvent,
   type WorldData } from '../world/types';
+import { lang, t, tHtml, type Lang } from '../i18n';
 
 export interface UICallbacks {
   play(): void;
@@ -41,6 +42,8 @@ export interface UICallbacks {
   settleRiver(clear: boolean): void;
   loadScenario(name: string): void;
   getObjects(): ObjectData[];
+  // switch the interface language (reloads the page; the simulation carries on)
+  setLanguage(next: Lang): void;
 }
 
 /**
@@ -165,6 +168,8 @@ export class UI {
   private sectionHistory = new Map<string, number[]>();
   // the collapsible sections of the right panel, by heading (makeSections)
   private sections = new Map<string, HTMLDetailsElement>();
+  // the prepared scenario whose card is up, if any
+  private scenario: string | null = null;
 
   constructor(root: HTMLElement, private cb: UICallbacks) {
     this.root = root;
@@ -215,8 +220,18 @@ export class UI {
     speed.onchange = () => this.cb.setSpeed(parseFloat(speed.value));
     controls.append(speed);
     const clock = el('span', 'clock');
-    clock.innerHTML = '<span id="sim-status">IDLE</span> <span id="clock">t = 0.0s</span>';
-    bar.append(controls, clock);
+    clock.innerHTML = `<span id="sim-status" data-status="IDLE">${t('IDLE')}</span> `
+      + `<span id="clock">${t('t = {v}s', { v: '0.0' })}</span>`;
+    // EN | RU: the language in use reads as pressed
+    const langs = el('div', 'langs');
+    for (const code of ['en', 'ru'] as const) {
+      const button = el('button', '', code.toUpperCase()) as HTMLButtonElement;
+      button.classList.toggle('active', code === lang);
+      button.title = code === 'en' ? 'English' : 'Русский';
+      button.onclick = () => this.cb.setLanguage(code);
+      langs.append(button);
+    }
+    bar.append(controls, clock, langs);
     return bar;
   }
 
@@ -226,7 +241,7 @@ export class UI {
     const scenarios = el('div', 'palette');
     for (const scenario of SCENARIOS) {
       const button = btn(scenario.label, () => this.cb.loadScenario(scenario.name));
-      button.title = scenario.hint;
+      button.title = t(scenario.hint);
       scenarios.append(button);
     }
     panel.append(scenarios);
@@ -235,9 +250,9 @@ export class UI {
       + 'move objects, change the discharge.'));
     panel.append(el('h2', '', 'OBJECTS'));
     const palette = el('div', 'palette');
-    for (const t of OBJECT_TYPES) {
-      palette.append(btn(t.charAt(0) + t.slice(1).toLowerCase(),
-                         () => this.cb.add(t)));
+    for (const type of OBJECT_TYPES) {
+      palette.append(btn((type.charAt(0) + type.slice(1).toLowerCase()).replace(/_/g, ' '),
+                         () => this.cb.add(type)));
     }
     panel.append(palette);
 
@@ -251,7 +266,7 @@ export class UI {
     sewerTools.append(layPipe);
     panel.append(sewerTools);
     const pipeRow = el('div', 'slider-row');
-    pipeRow.innerHTML = '<label>Pipe diameter <output id="pipe-d-out">200</output> mm</label>';
+    pipeRow.innerHTML = tHtml('<label>Pipe diameter <output id="pipe-d-out">200</output> mm</label>');
     const pipeDiameter = el('input', '') as HTMLInputElement;
     pipeDiameter.id = 'pipe-diameter';
     pipeDiameter.type = 'range'; pipeDiameter.min = '100'; pipeDiameter.max = '1000';
@@ -294,7 +309,7 @@ export class UI {
 
     panel.append(el('h3', '', 'Water'));
     const water = el('div', 'slider-row');
-    water.innerHTML = '<label>Edge inflow level <output id="water-out">0.5</output> m</label>';
+    water.innerHTML = tHtml('<label>Edge inflow level <output id="water-out">0.5</output> m</label>');
     const slider = el('input', '') as HTMLInputElement;
     slider.id = 'water-level';
     slider.type = 'range'; slider.min = '-2'; slider.max = '8'; slider.step = '0.1';
@@ -336,7 +351,7 @@ export class UI {
     panel.append(inletRow);
 
     const flow = el('div', 'slider-row');
-    flow.innerHTML = '<label>Discharge Q <output id="river-q-out">12</output> m³/s</label>';
+    flow.innerHTML = tHtml('<label>Discharge Q <output id="river-q-out">12</output> m³/s</label>');
     const discharge = el('input', '') as HTMLInputElement;
     discharge.id = 'river-discharge';
     discharge.type = 'range'; discharge.min = '1'; discharge.max = '80';
@@ -352,7 +367,7 @@ export class UI {
     // v0.18.1: start from a flowing river instead of a dry channel
     const settleRow = el('div', 'palette');
     const settle = btn('Settle river', () => {
-      this.setSettled(false, 'settling, the river is filling (about a minute)...');
+      this.setSettled(false, t('settling, the river is filling (about a minute)...'));
       this.cb.settleRiver(false);
     });
     settle.id = 'settle-river';
@@ -360,7 +375,8 @@ export class UI {
     dry.id = 'settle-clear';
     settleRow.append(settle, dry);
     flow.append(settleRow);
-    flow.insertAdjacentHTML('beforeend', '<div class="hint" id="settle-state">Starts dry</div>');
+    flow.insertAdjacentHTML('beforeend',
+      tHtml('<div class="hint" id="settle-state">Starts dry</div>'));
 
     // v0.18.0: a flood wave on top of Q -- rises to a peak, falls back
     const hydroRow = el('label', 'check-row', 'Flood wave (hydrograph on top of Q)');
@@ -377,7 +393,7 @@ export class UI {
     const hydroSlider = (id: string, label: string, unit: string, key: keyof Hydrograph,
                          min: number, max: number, step: number) => {
       flow.insertAdjacentHTML('beforeend',
-        `<label>${label} <output id="${id}-out">${this.hydro[key]}</output> ${unit}</label>`);
+        `<label>${t(label)} <output id="${id}-out">${this.hydro[key]}</output> ${t(unit)}</label>`);
       const input = el('input', '') as HTMLInputElement;
       input.id = id;
       input.type = 'range'; input.min = String(min); input.max = String(max);
@@ -395,11 +411,11 @@ export class UI {
     hydroSlider('hydro-rise', 'Rises over', 's', 'rise_s', 10, 900, 10);
     hydroSlider('hydro-fall', 'Falls over', 's', 'fall_s', 10, 1800, 10);
     flow.insertAdjacentHTML('beforeend',
-      '<svg id="hydro-chart" viewBox="0 0 240 70" role="img" aria-label="Inlet discharge over time">'
+      `<svg id="hydro-chart" viewBox="0 0 240 70" role="img" aria-label="${t('Inlet discharge over time')}">`
       + '<polyline points="" /><line id="hydro-now" x1="0" y1="0" x2="0" y2="70" /></svg>'
       + '<div class="hint" id="hydro-now-q"></div>');
     flow.insertAdjacentHTML('beforeend',
-      '<label>Inlet width <output id="river-inlet-w-out">12</output> m</label>');
+      tHtml('<label>Inlet width <output id="river-inlet-w-out">12</output> m</label>'));
     const inletWidth = el('input', '') as HTMLInputElement;
     inletWidth.id = 'river-inlet-width';
     inletWidth.type = 'range'; inletWidth.min = '4'; inletWidth.max = '60';
@@ -410,7 +426,7 @@ export class UI {
     };
     flow.append(inletWidth);
     flow.insertAdjacentHTML('beforeend',
-      '<label>Outlet width <output id="river-outlet-w-out">0</output> m (0 = whole edge)</label>');
+      tHtml('<label>Outlet width <output id="river-outlet-w-out">0</output> m (0 = whole edge)</label>'));
     const outletWidth = el('input', '') as HTMLInputElement;
     outletWidth.id = 'river-outlet-width';
     outletWidth.type = 'range'; outletWidth.min = '0'; outletWidth.max = '80';
@@ -424,11 +440,11 @@ export class UI {
     // a sea it would drain, so the world says which it is. "Sea or pool" is the
     // free overfall every world had before; a river on it draws itself down
     // toward the brink as if it ran off a waterfall.
-    flow.insertAdjacentHTML('beforeend', '<label>Beyond the downstream edge</label>');
+    flow.insertAdjacentHTML('beforeend', tHtml('<label>Beyond the downstream edge</label>'));
     const outletKind = el('select', '') as HTMLSelectElement;
     outletKind.id = 'river-outlet-kind';
-    outletKind.innerHTML = '<option value="overfall">sea or pool (free overfall)</option>'
-      + '<option value="river">the river runs on</option>';
+    outletKind.innerHTML = tHtml('<option value="overfall">sea or pool (free overfall)</option>'
+      + '<option value="river">the river runs on</option>');
     outletKind.onchange = () =>
       this.cb.setRiverOutlet({ kind: outletKind.value as OutletKind });
     flow.append(outletKind);
@@ -474,7 +490,7 @@ export class UI {
     const rainPresets = el('div', 'palette');
     const rain = el('div', 'slider-row');
     rain.innerHTML =
-      '<label>Intensity <output id="rain-out">0</output> mm/h (= L/m² per hour)</label>';
+      tHtml('<label>Intensity <output id="rain-out">0</output> mm/h (= L/m² per hour)</label>');
     const rainSlider = el('input', '') as HTMLInputElement;
     rainSlider.id = 'rain-intensity';
     rainSlider.type = 'range'; rainSlider.min = '0'; rainSlider.max = '150';
@@ -485,21 +501,21 @@ export class UI {
     };
     rainSlider.oninput = sendRain;
     const off = btn('Off', () => { rainSlider.value = '0'; sendRain(); });
-    off.title = 'No rain';
+    off.title = t('No rain');
     rainPresets.append(off);
     for (const preset of RAIN_PRESETS) {
       const button = btn(preset.label, () => {
         rainSlider.value = String(preset.mmPerHour);
         sendRain();
       });
-      button.title = `${preset.mmPerHour} mm/h`;
+      button.title = t('{v} mm/h', { v: preset.mmPerHour });
       rainPresets.append(button);
     }
     panel.append(rainPresets);
     rain.append(rainSlider);
     const applied = el('div', 'hint');
     applied.id = 'rain-applied';
-    applied.textContent = 'applied: none';
+    applied.textContent = t('applied: none');
     rain.append(applied);
     panel.append(rain);
     panel.append(el('p', 'hint',
@@ -517,7 +533,7 @@ export class UI {
     panel.append(tracerToggle);
     const tracerCount = el('div', 'slider-row');
     tracerCount.innerHTML =
-      '<label>Visible tracers <output id="tracer-count-out">36000</output></label>';
+      tHtml('<label>Visible tracers <output id="tracer-count-out">36000</output></label>');
     const count = el('input', '') as HTMLInputElement;
     // Ceiling follows the backend's FLOW_TRACER_COUNT: a slider that maxed out
     // at the old 8 000 would have silently hidden three quarters of the tracers
@@ -541,7 +557,7 @@ export class UI {
     }
     panel.append(tools);
     const brush = el('div', 'slider-row');
-    brush.innerHTML = '<label>Brush size <output id="brush-size-out">6</output> m</label>';
+    brush.innerHTML = tHtml('<label>Brush size <output id="brush-size-out">6</output> m</label>');
     const size = el('input', '') as HTMLInputElement;
     size.type = 'range'; size.min = '1'; size.max = '15'; size.step = '0.5'; size.value = '6';
     const strength = el('input', '') as HTMLInputElement;
@@ -549,7 +565,7 @@ export class UI {
     strength.step = '0.05'; strength.value = '0.4';
     brush.append(size);
     brush.insertAdjacentHTML('beforeend',
-      '<label>Brush strength <output id="brush-str-out">0.4</output> m</label>');
+      tHtml('<label>Brush strength <output id="brush-str-out">0.4</output> m</label>'));
     brush.append(strength);
     size.oninput = () => {
       this.root.querySelector('#brush-size-out')!.textContent = size.value;
@@ -579,21 +595,21 @@ export class UI {
     panel.append(el('h3', '', 'River valley'));
     const river = el('div', 'slider-row');
     river.innerHTML =
-      '<label>Slope <output id="river-slope-out">0.20</output> %</label>';
+      tHtml('<label>Slope <output id="river-slope-out">0.20</output> %</label>');
     const slope = el('input', '') as HTMLInputElement;
     slope.id = 'river-slope';
     slope.type = 'range'; slope.min = '0.05'; slope.max = '1.0';
     slope.step = '0.05'; slope.value = '0.20';
     river.append(slope);
     river.insertAdjacentHTML('beforeend',
-      '<label>Channel width <output id="river-width-out">12</output> m</label>');
+      tHtml('<label>Channel width <output id="river-width-out">12</output> m</label>'));
     const width = el('input', '') as HTMLInputElement;
     width.id = 'river-width';
     width.type = 'range'; width.min = '4'; width.max = '40';
     width.step = '1'; width.value = '12';
     river.append(width);
     river.insertAdjacentHTML('beforeend',
-      '<label>Incision <output id="river-depth-out">2.0</output> m</label>');
+      tHtml('<label>Incision <output id="river-depth-out">2.0</output> m</label>'));
     const incision = el('input', '') as HTMLInputElement;
     incision.id = 'river-incision';
     incision.type = 'range'; incision.min = '0.5'; incision.max = '6.0';
@@ -603,14 +619,14 @@ export class UI {
     // the channel to where it crosses the map edges (terrain_gen.river_valley);
     // the prepared scenarios keep their straight river, their towns line it.
     river.insertAdjacentHTML('beforeend',
-      '<label>Meander swing <output id="river-meander-out">20</output> m (0 = straight)</label>');
+      tHtml('<label>Meander swing <output id="river-meander-out">20</output> m (0 = straight)</label>'));
     const meander = el('input', '') as HTMLInputElement;
     meander.id = 'river-meander';
     meander.type = 'range'; meander.min = '0'; meander.max = '40';
     meander.step = '2'; meander.value = '20';
     river.append(meander);
     river.insertAdjacentHTML('beforeend',
-      '<label>Meander length <output id="river-wave-out">120</output> m</label>');
+      tHtml('<label>Meander length <output id="river-wave-out">120</output> m</label>'));
     const wave = el('input', '') as HTMLInputElement;
     wave.id = 'river-meander-length';
     wave.type = 'range'; wave.min = '60'; wave.max = '300';
@@ -662,12 +678,15 @@ export class UI {
     let section: HTMLDetailsElement | null = null;
     for (const node of [...panel.children]) {
       if (node.tagName === 'H3') {
-        const title = node.textContent ?? '';
+        // keyed by the English heading (el() keeps it in data-key), so the
+        // scenario table and the default below hold in any language
+        const title = (node as HTMLElement).dataset.key ?? node.textContent ?? '';
         section = document.createElement('details');
         section.className = 'section';
+        section.dataset.key = title;
         section.open = title === 'Water';
         const summary = document.createElement('summary');
-        summary.textContent = title;
+        summary.textContent = node.textContent;
         section.append(summary);
         node.replaceWith(section);
         this.sections.set(title, section);
@@ -692,8 +711,8 @@ export class UI {
     card.hidden = true;
     const close = btn('×', () => { card.hidden = true; });
     close.className = 'close';
-    close.title = 'Close';
-    close.setAttribute('aria-label', 'Close the scenario description');
+    close.title = t('Close');
+    close.setAttribute('aria-label', t('Close the scenario description'));
     card.append(close, el('h2', ''), el('p', ''));
     return card;
   }
@@ -716,65 +735,81 @@ export class UI {
     const card = this.root.querySelector<HTMLElement>('#scenario-card')!;
     const scenario = SCENARIOS.find((s) => s.name === name);
     card.hidden = !scenario;
+    this.scenario = null;
     if (!scenario) return;
     // a new scenario starts from its own view of the panel: Water plus what
     // it is about, so the previous scenario's sections do not pile up open
     const wanted = new Set(['Water', ...(scenario.sections ?? [])]);
     for (const [title, section] of this.sections) section.open = wanted.has(title);
-    card.querySelector('h2')!.textContent = `Scenario: ${scenario.label}`;
-    card.querySelector('p')!.textContent = scenario.hint + '.';
+    card.querySelector('h2')!.textContent = t('Scenario: {name}', { name: t(scenario.label) });
+    card.querySelector('p')!.textContent = t(scenario.hint) + '.';
+    this.scenario = scenario.name;
+  }
+
+  /** What a language switch carries over its reload (see i18n.Carry). */
+  viewState(): { openSections: string[]; scenario: string | null } {
+    const card = this.root.querySelector<HTMLElement>('#scenario-card')!;
+    return {
+      openSections: [...this.sections].filter(([, s]) => s.open).map(([key]) => key),
+      scenario: card.hidden ? null : this.scenario,
+    };
+  }
+
+  /** Put back the panel and the scenario card a language switch left. */
+  restoreView(view: { openSections: string[]; scenario: string | null }): void {
+    this.showScenario(view.scenario);
+    const open = new Set(view.openSections);
+    for (const [key, section] of this.sections) section.open = open.has(key);
   }
 
   private buildBottom(): HTMLElement {
     const bar = el('div', 'bottombar');
     const left = el('div', '');
-    left.innerHTML =
-      'FPS <span id="dbg-fps">–</span> | ' +
-      'Sim FPS <span id="dbg-simfps">–</span> | ' +
-      'Objects <span id="dbg-objects">0</span> | ' +
-      'Tracers source <span id="dbg-particles">0</span> | ' +
-      'Wet cells <span id="dbg-fluid">0</span> | ' +
-      // The balance is the instrument that says whether the boundaries are
-      // doing what they claim: in / out as measured discharge, and the running
-      // totals. A river whose inlet reports 12 m³/s while nothing arrives
-      // downstream is a bug you can only see here.
-      'Q in/out <span id="dbg-flux">– / –</span> | ' +
-      // Substeps and the CFL flag, because the failure they describe is silent:
-      // when the solver cannot resolve the wave speed in FLUID_MAX_SUBSTEPS it
-      // runs anyway, at a timestep it knows is too long. The river gets worse
-      // and no test falls over. Shown as a number so the cost of a steeper
-      // slope or a bigger discharge is visible while it is being chosen.
-      'Substeps <span id="dbg-substeps">1</span> | ' +
-      'WS <span id="dbg-ws">offline</span> | ' +
-      'Warp <span id="dbg-warp">–</span> | ' +
-      'CUDA <span id="dbg-cuda">–</span> | ' +
-      'GPU <span id="dbg-gpu">–</span>';
+    // The balance (Q in/out) is the instrument that says whether the
+    // boundaries are doing what they claim: in / out as measured discharge,
+    // and the running totals. A river whose inlet reports 12 m³/s while
+    // nothing arrives downstream is a bug you can only see here. Substeps and
+    // the CFL flag, because the failure they describe is silent: when the
+    // solver cannot resolve the wave speed in FLUID_MAX_SUBSTEPS it runs
+    // anyway, at a timestep it knows is too long. Shown as a number so the
+    // cost of a steeper slope or a bigger discharge is visible while chosen.
+    const items: [string, string, string][] = [
+      ['FPS', 'dbg-fps', '–'], ['Sim FPS', 'dbg-simfps', '–'], ['Objects', 'dbg-objects', '0'],
+      ['Tracers source', 'dbg-particles', '0'], ['Wet cells', 'dbg-fluid', '0'],
+      ['Q in/out', 'dbg-flux', '– / –'], ['Substeps', 'dbg-substeps', '1'],
+      ['WS', 'dbg-ws', t('offline')], ['Warp', 'dbg-warp', '–'], ['CUDA', 'dbg-cuda', '–'],
+      ['GPU', 'dbg-gpu', '–'],
+    ];
+    left.innerHTML = items.map(([label, id, value]) =>
+      `${t(label)} <span id="${id}">${value}</span>`).join(' | ');
     const events = el('div', 'events');
     events.id = 'event-log';
-    events.textContent = 'events: –';
+    events.textContent = t('events: –');
     bar.append(left, events);
     return bar;
   }
 
   // ------------------------------------------------------------------ updates
   setConnection(status: string): void {
-    this.wsEl.textContent = status;
+    this.wsEl.textContent = t(status);
     this.wsEl.className = status === 'connected' ? 'ok' : 'bad';
   }
 
   setEngine(engine: { warp_available: boolean; cuda: boolean; device: string;
                       gpu_name: string; version?: string }): void {
     if (engine.version) this.brandEl.textContent = `NatureLab ${engine.version}`;
-    this.warpEl.textContent = engine.warp_available ? 'ready' : 'missing';
-    this.cudaEl.textContent = engine.cuda ? 'yes' : 'no (CPU mode)';
+    this.warpEl.textContent = t(engine.warp_available ? 'ready' : 'missing');
+    this.cudaEl.textContent = t(engine.cuda ? 'yes' : 'no (CPU mode)');
     this.gpuEl.textContent = engine.gpu_name;
   }
 
   setClock(time: number, status: string): void {
-    this.clockEl.textContent = `t = ${time.toFixed(1)}s`;
+    this.clockEl.textContent = t('t = {v}s', { v: time.toFixed(1) });
     this.simTime = time;
     this.drawHydrograph();
-    this.statusEl.textContent = status;
+    // the raw status stays readable for scripts; what shows is translated
+    this.statusEl.dataset.status = status;
+    this.statusEl.textContent = t(status);
     this.statusEl.className = status === 'RUNNING' ? 'ok' : '';
   }
 
@@ -807,14 +842,14 @@ export class UI {
     const x = Math.min(240, this.simTime / span * 240).toFixed(1);
     now.setAttribute('x1', x);
     now.setAttribute('x2', x);
-    if (text) text.textContent = `Inlet now ${this.hydroAt(this.simTime).toFixed(1)} m³/s`
-      + (this.hydro.enabled ? '' : ' (no flood wave)');
+    if (text) text.textContent = t('Inlet now {q} m³/s', { q: this.hydroAt(this.simTime).toFixed(1) })
+      + (this.hydro.enabled ? '' : ' ' + t('(no flood wave)'));
   }
 
   /** v0.18.1: whether the loaded world starts with its river flowing. */
   setSettled(settled: boolean, note = ''): void {
     const text = this.root.querySelector('#settle-state');
-    if (text) text.textContent = (settled ? 'Starts with the river flowing' : 'Starts dry')
+    if (text) text.textContent = t(settled ? 'Starts with the river flowing' : 'Starts dry')
       + (note ? ` -- ${note}` : '');
   }
 
@@ -915,9 +950,9 @@ export class UI {
       const applied = this.root.querySelector('#rain-applied');
       if (applied) {
         applied.textContent = state.fluid.rain_mm_h > 0
-          ? `applied: ${state.fluid.rain_mm_h.toFixed(1)} mm/h ≈ `
-            + `${(state.fluid.rain_m3s ?? 0).toFixed(3)} m³/s over the map`
-          : 'applied: none';
+          ? t('applied: {mm} mm/h ≈ {q} m³/s over the map', {
+            mm: state.fluid.rain_mm_h.toFixed(1), q: (state.fluid.rain_m3s ?? 0).toFixed(3) })
+          : t('applied: none');
       }
     }
     if (state.fluid?.edge_inflow !== undefined) {
@@ -935,33 +970,35 @@ export class UI {
     this.particlesEl.textContent = state.particles.toLocaleString();
     const wet = state.fluid?.wet_cells ?? 0;
     const volume = state.fluid?.volume_m3 ?? 0;
-    this.fluidEl.textContent = `${wet.toLocaleString()} / ${volume.toFixed(1)} m³`;
+    this.fluidEl.textContent = `${wet.toLocaleString()} / ${t('{v} m³', { v: volume.toFixed(1) })}`;
     const qIn = state.fluid?.inlet_discharge_m3s;
     const added = state.fluid?.added_m3 ?? 0;
     const removed = state.fluid?.removed_m3 ?? 0;
     this.fluxEl.textContent = state.fluid?.inlet_enabled
-      ? `${(qIn ?? 0).toFixed(1)} m³/s | ${added.toFixed(0)} in / ${removed.toFixed(0)} out m³`
-      : `${added.toFixed(0)} in / ${removed.toFixed(0)} out m³`;
+      ? t('{q} m³/s | {a} in / {r} out m³', { q: (qIn ?? 0).toFixed(1), a: added.toFixed(0),
+                                                r: removed.toFixed(0) })
+      : t('{a} in / {r} out m³', { a: added.toFixed(0), r: removed.toFixed(0) });
     if (state.fluid?.inlet_enabled !== undefined) {
       this.setRiverInletEnabled(state.fluid.inlet_enabled);
     }
     const limited = state.fluid?.cfl_limited === true;
     this.substepEl.textContent = limited
-      ? `${state.fluid?.substeps ?? 0} CFL-LIMITED`
+      ? `${state.fluid?.substeps ?? 0} ${t('CFL-LIMITED')}`
       : String(state.fluid?.substeps ?? 0);
     this.substepEl.className = limited ? 'bad' : '';
   }
 
   logEvent(e: SimEvent): void {
-    this.eventEl.textContent =
-      `events: ${e.time.toFixed(2)}s ${e.object_id ?? ''} ${e.type} (${e.cause})`;
+    this.eventEl.textContent = t('events: {time}s {id} {type} ({cause})', {
+      time: e.time.toFixed(2), id: e.object_id ?? '', type: t(e.type), cause: t(e.cause) });
   }
 
   refreshObjectList(objects: ObjectData[], selected: string | null): void {
     this.objectList.innerHTML = '';
     for (const obj of objects) {
       const row = el('div', `obj-row${obj.id === selected ? ' selected' : ''}`);
-      const label = el('span', '', obj.id);
+      const label = el('span', '');
+      label.textContent = obj.id;          // an id, never translated
       const del = btn('×', () => {
         this.cb.select(obj.id);
         this.cb.removeSelected();
@@ -1071,7 +1108,7 @@ export class UI {
     );
     for (const [label, key, value, apply] of fields) {
       const row = el('div', 'prop-row');
-      row.innerHTML = `<label>${label}</label>`;
+      row.innerHTML = `<label>${t(label)}</label>`;
       const input = el('input', '') as HTMLInputElement;
       input.type = 'number'; input.step = '0.1'; input.value = String(round2(value));
       input.dataset.key = key;
@@ -1085,15 +1122,15 @@ export class UI {
     if (obj.type === 'SECTION') {
       const readout = el('div', 'gauge-readout');
       readout.id = 'section-readout';
-      readout.innerHTML =
+      readout.innerHTML = tHtml(
         '<h3>Gauging line</h3>' +
         '<div>Discharge <strong id="section-q">--</strong></div>' +
         '<div>Water width <strong id="section-width">--</strong></div>' +
         '<div>Mean depth <strong id="section-depth">--</strong></div>' +
         '<div>Mean speed <strong id="section-speed">--</strong></div>' +
         '<div>Froude (section) <strong id="section-froude">--</strong></div>' +
-        '<div>Water level <strong id="section-level">--</strong></div>' +
-        '<svg id="section-chart" viewBox="0 0 240 70" role="img" aria-label="Discharge history">' +
+        '<div>Water level <strong id="section-level">--</strong></div>') +
+        `<svg id="section-chart" viewBox="0 0 240 70" role="img" aria-label="${t('Discharge history')}">` +
         '<polyline points="" /></svg>';
       host.append(readout);
       this.renderSectionReadout();
@@ -1101,20 +1138,20 @@ export class UI {
     if (obj.type === 'GAUGE') {
       const readout = el('div', 'gauge-readout');
       readout.id = 'gauge-readout';
-      readout.innerHTML =
+      readout.innerHTML = tHtml(
         '<h3>Live measurements</h3>' +
         '<div>Depth <strong id="gauge-depth">dry</strong></div>' +
         '<div>Surface <strong id="gauge-surface">dry</strong></div>' +
         '<div>Speed <strong id="gauge-speed">0.000 m/s</strong></div>' +
-        '<div>Wave arrival <strong id="gauge-arrival">not arrived</strong></div>' +
-        '<svg id="gauge-chart" viewBox="0 0 240 70" role="img" aria-label="Gauge depth history">' +
+        '<div>Wave arrival <strong id="gauge-arrival">not arrived</strong></div>') +
+        `<svg id="gauge-chart" viewBox="0 0 240 70" role="img" aria-label="${t('Gauge depth history')}">` +
         '<polyline points="" /></svg>';
       host.append(readout);
     }
     if (sewerPart) {
       const readout = el('div', 'gauge-readout');
       readout.id = 'sewer-readout';
-      readout.innerHTML = '<h3>Storm sewer</h3><div id="sewer-lines"></div>';
+      readout.innerHTML = tHtml('<h3>Storm sewer</h3><div id="sewer-lines"></div>');
       host.append(readout);
       if (obj.type === 'PIPE') {
         const more = btn('Continue the pipe', () => this.cb.extendPipe(obj.id));
@@ -1138,7 +1175,7 @@ export class UI {
     const mine = this.sewerLinks.filter(
       (l) => l.pipe_id === id || l.from_id === id || l.to_id === id);
     if (!mine.length) {
-      host.innerHTML = '<div>Not joined to a pipe yet.</div>';
+      host.innerHTML = `<div>${t('Not joined to a pipe yet.')}</div>`;
       return;
     }
     const why: Record<string, string> = {
@@ -1154,13 +1191,14 @@ export class UI {
       const load = l.capacity_m3s > 0 ? Math.round(100 * l.flow_m3s / l.capacity_m3s) : 0;
       // a manhole shows every pipe that meets it, so each line says which
       const name = mine.length > 1 ? `<div><em>${l.pipe_id}</em></div>` : '';
-      return `${name}<div>Flow <strong>${ls(l.flow_m3s)} L/s</strong> of `
-        + `${ls(l.capacity_m3s)} L/s (${load}%)</div>`
-        + `<div>Fall ${l.fall_m.toFixed(2)} m over ${l.length_m.toFixed(0)} m</div>`
+      return `${name}<div>${t('Flow <strong>{q} L/s</strong> of {cap} L/s ({load}%)', {
+        q: ls(l.flow_m3s), cap: ls(l.capacity_m3s), load })}</div>`
+        + `<div>${t('Fall {fall} m over {len} m', {
+          fall: l.fall_m.toFixed(2), len: l.length_m.toFixed(0) })}</div>`
         + (l.status === 'uphill' && l.suggested_to_depth_m > 0
-          ? `<div>Dig ${l.to_id} to ${l.suggested_to_depth_m.toFixed(2)} m deep `
-            + 'for a 0.5% grade</div>' : '')
-        + (why[l.status] ? `<div class="bad">${why[l.status]}`
+          ? `<div>${t('Dig {id} to {d} m deep for a 0.5% grade', {
+            id: l.to_id, d: l.suggested_to_depth_m.toFixed(2) })}</div>` : '')
+        + (why[l.status] ? `<div class="bad">${t(why[l.status])}`
           + (l.blocked_by ? ` (${l.blocked_by}).` : '') + '</div>' : '');
     }).join('');
   }
@@ -1186,13 +1224,14 @@ export class UI {
       if (node) node.textContent = text;
     };
     const wet = !!r && r.wetted_width_m > 0;
-    set('#section-q', r ? `${r.flow_m3s.toFixed(2)} m³/s` : '--');
-    set('#section-width', wet ? `${r!.wetted_width_m.toFixed(1)} m` : 'dry');
-    set('#section-depth', wet ? `${r!.mean_depth_m.toFixed(2)} m` : '--');
-    set('#section-speed', wet ? `${r!.mean_velocity_m_s.toFixed(2)} m/s` : '--');
-    set('#section-froude', wet ? r!.froude_section.toFixed(2)
-      + (r!.froude_section < 1 ? ' (calm)' : ' (shooting)') : '--');
-    set('#section-level', wet && r!.level_m != null ? `${r!.level_m.toFixed(2)} m` : '--');
+    set('#section-q', r ? t('{v} m³/s', { v: r.flow_m3s.toFixed(2) }) : '--');
+    set('#section-width', wet ? t('{v} m', { v: r!.wetted_width_m.toFixed(1) }) : t('dry'));
+    set('#section-depth', wet ? t('{v} m', { v: r!.mean_depth_m.toFixed(2) }) : '--');
+    set('#section-speed', wet ? t('{v} m/s', { v: r!.mean_velocity_m_s.toFixed(2) }) : '--');
+    set('#section-froude', wet ? r!.froude_section.toFixed(2) + ' '
+      + t(r!.froude_section < 1 ? '(calm)' : '(shooting)') : '--');
+    set('#section-level', wet && r!.level_m != null
+      ? t('{v} m', { v: r!.level_m.toFixed(2) }) : '--');
     const line = this.root.querySelector<SVGPolylineElement>('#section-chart polyline');
     const history = (this.sectionHistory.get(id) ?? []).slice(-240);
     if (!line || history.length < 2) return;
@@ -1208,13 +1247,13 @@ export class UI {
     if (!state || state.id !== this.selectedId || !this.root.querySelector('#gauge-readout')) return;
     const latest = state.latest;
     this.root.querySelector('#gauge-depth')!.textContent = latest
-      ? `${latest.water_depth_m.toFixed(3)} m` : 'dry';
+      ? t('{v} m', { v: latest.water_depth_m.toFixed(3) }) : t('dry');
     this.root.querySelector('#gauge-surface')!.textContent = latest?.surface_elevation_m != null
-      ? `${latest.surface_elevation_m.toFixed(3)} m` : 'dry';
-    this.root.querySelector('#gauge-speed')!.textContent = latest
-      ? `${latest.speed_m_s.toFixed(3)} m/s` : '0.000 m/s';
+      ? t('{v} m', { v: latest.surface_elevation_m.toFixed(3) }) : t('dry');
+    this.root.querySelector('#gauge-speed')!.textContent =
+      t('{v} m/s', { v: latest ? latest.speed_m_s.toFixed(3) : '0.000' });
     this.root.querySelector('#gauge-arrival')!.textContent = state.arrival_time_s != null
-      ? `${state.arrival_time_s.toFixed(2)} s` : 'not arrived';
+      ? t('{v} s', { v: state.arrival_time_s.toFixed(2) }) : t('not arrived');
     const points = this.root.querySelector<SVGPolylineElement>('#gauge-chart polyline');
     if (!points || history.length < 2) return;
     const visible = history.slice(-240);
@@ -1267,10 +1306,16 @@ export class UI {
 }
 
 // ---------------------------------------------------------------------- utils
+// Every label and hint passes through here, so it is where the interface
+// language is applied (i18n.t: the English text is the key). A heading keeps
+// its English text in data-key, which the panel sections are keyed on.
 function el(tag: string, cls: string, text = ''): HTMLElement {
   const node = document.createElement(tag);
   if (cls) node.className = cls;
-  if (text) node.textContent = text;
+  if (text) {
+    node.textContent = t(text);
+    if (tag === 'h3') node.dataset.key = text;
+  }
   return node;
 }
 

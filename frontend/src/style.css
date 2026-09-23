@@ -27,6 +27,9 @@ body {
 .controls { display: flex; gap: 6px; align-items: center; }
 
 .clock { margin-left: auto; font-variant-numeric: tabular-nums; }
+/* EN | RU */
+.langs { display: flex; gap: 2px; }
+.langs button { padding: 3px 7px; font-size: 11px; }
 .clock #sim-status { font-weight: 700; }
 .clock #sim-status.ok { color: #7fd07f; }
 

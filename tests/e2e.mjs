@@ -501,6 +501,40 @@ try {
     `flood chart did not draw a wave: ${JSON.stringify(hydro)}`);
   report('Flood wave: checkbox on, chart draws the hydrograph');
 
+  // Interface language: RU reloads the page into Russian, keeps the camera,
+  // and every string it showed has a Russian entry (the only misses allowed
+  // are names that stay as they are). Then back to English for the rest.
+  const cameraBefore = await page.evaluate(() => {
+    const s = globalThis.__NL.sceneManager;
+    s.camera.position.set(20, 15, 40);
+    s.controls.target.set(30, 0, 0);
+    s.controls.update();
+    return s.camera.position.toArray();
+  });
+  const clickLang = (code) => page.evaluate((c) => [...document.querySelectorAll('.langs button')]
+    .find((b) => b.textContent === c).click(), code);
+  await Promise.all([page.waitForNavigation(), clickLang('RU')]);
+  await waitFor(() => page.evaluate(() => globalThis.__NL?.lang === 'ru'
+    && document.querySelector('#dbg-ws')?.className === 'ok'));
+  await sleep(1500);
+  const ru = await page.evaluate(() => ({
+    play: [...document.querySelectorAll('.topbar button')].map((b) => b.textContent),
+    camera: globalThis.__NL.sceneManager.camera.position.toArray(),
+    missing: [...globalThis.__NL.i18nMissing],
+    htmlLang: document.documentElement.lang,
+  }));
+  const allowedMisses = new Set(['NatureLab', '0.25x', '0.5x', '1x', '2x', '4x', 'EN', 'RU',
+    'FPS', 'WS', 'Warp', 'CUDA', 'GPU']);
+  assert(ru.play.includes('ПУСК') && ru.htmlLang === 'ru', `not in Russian: ${JSON.stringify(ru)}`);
+  assert(ru.camera.every((v, i) => Math.abs(v - cameraBefore[i]) < 0.01),
+    `camera moved on the switch: ${ru.camera} vs ${cameraBefore}`);
+  const unexpected = ru.missing.filter((k) => !allowedMisses.has(k));
+  assert(unexpected.length === 0, `no Russian for: ${JSON.stringify(unexpected)}`);
+  await Promise.all([page.waitForNavigation(), clickLang('EN')]);
+  await waitFor(() => page.evaluate(() => globalThis.__NL?.lang === 'en'
+    && document.querySelector('#dbg-ws')?.className === 'ok'));
+  report('Language: RU translates every shown string, keeps the camera, and back to EN');
+
   assert(errors.length === 0, errors.join('\n'));
   report('no browser errors');
   // read the version off the running backend rather than hard-coding it, so
