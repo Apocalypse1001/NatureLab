@@ -62,14 +62,16 @@ export interface UICallbacks {
 export type ScenarioFrame = { x0: number; x1: number; z0: number; z1: number } | 'map';
 
 export const SCENARIOS: { name: string; label: string; hint: string;
-                          frame?: ScenarioFrame }[] = [
-  { name: 'scenario_river', label: 'River',
+                          frame?: ScenarioFrame;
+                          // right-panel sections the scenario is about, opened on load
+                          sections?: string[] }[] = [
+  { name: 'scenario_river', label: 'River', sections: ['River'],
     hint: 'A town on the bank of a running river, already flowing when it opens. '
         + 'At the discharge it ships with, the channel runs about 0.7 m deep and '
         + 'the town stays dry. Take Q to the top of the slider and the river '
         + 'leaves its bed: water reaches the street in about a minute and a half '
         + 'and stands about 8 cm deep there after three minutes' },
-  { name: 'scenario_sewer', label: 'Sewer',
+  { name: 'scenario_sewer', label: 'Sewer', sections: ['Rain'],
     hint: 'The river town in a downpour, with a storm sewer: three street inlets '
         + 'on 150 mm pipes down to the river. Water runs to each grate, goes down '
         + 'it and pours out of the outfall into the river. Click a pipe to see its '
@@ -79,7 +81,7 @@ export const SCENARIOS: { name: string; label: string; hint: string;
         + '11 l/s it can, and a pond starts to grow over its grate -- a centimetre '
         + 'by seven minutes, a hand deep by ten (a faster speed gets there '
         + 'sooner); lay a wider one with "Lay pipe"' },
-  { name: 'scenario_bridge', label: 'Bridge',
+  { name: 'scenario_bridge', label: 'Bridge', sections: ['River'],
     hint: 'The river town with a bridge on five piers, and a gauging line above and '
         + 'below it; the river is already flowing. Click a line: the same '
         + 'discharge passes both, but the level drops faster across the bridge -- the '
@@ -92,7 +94,7 @@ export const SCENARIOS: { name: string; label: string; hint: string;
   // The dam is terrain, not an object: its crest sits 70 m from the west edge
   // (terrain_gen.DAM_DEFAULTS), x = -30, so the box is the town plus the dam
   // and a stretch of the reservoir behind it.
-  { name: 'scenario_dam', label: 'Dam', frame: { x0: -60, x1: 65, z0: -20, z1: 60 },
+  { name: 'scenario_dam', label: 'Dam', sections: ['River'], frame: { x0: -60, x1: 65, z0: -20, z1: 60 },
     hint: 'The same town below a dam. At the discharge it ships with, the '
         + 'spillway carries the river and the dam holds. Push Q past about 60 '
         + 'and the crest goes under in roughly six minutes of simulated time '
@@ -161,6 +163,8 @@ export class UI {
   // v0.18.0 gauging lines: the latest reading and a discharge history per line
   private sectionLatest = new Map<string, SectionState['latest']>();
   private sectionHistory = new Map<string, number[]>();
+  // the collapsible sections of the right panel, by heading (makeSections)
+  private sections = new Map<string, HTMLDetailsElement>();
 
   constructor(root: HTMLElement, private cb: UICallbacks) {
     this.root = root;
@@ -320,6 +324,7 @@ export class UI {
     inlet.type = 'checkbox';
     inlet.onchange = () => this.cb.setRiverInlet({ enabled: inlet.checked });
     inletRow.prepend(inlet);
+    panel.append(el('h3', '', 'River'));
     panel.append(inletRow);
 
     const flow = el('div', 'slider-row');
@@ -627,7 +632,42 @@ export class UI {
     }));
     generate.id = 'river-generate';
     panel.append(generate);
+    // the west-edge switch is about the map's edge, like the two controls
+    // above the River heading, not about the river
+    outflowRow.after(edgeRow);
+    this.makeSections(panel);
     return panel;
+  }
+
+  /**
+   * Fold every h3 of a panel, and what follows it up to the next heading, into
+   * a <details> section that can be collapsed. The right panel had grown into
+   * one scroll of some forty controls in a fixed order, so the Rain slider of
+   * the Sewer scenario sat below the fold under a flood-wave block that scene
+   * never uses. Only Water starts open; loading a scenario opens Water and
+   * what it is about (SCENARIOS[].sections, via showScenario) and folds the
+   * rest. Controls keep their ids, and a
+   * collapsed control still takes a programmatic click.
+   */
+  private makeSections(panel: HTMLElement): void {
+    let section: HTMLDetailsElement | null = null;
+    for (const node of [...panel.children]) {
+      if (node.tagName === 'H3') {
+        const title = node.textContent ?? '';
+        section = document.createElement('details');
+        section.className = 'section';
+        section.open = title === 'Water';
+        const summary = document.createElement('summary');
+        summary.textContent = title;
+        section.append(summary);
+        node.replaceWith(section);
+        this.sections.set(title, section);
+      } else if (node.tagName === 'H2') {
+        section = null;
+      } else if (section) {
+        section.append(node);
+      }
+    }
   }
 
   /**
@@ -655,6 +695,10 @@ export class UI {
     const scenario = SCENARIOS.find((s) => s.name === name);
     card.hidden = !scenario;
     if (!scenario) return;
+    // a new scenario starts from its own view of the panel: Water plus what
+    // it is about, so the previous scenario's sections do not pile up open
+    const wanted = new Set(['Water', ...(scenario.sections ?? [])]);
+    for (const [title, section] of this.sections) section.open = wanted.has(title);
     card.querySelector('h2')!.textContent = `Scenario: ${scenario.label}`;
     card.querySelector('p')!.textContent = scenario.hint + '.';
   }
