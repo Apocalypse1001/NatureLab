@@ -20,6 +20,7 @@ export interface UICallbacks {
   setErosion(enabled: boolean): void;
   setOutflow(enabled: boolean): void;
   setTracerVisible(visible: boolean): void;
+  setGridVisible(visible: boolean): void;
   setTracerCount(count: number): void;
   setTool(tool: 'select' | 'raise' | 'lower' | 'pipe'): void;
   // v0.17.0 storm sewer
@@ -529,6 +530,15 @@ export class UI {
       this.cb.setBrush(parseFloat(size.value), parseFloat(strength.value));
     };
     panel.append(brush);
+    // The solver's cells drawn on the ground: a ruler for the scale of what the
+    // water can resolve. Off by default -- it is a measuring aid, not scenery.
+    const gridRow = el('label', 'slider-row', 'Show cell grid (every 10th line stronger)');
+    const grid = el('input', '') as HTMLInputElement;
+    grid.id = 'terrain-grid';
+    grid.type = 'checkbox';
+    grid.onchange = () => this.cb.setGridVisible(grid.checked);
+    gridRow.append(grid);
+    panel.append(gridRow);
 
     // v0.12.0: a channel is a precondition for a river, not a decoration -- the
     // flow is driven by the slope of the bed, so on the flat starting map no

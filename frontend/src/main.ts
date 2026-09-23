@@ -155,6 +155,7 @@ const ui = new UI(uiHost, {
   setErosion: (enabled) => net.send({ op: 'water_erosion', enabled }),
   setOutflow: (enabled) => net.send({ op: 'water_outflow', enabled }),
   setTracerVisible: (visible) => sceneManager.setTracerVisible(visible),
+  setGridVisible: (visible) => sceneManager.setGridVisible(visible),
   setTracerCount: (count) => sceneManager.setTracerDisplayLimit(count),
   setTool: (tool) => editor.setTool(tool),
   setBrush: (radius, strength) => {

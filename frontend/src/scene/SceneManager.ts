@@ -35,7 +35,10 @@ export class SceneManager {
   private _selectionHelper: THREE.BoxHelper | null = null;
   private waterBaseIndices: Uint16Array | Uint32Array;
   private waterDynamicIndices: Uint16Array | Uint32Array;
-  private gridHelper: THREE.GridHelper;
+  // The cell grid is drawn by the terrain's own shader (buildTerrainMaterial),
+  // so it lies on the ground wherever the ground is -- see setGridVisible.
+  private gridOn = { value: 0 };
+  private gridCell = { value: 1 };
   private waterFlow = new Float32Array(0);
   private waterDepth = new Float32Array(0);
   private waterLavaTemp = new Float32Array(0);
@@ -155,18 +158,12 @@ export class SceneManager {
     // -- baked once, tiled by repeat -- and keeps the same low-poly toy read
     // the rest of the scene has, rather than importing a photo texture.
     this.groundTexture = this.buildGroundTexture();
-    this.terrainMesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
-      map: this.groundTexture, roughness: 1.0, metalness: 0,
-    }));
+    this.gridCell.value = this.terrain.sizeM / this.terrain.width;
+    this.terrainMesh = new THREE.Mesh(geo, this.buildTerrainMaterial());
     this.updateGroundTextureRepeat(span);
     this.terrainMesh.rotation.x = -Math.PI / 2;
     this.terrainMesh.receiveShadow = true;
     this.scene.add(this.terrainMesh);
-
-    this.gridHelper = new THREE.GridHelper(
-      this.terrain.sizeM, this.terrain.width, 0x223344, 0x1b2836);
-    this.gridHelper.position.y = 0.05;
-    this.scene.add(this.gridHelper);
 
     // Water vertices share terrain ordering, allowing direct bulk frame updates.
     const waterGeometry = new THREE.PlaneGeometry(this.terrain.sizeM, this.terrain.sizeM,
@@ -314,14 +311,6 @@ export class SceneManager {
     pos.needsUpdate = true;
     geo.computeVertexNormals();
     this.edgeSkirt.rebuild(terrain);
-    // The helper grid sits at y = 0.05, i.e. under the ground of any map whose
-    // terrain stays above it and on top of the ground of a flat one -- but
-    // floating on the SEA of a coast, where the tsunami world showed it as a
-    // black mesh of 10 m lines over the whole sea (measured: hiding it was the
-    // only change that removed them). Where the ground dips below it, hide it.
-    let lowest = Infinity;
-    for (let i = 0; i < terrain.heights.length; i++) lowest = Math.min(lowest, terrain.heights[i]);
-    this.gridHelper.visible = lowest >= this.gridHelper.position.y - 0.05;
   }
 
   /** v0.17.0: each pipe's live capacity and flow, as streamed in sim_state. */
@@ -342,6 +331,11 @@ export class SceneManager {
       new THREE.LineBasicMaterial({ color: 0x7fd4ff, depthTest: false }));
     this.pipePreview.renderOrder = 10;
     this.scene.add(this.pipePreview);
+  }
+
+  /** Draw the solver's cells on the ground (or stop). Off by default. */
+  setGridVisible(on: boolean): void {
+    this.gridOn.value = on ? 1 : 0;
   }
 
   /** v0.18.0: colour the water by its local Froude number (or stop). */
@@ -376,6 +370,63 @@ export class SceneManager {
    * That is the point. A prettier shader that hid the physics would be the
    * decorative water docs/01_vision.md explicitly rules out.
    */
+  /**
+   * The ground, with the solver's cell grid drawn ON it rather than beside it.
+   *
+   * The grid used to be a flat THREE.GridHelper at y = 0.05: buried under any
+   * ground above that, floating over any ground below it, and on a map that
+   * sits exactly at 0 -- the plain around the volcano -- its 200 lines per side
+   * aliased into a black moire ring. Drawn in the terrain's fragment shader it
+   * follows the ground everywhere by construction. Lines are a fixed width in
+   * PIXELS (fwidth, core in WebGL2), and fade out where a cell shrinks toward a
+   * couple of pixels, which is exactly where lines would start beating against
+   * the pixel grid; every tenth line is stronger and survives further out.
+   */
+  private buildTerrainMaterial(): THREE.MeshStandardMaterial {
+    const material = new THREE.MeshStandardMaterial({
+      map: this.groundTexture, roughness: 1.0, metalness: 0,
+    });
+    material.onBeforeCompile = (shader) => {
+      shader.uniforms.uGridOn = this.gridOn;
+      shader.uniforms.uGridCell = this.gridCell;
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', `
+          #include <common>
+          varying vec2 vGridXZ;
+        `)
+        .replace('#include <begin_vertex>', `
+          #include <begin_vertex>
+          vGridXZ = (modelMatrix * vec4(transformed, 1.0)).xz;
+        `);
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', `
+          #include <common>
+          uniform float uGridOn;
+          uniform float uGridCell;
+          varying vec2 vGridXZ;
+
+          // coverage of a 1-pixel line every "period" cells, faded out where
+          // the cells get too small on screen to draw without aliasing
+          float gridLine(vec2 cells, float period) {
+            vec2 g = cells / period;
+            vec2 w = max(fwidth(g), vec2(1e-5));
+            vec2 d = abs(fract(g - 0.5) - 0.5) / w;
+            float line = 1.0 - min(min(d.x, d.y), 1.0);
+            return line * (1.0 - smoothstep(0.12, 0.35, max(w.x, w.y)));
+          }
+        `)
+        .replace('#include <map_fragment>', `
+          #include <map_fragment>
+          if (uGridOn > 0.5) {
+            vec2 cells = vGridXZ / uGridCell;
+            float grid = max(0.35 * gridLine(cells, 1.0), 0.6 * gridLine(cells, 10.0));
+            diffuseColor.rgb *= 1.0 - grid;
+          }
+        `);
+    };
+    return material;
+  }
+
   private buildWaterMaterial(): THREE.MeshStandardMaterial {
     const material = new THREE.MeshStandardMaterial({
       color: 0x2f7fd0, transparent: true, opacity: 0.45,
@@ -625,11 +676,7 @@ export class SceneManager {
     this.waterMesh.geometry.dispose();
     this.waterMesh.geometry = waterGeometry;
 
-    this.scene.remove(this.gridHelper);
-    this.gridHelper.geometry.dispose();
-    this.gridHelper = new THREE.GridHelper(sizeM, width, 0x223344, 0x1b2836);
-    this.gridHelper.position.y = 0.05;
-    this.scene.add(this.gridHelper);
+    this.gridCell.value = sizeM / width;
 
     // camera framing, fog and the sun's shadow frustum follow the world, see
     // the constructor note and configureSun()
