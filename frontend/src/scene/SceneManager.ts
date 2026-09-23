@@ -188,7 +188,8 @@ export class SceneManager {
     this.waterMesh.frustumCulled = false;
     this.scene.add(this.waterMesh);
 
-    this.edgeSkirt = new EdgeSkirt(this.groundTexture, this.buildWaterMaterial());
+    this.edgeSkirt = new EdgeSkirt(this.buildTerrainMaterial({ value: 0 }, true),
+                                   this.buildWaterMaterial());
     this.edgeSkirt.rebuild(this.terrain);
     this.scene.add(this.edgeSkirt.group);
 
@@ -358,6 +359,82 @@ export class SceneManager {
   }
 
   /**
+   * The ground, with the solver's cell grid drawn ON it rather than beside it.
+   *
+   * The grid used to be a flat THREE.GridHelper at y = 0.05: buried under any
+   * ground above that, floating over any ground below it, and on a map that
+   * sits exactly at 0 -- the plain around the volcano -- its 200 lines per side
+   * aliased into a black moire ring. Drawn in the terrain's fragment shader it
+   * follows the ground everywhere by construction. Lines are a fixed width in
+   * PIXELS (fwidth, core in WebGL2), and fade out where a cell shrinks toward a
+   * couple of pixels, which is exactly where lines would start beating against
+   * the pixel grid; every tenth line is stronger and survives further out.
+   *
+   * Steep ground turns from grass to bare earth. Under a high sun a 3 m dam
+   * face, a river bank or the flank of the volcano was shaded within a few
+   * percent of the plain around it, and read as flat; grass does not hold on
+   * a steep face anyway. The tint starts near 10 degrees and is full by about
+   * 25, from the ground's own normal, so it follows every brush stroke and
+   * erosion step with no extra data. The drawn terrain past the map edge
+   * (EdgeSkirt) gets the same material with the grid held off (`gridOn`),
+   * so a slope does not change colour where it crosses the edge.
+   */
+  private buildTerrainMaterial(gridOn: { value: number } = this.gridOn,
+                       vertexColors = false): THREE.MeshStandardMaterial {
+    const material = new THREE.MeshStandardMaterial({
+      map: this.groundTexture, roughness: 1.0, metalness: 0, vertexColors,
+    });
+    material.onBeforeCompile = (shader) => {
+      shader.uniforms.uGridOn = gridOn;
+      shader.uniforms.uGridCell = this.gridCell;
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', `
+          #include <common>
+          varying vec2 vGridXZ;
+          varying float vGroundUp;
+        `)
+        .replace('#include <begin_vertex>', `
+          #include <begin_vertex>
+          vGridXZ = (modelMatrix * vec4(transformed, 1.0)).xz;
+          vGroundUp = normalize((modelMatrix * vec4(objectNormal, 0.0)).xyz).y;
+        `);
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', `
+          #include <common>
+          uniform float uGridOn;
+          uniform float uGridCell;
+          varying vec2 vGridXZ;
+          varying float vGroundUp;
+
+          // coverage of a 1-pixel line every "period" cells, faded out where
+          // the cells get too small on screen to draw without aliasing
+          float gridLine(vec2 cells, float period) {
+            vec2 g = cells / period;
+            vec2 w = max(fwidth(g), vec2(1e-5));
+            vec2 d = abs(fract(g - 0.5) - 0.5) / w;
+            float line = 1.0 - min(min(d.x, d.y), 1.0);
+            return line * (1.0 - smoothstep(0.12, 0.35, max(w.x, w.y)));
+          }
+        `)
+        .replace('#include <map_fragment>', `
+          #include <map_fragment>
+          // up-component of the normal: 0.985 is about 10 deg, 0.90 about 26
+          float steep = 1.0 - smoothstep(0.90, 0.985, vGroundUp);
+          vec3 earth = vec3(0.25, 0.19, 0.12);     // linear; sRGB ~ #8a7a62
+          // a third of the grass texture stays, so the mottling carries over
+          diffuseColor.rgb = mix(diffuseColor.rgb, earth * (0.7 + 0.9 * diffuseColor.rgb.g),
+                                 0.8 * steep);
+          if (uGridOn > 0.5) {
+            vec2 cells = vGridXZ / uGridCell;
+            float grid = max(0.35 * gridLine(cells, 1.0), 0.6 * gridLine(cells, 10.0));
+            diffuseColor.rgb *= 1.0 - grid;
+          }
+        `);
+    };
+    return material;
+  }
+
+  /**
    * Water material driven by the REAL velocity field, not a painted flow map.
    *
    * Every off-the-shelf option considered -- THREE.Water, FFT oceans, painted
@@ -378,63 +455,6 @@ export class SceneManager {
    * That is the point. A prettier shader that hid the physics would be the
    * decorative water docs/01_vision.md explicitly rules out.
    */
-  /**
-   * The ground, with the solver's cell grid drawn ON it rather than beside it.
-   *
-   * The grid used to be a flat THREE.GridHelper at y = 0.05: buried under any
-   * ground above that, floating over any ground below it, and on a map that
-   * sits exactly at 0 -- the plain around the volcano -- its 200 lines per side
-   * aliased into a black moire ring. Drawn in the terrain's fragment shader it
-   * follows the ground everywhere by construction. Lines are a fixed width in
-   * PIXELS (fwidth, core in WebGL2), and fade out where a cell shrinks toward a
-   * couple of pixels, which is exactly where lines would start beating against
-   * the pixel grid; every tenth line is stronger and survives further out.
-   */
-  private buildTerrainMaterial(): THREE.MeshStandardMaterial {
-    const material = new THREE.MeshStandardMaterial({
-      map: this.groundTexture, roughness: 1.0, metalness: 0,
-    });
-    material.onBeforeCompile = (shader) => {
-      shader.uniforms.uGridOn = this.gridOn;
-      shader.uniforms.uGridCell = this.gridCell;
-      shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', `
-          #include <common>
-          varying vec2 vGridXZ;
-        `)
-        .replace('#include <begin_vertex>', `
-          #include <begin_vertex>
-          vGridXZ = (modelMatrix * vec4(transformed, 1.0)).xz;
-        `);
-      shader.fragmentShader = shader.fragmentShader
-        .replace('#include <common>', `
-          #include <common>
-          uniform float uGridOn;
-          uniform float uGridCell;
-          varying vec2 vGridXZ;
-
-          // coverage of a 1-pixel line every "period" cells, faded out where
-          // the cells get too small on screen to draw without aliasing
-          float gridLine(vec2 cells, float period) {
-            vec2 g = cells / period;
-            vec2 w = max(fwidth(g), vec2(1e-5));
-            vec2 d = abs(fract(g - 0.5) - 0.5) / w;
-            float line = 1.0 - min(min(d.x, d.y), 1.0);
-            return line * (1.0 - smoothstep(0.12, 0.35, max(w.x, w.y)));
-          }
-        `)
-        .replace('#include <map_fragment>', `
-          #include <map_fragment>
-          if (uGridOn > 0.5) {
-            vec2 cells = vGridXZ / uGridCell;
-            float grid = max(0.35 * gridLine(cells, 1.0), 0.6 * gridLine(cells, 10.0));
-            diffuseColor.rgb *= 1.0 - grid;
-          }
-        `);
-    };
-    return material;
-  }
-
   private buildWaterMaterial(): THREE.MeshStandardMaterial {
     const material = new THREE.MeshStandardMaterial({
       color: 0x2f7fd0, transparent: true, opacity: 0.45,

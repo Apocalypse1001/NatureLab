@@ -68,11 +68,10 @@ export class EdgeSkirt {
   private waterDepth = new Float32Array(0);
   private wet = new Uint8Array(0);
 
-  constructor(groundTexture: THREE.Texture, waterMaterial: THREE.Material) {
-    this.terrainMesh = new THREE.Mesh(new THREE.BufferGeometry(),
-      new THREE.MeshStandardMaterial({
-        map: groundTexture, roughness: 1.0, metalness: 0, vertexColors: true,
-      }));
+  // groundMaterial: the map's own ground (SceneManager.buildTerrainMaterial,
+  // vertex colours on, grid off), so slopes keep their colour past the edge
+  constructor(groundMaterial: THREE.Material, waterMaterial: THREE.Material) {
+    this.terrainMesh = new THREE.Mesh(new THREE.BufferGeometry(), groundMaterial);
     this.terrainMesh.receiveShadow = true;
     this.terrainMesh.frustumCulled = false;
     this.waterMesh = new THREE.Mesh(new THREE.BufferGeometry(), waterMaterial);
