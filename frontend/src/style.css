@@ -35,6 +35,9 @@ button {
   border-radius: 4px; padding: 5px 12px; cursor: pointer; font-size: 12px;
 }
 button:hover { background: #33445d; }
+/* the tool in use (UI.setActiveTool) */
+button.active { background: #35507a; border-color: #7fa8d0; color: #fff; }
+.hint[hidden] { display: none; }
 
 select {
   background: #263244; color: #dfe6ee; border: 1px solid #3a4a62;

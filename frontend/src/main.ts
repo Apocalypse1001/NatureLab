@@ -182,6 +182,7 @@ const ui = new UI(uiHost, {
 
 // ---------------------------------------------------------------------- editor
 const editor = new EditorController(sceneManager, store, net);
+editor.onToolChange = (tool) => ui.setActiveTool(tool);
 
 // ---------------------------------------------------------------------- world sync
 function applyWorld(world: WorldData, simStatus: string, op?: string,

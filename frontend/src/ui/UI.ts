@@ -188,6 +188,7 @@ export class UI {
     this.objectList = this.root.querySelector('#object-list')!;
     this.propsHost = this.root.querySelector('#properties')!;
     this.showProperties(null);
+    this.setActiveTool('select');
   }
 
   // ------------------------------------------------------------------ layout
@@ -246,6 +247,7 @@ export class UI {
     const sewerTools = el('div', 'palette');
     const layPipe = btn('Lay pipe', () => this.cb.setTool('pipe'));
     layPipe.id = 'lay-pipe';
+    layPipe.dataset.tool = 'pipe';
     sewerTools.append(layPipe);
     panel.append(sewerTools);
     const pipeRow = el('div', 'slider-row');
@@ -260,7 +262,13 @@ export class UI {
     };
     pipeRow.append(pipeDiameter);
     panel.append(pipeRow);
-    panel.append(el('p', 'hint',
+    // The step-by-step only while a pipe is being laid (setActiveTool): shown
+    // all the time it was the longest text on the left, read once and then in
+    // the way. Outside the mode, one line says it exists.
+    const pipeIdle = el('p', 'hint', 'Press "Lay pipe"; the steps appear here while you lay it.');
+    pipeIdle.id = 'pipe-help-idle';
+    panel.append(pipeIdle);
+    panel.append(el('p', 'hint pipe-help',
       'Click a storm inlet or a manhole, or bare ground to place an inlet; click '
       + 'along the route; click a manhole or an outfall, or press Enter (or '
       + 'right-click) to place an outfall at the last point. Pipes from several '
@@ -525,11 +533,12 @@ export class UI {
 
     panel.append(el('h3', '', 'Terrain'));
     const tools = el('div', 'palette');
-    tools.append(
-      btn('Select / Move', () => this.cb.setTool('select')),
-      btn('Raise', () => this.cb.setTool('raise')),
-      btn('Lower', () => this.cb.setTool('lower')),
-    );
+    for (const [label, tool] of [['Select / Move', 'select'], ['Raise', 'raise'],
+                                 ['Lower', 'lower']] as const) {
+      const button = btn(label, () => this.cb.setTool(tool));
+      button.dataset.tool = tool;
+      tools.append(button);
+    }
     panel.append(tools);
     const brush = el('div', 'slider-row');
     brush.innerHTML = '<label>Brush size <output id="brush-size-out">6</output> m</label>';
@@ -687,6 +696,19 @@ export class UI {
     close.setAttribute('aria-label', 'Close the scenario description');
     card.append(close, el('h2', ''), el('p', ''));
     return card;
+  }
+
+  /**
+   * Mark the tool in use: its button reads as pressed, and the pipe-laying
+   * steps show only while a pipe is being laid. Driven by the editor, so Esc,
+   * a right-click or a finished pipe clear it as surely as a button does.
+   */
+  setActiveTool(tool: string): void {
+    for (const button of this.root.querySelectorAll<HTMLElement>('button[data-tool]')) {
+      button.classList.toggle('active', button.dataset.tool === tool);
+    }
+    this.root.querySelector<HTMLElement>('.pipe-help')!.hidden = tool !== 'pipe';
+    this.root.querySelector<HTMLElement>('#pipe-help-idle')!.hidden = tool === 'pipe';
   }
 
   /** Show the card for a prepared scenario, or hide it for any other world. */

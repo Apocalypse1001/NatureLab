@@ -15,6 +15,8 @@ export class EditorController {
   terrainEditingEnabled = true;
   /** v0.17.0: diameter of the next pipe laid, metres. */
   pipeDiameter = 0.2;
+  /** Told of every tool change -- a click, Esc, a finished pipe -- for the HUD. */
+  onToolChange: ((tool: Tool) => void) | null = null;
 
   private transform: TransformControls;
   private painting = false;
@@ -151,6 +153,7 @@ export class EditorController {
       this.transform.detach();
       this.store.select(null);
     }
+    this.onToolChange?.(tool);
   }
 
   /** Carry an existing pipe on from its outfall: its route is picked back up. */
