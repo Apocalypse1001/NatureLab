@@ -147,7 +147,6 @@ export class SceneManager {
     const bounce = new THREE.DirectionalLight(0x9fb8d8, 0.35);
     bounce.position.set(-span * 0.4, span * 0.25, -span * 0.5);
     this.scene.add(bounce);
-    this.scene.add(new THREE.AxesHelper(span * 0.1));
 
     // terrain mesh (geometry rebuilt from the logical grid)
     const geo = new THREE.PlaneGeometry(
