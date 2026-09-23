@@ -15,6 +15,15 @@ import type { SewerLinkState } from '../world/types';
 import { applyTransform, buildObjectMesh, setGroundHeightSampler } from '../world/ObjectFactory';
 import type { ObjectData } from '../world/types';
 
+// A daytime sky. The horizon was the UI's own navy (0x0e1420) until the visual
+// audit of 2026-09-23: sunlit grass under a night sky, and the far terrain
+// faded into darkness instead of haze. The fog, the clear colour and the dome's
+// horizon are ONE colour so the fog-swallowed terrain meets the sky with no
+// seam; all three pass through the same OutputPass tone mapping, and both
+// stay under the bloom threshold (1.0), so the sky never glows.
+const SKY_HORIZON = 0xc4d4e0;   // pale haze
+const SKY_ZENITH = 0x4f86c2;    // clear blue overhead
+
 export class SceneManager {
   readonly renderer: THREE.WebGLRenderer;
   readonly scene = new THREE.Scene();
@@ -82,7 +91,7 @@ export class SceneManager {
     // v0.17.0: pipes drape over whatever terrain is loaded at the time they build
     setGroundHeightSampler((x, z) => this.terrain.heightAt(x, z));
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setClearColor(0x0e1420);
+    this.renderer.setClearColor(SKY_HORIZON);
     // Shadows are the one cheap thing that makes an object look like it is ON
     // the terrain rather than floating in front of it. Nothing else in this
     // pass changes what the user can read off the scene as much as this does.
@@ -115,7 +124,7 @@ export class SceneManager {
     // fixed numbers: they were tuned for a 100 m map and left the 200 m map
     // half out of frame and inside the fog when it was doubled in v0.7.0.
     const span = terrain.sizeM;
-    this.scene.fog = new THREE.Fog(0x0e1420, span * 1.2, span * 4);
+    this.scene.fog = new THREE.Fog(SKY_HORIZON, span * 1.2, span * 4);
 
     // A gradient dome, not the flat clear-colour backdrop the renderer painted
     // before: at ground level (the camera height a child would actually use)
@@ -605,8 +614,8 @@ export class SceneManager {
     const geometry = new THREE.SphereGeometry(1, 24, 16);
     const position = geometry.attributes.position as THREE.BufferAttribute;
     const colors = new Float32Array(position.count * 3);
-    const zenith = new THREE.Color(0x25446b);
-    const horizon = new THREE.Color(0x0e1420);   // matches scene.fog exactly
+    const zenith = new THREE.Color(SKY_ZENITH);
+    const horizon = new THREE.Color(SKY_HORIZON);   // matches scene.fog exactly
     const c = new THREE.Color();
     // Steep on purpose: from eye height, most of what a camera frames is
     // within a few degrees of the horizon (y near 0), not the zenith. A
@@ -710,7 +719,7 @@ export class SceneManager {
     // camera framing, fog and the sun's shadow frustum follow the world, see
     // the constructor note and configureSun()
     this.configureSun();
-    this.scene.fog = new THREE.Fog(0x0e1420, sizeM * 1.2, sizeM * 4);
+    this.scene.fog = new THREE.Fog(SKY_HORIZON, sizeM * 1.2, sizeM * 4);
     this.updateSkyDome(sizeM);
     this.updateGroundTextureRepeat(sizeM);
     this.camera.far = sizeM * 6;
