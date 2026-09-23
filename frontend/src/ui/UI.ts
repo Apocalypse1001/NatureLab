@@ -284,13 +284,13 @@ export class UI {
     // get back, so it has to be a deliberate choice, not a hidden one.
     // v0.8.0: without an open downstream edge the map simply fills up, which
     // is what every version through 0.7.0 did. On by default.
-    const outflowRow = el('label', 'slider-row', 'Open downstream edge (water leaves the map)');
+    const outflowRow = el('label', 'check-row', 'Open downstream edge (water leaves the map)');
     const outflow = el('input', '') as HTMLInputElement;
     outflow.id = 'water-outflow';
     outflow.type = 'checkbox';
     outflow.checked = true;
     outflow.onchange = () => this.cb.setOutflow(outflow.checked);
-    outflowRow.append(outflow);
+    outflowRow.prepend(outflow);
     panel.append(outflowRow);
 
     // v0.12.0: a river is delivered as a discharge; the level it runs at is the
@@ -299,12 +299,12 @@ export class UI {
     // over-determines the boundary and the two disagree the moment the bed
     // changes. While it is on, the edge-inflow level control above is inert:
     // one map, one answer to "where does the water come from".
-    const inletRow = el('label', 'slider-row', 'River inlet (prescribed discharge)');
+    const inletRow = el('label', 'check-row', 'River inlet (prescribed discharge)');
     const inlet = el('input', '') as HTMLInputElement;
     inlet.id = 'river-inlet';
     inlet.type = 'checkbox';
     inlet.onchange = () => this.cb.setRiverInlet({ enabled: inlet.checked });
-    inletRow.append(inlet);
+    inletRow.prepend(inlet);
     panel.append(inletRow);
 
     const flow = el('div', 'slider-row');
@@ -335,7 +335,7 @@ export class UI {
     flow.insertAdjacentHTML('beforeend', '<div class="hint" id="settle-state">Starts dry</div>');
 
     // v0.18.0: a flood wave on top of Q -- rises to a peak, falls back
-    const hydroRow = el('label', 'slider-row', 'Flood wave (hydrograph on top of Q)');
+    const hydroRow = el('label', 'check-row', 'Flood wave (hydrograph on top of Q)');
     const hydroOn = el('input', '') as HTMLInputElement;
     hydroOn.id = 'hydro-enabled';
     hydroOn.type = 'checkbox';
@@ -344,7 +344,7 @@ export class UI {
       this.cb.setRiverInlet({ hydrograph: { enabled: hydroOn.checked } });
       this.drawHydrograph();
     };
-    hydroRow.append(hydroOn);
+    hydroRow.prepend(hydroOn);
     flow.append(hydroRow);
     const hydroSlider = (id: string, label: string, unit: string, key: keyof Hydrograph,
                          min: number, max: number, step: number) => {
@@ -407,36 +407,36 @@ export class UI {
     panel.append(flow);
 
     // v0.18.0: the local Froude number |u| / sqrt(g h) painted on the water
-    const froudeRow = el('label', 'slider-row', 'Colour water by Froude number');
+    const froudeRow = el('label', 'check-row', 'Colour water by Froude number');
     const froude = el('input', '') as HTMLInputElement;
     froude.id = 'water-froude';
     froude.type = 'checkbox';
     froude.onchange = () => this.cb.setFroudeView(froude.checked);
-    froudeRow.append(froude);
+    froudeRow.prepend(froude);
     panel.append(froudeRow);
     panel.append(el('p', 'hint',
       'Blue: calm, slower than a surface wave travels (Fr < 1). White: critical '
       + '(Fr = 1). Red: shooting, faster than a wave can go upstream (Fr > 1) -- '
       + 'what you see between bridge piers and over a weir.'));
 
-    const erosionRow = el('label', 'slider-row', 'Erosion (river reshapes the bed)');
+    const erosionRow = el('label', 'check-row', 'Erosion (river reshapes the bed)');
     const erosion = el('input', '') as HTMLInputElement;
     erosion.id = 'water-erosion';
     erosion.type = 'checkbox';
     erosion.onchange = () => this.cb.setErosion(erosion.checked);
-    erosionRow.append(erosion);
+    erosionRow.prepend(erosion);
     panel.append(erosionRow);
 
     // RainLab-1: the west edge holds the inflow level above every tick, so on a
     // map meant to be wetted by rain alone it has to be switchable -- otherwise
     // rain falling on those columns is overwritten and the edge acts as a sink.
-    const edgeRow = el('label', 'slider-row', 'Edge inflow (west edge holds the level above)');
+    const edgeRow = el('label', 'check-row', 'Edge inflow (west edge holds the level above)');
     const edge = el('input', '') as HTMLInputElement;
     edge.id = 'edge-inflow';
     edge.type = 'checkbox';
     edge.checked = true;
     edge.onchange = () => this.cb.setEdgeInflow(edge.checked);
-    edgeRow.append(edge);
+    edgeRow.prepend(edge);
     panel.append(edgeRow);
 
     // Rain is an areal source: it adds to whatever boundary is active rather
@@ -480,11 +480,11 @@ export class UI {
       + 'deep enough to see -- the water shows where the terrain gathers it.'));
 
     panel.append(el('h3', '', 'Flow visualization'));
-    const tracerToggle = el('label', 'slider-row', 'Show physical tracers');
+    const tracerToggle = el('label', 'check-row', 'Show physical tracers');
     const visible = el('input', '') as HTMLInputElement;
     visible.id = 'tracers-visible'; visible.type = 'checkbox'; visible.checked = true;
     visible.onchange = () => this.cb.setTracerVisible(visible.checked);
-    tracerToggle.append(visible);
+    tracerToggle.prepend(visible);
     panel.append(tracerToggle);
     const tracerCount = el('div', 'slider-row');
     tracerCount.innerHTML =
@@ -532,12 +532,12 @@ export class UI {
     panel.append(brush);
     // The solver's cells drawn on the ground: a ruler for the scale of what the
     // water can resolve. Off by default -- it is a measuring aid, not scenery.
-    const gridRow = el('label', 'slider-row', 'Show cell grid (every 10th line stronger)');
+    const gridRow = el('label', 'check-row', 'Show cell grid (every 10th line stronger)');
     const grid = el('input', '') as HTMLInputElement;
     grid.id = 'terrain-grid';
     grid.type = 'checkbox';
     grid.onchange = () => this.cb.setGridVisible(grid.checked);
-    gridRow.append(grid);
+    gridRow.prepend(grid);
     panel.append(gridRow);
 
     // v0.12.0: a channel is a precondition for a river, not a decoration -- the

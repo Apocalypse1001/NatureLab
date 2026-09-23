@@ -76,6 +76,15 @@ select {
 .slider-row label { color: #aebacb; font-size: 12px; }
 .slider-row input[type="range"] { width: 100%; }
 
+/* a checkbox and what it switches, on one line: box first, then the text in
+   the same muted face as a slider's label (.panel wins over .slider-row label
+   for the one row that sits inside a slider block) */
+.panel .check-row {
+  display: flex; align-items: flex-start; gap: 6px; margin: 4px 0 6px;
+  color: #aebacb; font-size: 12px; line-height: 1.35; cursor: pointer;
+}
+.check-row input[type="checkbox"] { flex: none; margin-top: 1px; cursor: pointer; }
+
 .hint { color: #6b7a90; font-style: italic; padding: 6px 0; }
 .gauge-readout { margin-top: 12px; padding: 10px; border: 1px solid #27516a; background: #0b1d29; }
 .gauge-readout > div { display: flex; justify-content: space-between; margin: 5px 0; color: #9db3ca; }
