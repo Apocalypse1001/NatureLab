@@ -52,7 +52,17 @@ export interface UICallbacks {
  * sends. Adding a scenario is adding a row here and a world file -- no new op,
  * no new load path, and nothing in the existing controls has to move.
  */
-const SCENARIOS: { name: string; label: string; hint: string }[] = [
+/**
+ * Where the camera looks when a scenario loads: an xz box (m) fitted into the
+ * view, or 'map' for the whole-map view every world had before framing. A
+ * scenario without one is framed on its objects, like any user's saved world
+ * -- right for a town, wrong where the subject is terrain or open water the
+ * objects do not reach.
+ */
+export type ScenarioFrame = { x0: number; x1: number; z0: number; z1: number } | 'map';
+
+export const SCENARIOS: { name: string; label: string; hint: string;
+                          frame?: ScenarioFrame }[] = [
   { name: 'scenario_river', label: 'River',
     hint: 'A town on the bank of a running river, already flowing when it opens. '
         + 'At the discharge it ships with, the channel runs about 0.7 m deep and '
@@ -79,7 +89,10 @@ const SCENARIOS: { name: string; label: string; hint: string }[] = [
         + 'centimetres; this water model has no loss where a flow narrows and widens, '
         + 'so it shows the effect, not its size. Change the piers in the bridge’s '
         + 'properties and watch the numbers' },
-  { name: 'scenario_dam', label: 'Dam',
+  // The dam is terrain, not an object: its crest sits 70 m from the west edge
+  // (terrain_gen.DAM_DEFAULTS), x = -30, so the box is the town plus the dam
+  // and a stretch of the reservoir behind it.
+  { name: 'scenario_dam', label: 'Dam', frame: { x0: -60, x1: 65, z0: -20, z1: 60 },
     hint: 'The same town below a dam. At the discharge it ships with, the '
         + 'spillway carries the river and the dam holds. Push Q past about 60 '
         + 'and the crest goes under in roughly six minutes of simulated time '
@@ -90,7 +103,9 @@ const SCENARIOS: { name: string; label: string; hint: string }[] = [
         + 'village just past it is safe at the vent’s shipped discharge '
         + '-- raise "Discharge Q" in the vent’s own properties, or just '
         + 'wait, to push the flow further' },
-  { name: 'scenario_tsunami', label: 'Tsunami',
+  // The sea the wave comes in over is the subject, and no object is on it:
+  // kept on the whole-map view it always had.
+  { name: 'scenario_tsunami', label: 'Tsunami', frame: 'map',
     hint: 'The only kilometre-scale world here: 2 km across at 10 m cells, '
         + 'because how far the sea goes out is the drawdown divided by the '
         + 'beach slope, and a real gentle shore does not fit in 200 m. The '

@@ -7,7 +7,9 @@ export type BackendStatus = 'connecting' | 'connected' | 'disconnected';
 interface Handlers {
   onStatus?: (status: BackendStatus) => void;
   onHello?: (engine: EngineInfo, simStatus: string) => void;
-  onWorld?: (world: WorldData, simStatus: string) => void;
+  // op: which request produced this world (load, reset, ...); absent from a
+  // backend older than the camera framing
+  onWorld?: (world: WorldData, simStatus: string, op?: string, name?: string) => void;
   onSimState?: (state: SimStateMessage) => void;
   onSaved?: (name: string, path: string) => void;
   onError?: (message: string) => void;
@@ -81,7 +83,9 @@ export class BackendClient {
         this.handlers.onHello?.(this.engineInfo, msg.status as string);
         break;
       case 'world':
-        this.handlers.onWorld?.(msg.world as WorldData, msg.status as string);
+        this.handlers.onWorld?.(msg.world as WorldData, msg.status as string,
+                                msg.op as string | undefined,
+                                msg.name as string | undefined);
         break;
       case 'sim_state':
         this.handlers.onSimState?.(msg as unknown as SimStateMessage);

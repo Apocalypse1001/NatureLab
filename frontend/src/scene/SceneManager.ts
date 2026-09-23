@@ -1087,6 +1087,61 @@ export class SceneManager {
     }
   }
 
+  /**
+   * Point the camera at what a world is about: the box around its objects.
+   *
+   * Before this, every load put the camera where it sits for an empty map --
+   * the whole 200 m square from a corner -- so the town a scenario is built
+   * around filled a sixth of the frame, and a same-size load did not move the
+   * camera at all, leaving it wherever the last world had it (inside the
+   * volcano, once). The view keeps the default angle from above; only the
+   * aim and the distance change. The distance fits the box into the part of
+   * the width the side panels leave open (`openWidth`, a 0..1 share), not the
+   * whole canvas. An empty world keeps the old whole-map view.
+   */
+  frameObjects(objects: ObjectData[], openWidth = 1): void {
+    if (!objects.length) {
+      this.frameBox(null, openWidth);
+      return;
+    }
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    for (const obj of objects) {
+      x0 = Math.min(x0, obj.position[0]); x1 = Math.max(x1, obj.position[0]);
+      z0 = Math.min(z0, obj.position[2]); z1 = Math.max(z1, obj.position[2]);
+    }
+    // positions are centres: leave room for what stands at the box's corners
+    const pad = 6;
+    this.frameBox({ x0: x0 - pad, x1: x1 + pad, z0: z0 - pad, z1: z1 + pad }, openWidth);
+  }
+
+  /**
+   * Fit an xz box (m) into the view, from the default angle above; `null` is
+   * the whole-map view the camera had before framing existed.
+   */
+  frameBox(box: { x0: number; x1: number; z0: number; z1: number } | null,
+           openWidth = 1): void {
+    const size = this.terrain.sizeM;
+    const direction = new THREE.Vector3(0.6, 0.55, 0.6).normalize();
+    if (!box) {
+      this.controls.target.set(0, 0, 0);
+      this.camera.position.set(size * 0.6, size * 0.55, size * 0.6);
+      this.controls.update();
+      return;
+    }
+    const cx = (box.x0 + box.x1) / 2;
+    const cz = (box.z0 + box.z1) / 2;
+    // the sphere around the box, so it fits whichever way it is turned; never
+    // tighter than a few houses, so one lone object is not a close-up
+    const radius = Math.max(0.5 * Math.hypot(box.x1 - box.x0, box.z1 - box.z0), 30);
+    const vertical = THREE.MathUtils.degToRad(this.camera.fov);
+    const horizontal = 2 * Math.atan(Math.tan(vertical / 2) * this.camera.aspect * openWidth);
+    const distance = Math.min(this.controls.maxDistance,
+                              radius / Math.sin(Math.min(vertical, horizontal) / 2));
+    this.controls.target.set(cx, this.terrain.heightAt(cx, cz), cz);
+    this.camera.position.copy(this.controls.target).addScaledVector(direction, distance);
+    this.controls.update();
+  }
+
   clearObjects(): void {
     for (const child of this.objectsRoot.children) SceneManager.disposeSubtree(child);
     this.objectsRoot.clear();

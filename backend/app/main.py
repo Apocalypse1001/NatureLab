@@ -116,7 +116,7 @@ async def _dispatch(ws: WebSocket, msg: dict) -> dict | None:
             # would silently vanish -- refuse it instead
             raise ValueError("the river is settling; wait for it to finish")
         if op == "request_world":
-            return {"type": "world", "world": client_world(),
+            return {"type": "world", "op": op, "world": client_world(),
                     "status": manager.status, "time": manager.sim_time}
         if op == "object_add":
             obj_dict = manager.apply_object_add(msg.get("object", {}))
@@ -172,7 +172,7 @@ async def _dispatch(ws: WebSocket, msg: dict) -> dict | None:
             return {"type": "ack", "op": op, "status": manager.status}
         if op == "reset":
             manager.reset()
-            return {"type": "world", "world": client_world(),
+            return {"type": "world", "op": op, "world": client_world(),
                     "status": manager.status, "time": manager.sim_time}
         if op == "set_speed":
             manager.set_speed(msg["value"])
@@ -183,12 +183,15 @@ async def _dispatch(ws: WebSocket, msg: dict) -> dict | None:
                     "path": path}
         if op == "load":
             manager.load(str(msg.get("name", "default")))
-            return {"type": "world", "world": client_world(),
+            # op and name let the client frame its camera on a world that has
+            # just arrived, and on a prepared scenario the way it is meant to
+            return {"type": "world", "op": op, "name": str(msg.get("name", "default")),
+                    "world": client_world(),
                     "status": manager.status, "time": manager.sim_time}
         if op == "water_settle":
             # v0.18.1: start the river flowing; the reply is the settled world
             result = await manager.apply_water_settle(msg.get("fields") or {})
-            return {"type": "world", "world": client_world(), "status": manager.status,
+            return {"type": "world", "op": op, "world": client_world(), "status": manager.status,
                     "time": manager.sim_time, "settle": result}
         return {"type": "error", "error": f"unknown op: {op}"}
     except Exception as exc:

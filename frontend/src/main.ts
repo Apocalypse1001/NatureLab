@@ -2,7 +2,7 @@ import { SceneManager } from './scene/SceneManager';
 import { WorldStore } from './world/WorldStore';
 import { EditorController } from './editor/EditorController';
 import { BackendClient } from './net/BackendClient';
-import { UI } from './ui/UI';
+import { SCENARIOS, UI } from './ui/UI';
 import type { ObjectData, OutletKind, WorldData } from './world/types';
 import type { EdgeWaterMode } from './scene/EdgeSkirt';
 import './style.css';
@@ -52,7 +52,7 @@ const net = new BackendClient(wsUrl, {
     ui.setEngine(engine);
     console.log('[NatureLab] backend engine:', engine);
   },
-  onWorld: (world, simStatus) => applyWorld(world, simStatus),
+  onWorld: (world, simStatus, op, name) => applyWorld(world, simStatus, op, name),
   onSimState: (state) => {
     currentSimStatus = state.status;
     editor.terrainEditingEnabled = state.status !== 'RUNNING';
@@ -184,7 +184,8 @@ const ui = new UI(uiHost, {
 const editor = new EditorController(sceneManager, store, net);
 
 // ---------------------------------------------------------------------- world sync
-function applyWorld(world: WorldData, simStatus: string): void {
+function applyWorld(world: WorldData, simStatus: string, op?: string,
+                    name?: string): void {
   currentSimStatus = simStatus;
   currentGravity = world.environment?.gravity ?? 9.81;
   editor.terrainEditingEnabled = simStatus !== 'RUNNING';
@@ -208,6 +209,25 @@ function applyWorld(world: WorldData, simStatus: string): void {
   ui.refreshObjectList([...store.objects.values()], null);
   ui.showProperties(null);
   ui.setClock(0, simStatus);
+  // Frame the camera on a world that has just ARRIVED -- a scenario, LOAD, the
+  // first connection -- but never on RESET or Settle river, which hand back
+  // the same world while the user may be looking somewhere on purpose.
+  if (op === undefined || op === 'load' || op === 'request_world') {
+    const frame = op === 'load' ? SCENARIOS.find((s) => s.name === name)?.frame : undefined;
+    if (frame === 'map') sceneManager.frameBox(null, unobstructedWidth());
+    else if (frame) sceneManager.frameBox(frame, unobstructedWidth());
+    else sceneManager.frameObjects(world.objects, unobstructedWidth());
+  }
+}
+
+/** Share of the viewport's width the side panels leave open, for framing. */
+function unobstructedWidth(): number {
+  const width = window.innerWidth;
+  let covered = 0;
+  for (const panel of document.querySelectorAll('.panel')) {
+    covered += panel.getBoundingClientRect().width + 8;   // + the panel's margin
+  }
+  return Math.max(0.35, (width - covered) / width);
 }
 
 store.on('objects-changed', () => {
