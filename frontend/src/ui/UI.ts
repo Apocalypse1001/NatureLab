@@ -475,8 +475,9 @@ export class UI {
     rain.append(applied);
     panel.append(rain);
     panel.append(el('p', 'hint',
-      'Every drop becomes runoff: no infiltration, no evaporation, and rain on a '
-      + 'building is lost (no roofs yet). On flat ground light rain never gets '
+      'Every drop becomes runoff: no infiltration, no evaporation. Rain on a '
+      + 'roof drips off its eaves onto the ground around the building (no '
+      + 'downpipes yet). On flat ground light rain never gets '
       + 'deep enough to see -- the water shows where the terrain gathers it.'));
 
     panel.append(el('h3', '', 'Flow visualization'));
