@@ -172,22 +172,22 @@ export class SceneManager {
 
     // terrain mesh (geometry rebuilt from the logical grid)
     const geo = new THREE.PlaneGeometry(
-      this.terrain.sizeM, this.terrain.sizeM,
+      this.terrain.sizeX, this.terrain.sizeZ,
       this.terrain.width, this.terrain.height);
     // A speckled canvas texture, not a flat fill: up close (a child's eye
     // height) one solid green reads as a floor, not grass. Mottling is cheap
     // -- baked once, tiled by repeat -- and keeps the same low-poly toy read
     // the rest of the scene has, rather than importing a photo texture.
     this.groundTexture = this.buildGroundTexture();
-    this.gridCell.value = this.terrain.sizeM / this.terrain.width;
+    this.gridCell.value = this.terrain.cellSize;
     this.terrainMesh = new THREE.Mesh(geo, this.buildTerrainMaterial());
-    this.updateGroundTextureRepeat(span);
+    this.updateGroundTextureRepeat();
     this.terrainMesh.rotation.x = -Math.PI / 2;
     this.terrainMesh.receiveShadow = true;
     this.scene.add(this.terrainMesh);
 
     // Water vertices share terrain ordering, allowing direct bulk frame updates.
-    const waterGeometry = new THREE.PlaneGeometry(this.terrain.sizeM, this.terrain.sizeM,
+    const waterGeometry = new THREE.PlaneGeometry(this.terrain.sizeX, this.terrain.sizeZ,
                                                   this.terrain.width, this.terrain.height);
     const sourceIndices = waterGeometry.index!.array;
     this.waterBaseIndices = sourceIndices instanceof Uint32Array
@@ -332,7 +332,81 @@ export class SceneManager {
     }
     pos.needsUpdate = true;
     geo.computeVertexNormals();
+    this.applySurfaceTint(geo, terrain);
     this.edgeSkirt.rebuild(terrain);
+    this.drawSiteOutline();
+  }
+
+  /**
+   * Linear rgb and weight per surface class (backend config.SURFACE_CLASSES).
+   * Grass (1) and "no class" (0) keep the grass texture as it is.
+   */
+  private static readonly SURFACE_TINT: Record<number, [number, number, number, number]> = {
+    2: [0.45, 0.38, 0.28, 0.7],    // yard
+    3: [0.40, 0.33, 0.24, 0.7],    // unpaved
+    4: [0.55, 0.53, 0.50, 0.75],   // half paved: gravel, shell
+    5: [0.50, 0.36, 0.30, 0.8],    // open paving: brick pavers
+    6: [0.18, 0.18, 0.19, 0.85],   // closed paving: asphalt
+    7: [0.20, 0.22, 0.20, 0.8],    // water: a ditch bed
+    8: [0.20, 0.30, 0.12, 0.5],    // bank
+    9: [0.12, 0.25, 0.10, 0.5],    // planted
+  };
+
+  private applySurfaceTint(geo: THREE.BufferGeometry, terrain: TerrainGrid): void {
+    const count = (terrain.width + 1) * (terrain.height + 1);
+    let attribute = geo.getAttribute('aSurface') as THREE.BufferAttribute | undefined;
+    if (!attribute || attribute.count !== count) {
+      attribute = new THREE.BufferAttribute(new Float32Array(count * 4), 4);
+      geo.setAttribute('aSurface', attribute);
+    }
+    const data = attribute.array as Float32Array;
+    const surface = terrain.surface;
+    for (let v = 0; v < count; v++) {
+      const tint = surface ? SceneManager.SURFACE_TINT[surface[v]] : undefined;
+      data[v * 4] = tint ? tint[0] : 0;
+      data[v * 4 + 1] = tint ? tint[1] : 0;
+      data[v * 4 + 2] = tint ? tint[2] : 0;
+      data[v * 4 + 3] = tint ? 1 - tint[3] : 1;
+    }
+    attribute.needsUpdate = true;
+  }
+
+  private siteOutline: THREE.Line | null = null;
+  private siteParcel: number[][] | null = null;
+
+  /** A surveyed plot's boundary ([x, z] m), draped on the ground; null clears. */
+  setSiteOutline(parcel: number[][] | null): void {
+    this.siteParcel = parcel && parcel.length >= 3 ? parcel : null;
+    this.drawSiteOutline();
+  }
+
+  private drawSiteOutline(): void {
+    if (this.siteOutline) {
+      this.scene.remove(this.siteOutline);
+      this.siteOutline.geometry.dispose();
+      (this.siteOutline.material as THREE.Material).dispose();
+      this.siteOutline = null;
+    }
+    const parcel = this.siteParcel;
+    if (!parcel) return;
+    // every half cell along each side, so the line follows the ground instead
+    // of cutting through a rise between two corners
+    const step = this.terrain.cellSize / 2;
+    const points: THREE.Vector3[] = [];
+    for (let k = 0; k < parcel.length; k++) {
+      const [x0, z0] = parcel[k];
+      const [x1, z1] = parcel[(k + 1) % parcel.length];
+      const n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, z1 - z0) / step));
+      for (let s = 0; s < n; s++) {
+        const x = x0 + ((x1 - x0) * s) / n, z = z0 + ((z1 - z0) * s) / n;
+        points.push(new THREE.Vector3(x, this.terrain.heightAt(x, z) + 0.06, z));
+      }
+    }
+    points.push(points[0].clone());
+    this.siteOutline = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points),
+      new THREE.LineBasicMaterial({ color: 0xffc933 }));
+    this.siteOutline.renderOrder = 2;
+    this.scene.add(this.siteOutline);
   }
 
   /** v0.17.0: each pipe's live capacity and flow, as streamed in sim_state. */
@@ -405,9 +479,14 @@ export class SceneManager {
           #include <common>
           varying vec2 vGridXZ;
           varying float vGroundUp;
+          // surface class tint: rgb, and w = 1 - how much of it to use -- so
+          // a geometry without the attribute (default 0,0,0,1) is untinted
+          attribute vec4 aSurface;
+          varying vec4 vSurface;
         `)
         .replace('#include <begin_vertex>', `
           #include <begin_vertex>
+          vSurface = aSurface;
           vGridXZ = (modelMatrix * vec4(transformed, 1.0)).xz;
           vGroundUp = normalize((modelMatrix * vec4(objectNormal, 0.0)).xyz).y;
         `);
@@ -418,6 +497,7 @@ export class SceneManager {
           uniform float uGridCell;
           varying vec2 vGridXZ;
           varying float vGroundUp;
+          varying vec4 vSurface;
 
           // coverage of a 1-pixel line every "period" cells, faded out where
           // the cells get too small on screen to draw without aliasing
@@ -431,6 +511,11 @@ export class SceneManager {
         `)
         .replace('#include <map_fragment>', `
           #include <map_fragment>
+          // a surveyed site's surface: paving, yard, ditch bed... keeping a
+          // little of the texture's mottling so it does not read as flat paint
+          diffuseColor.rgb = mix(diffuseColor.rgb,
+                                 vSurface.rgb * (0.75 + 0.5 * diffuseColor.rgb.g),
+                                 1.0 - vSurface.w);
           // up-component of the normal: 0.985 is about 10 deg, 0.90 about 26
           float steep = 1.0 - smoothstep(0.90, 0.985, vGroundUp);
           vec3 earth = vec3(0.25, 0.19, 0.12);     // linear; sRGB ~ #8a7a62
@@ -733,19 +818,19 @@ export class SceneManager {
   }
 
   /** One tile roughly every 10 m, regardless of the map's physical size. */
-  private updateGroundTextureRepeat(sizeM: number): void {
-    const tiles = Math.max(1, Math.round(sizeM / 10));
-    this.groundTexture.repeat.set(tiles, tiles);
+  private updateGroundTextureRepeat(): void {
+    const tiles = (size: number) => Math.max(1, Math.round(size / 10));
+    this.groundTexture.repeat.set(tiles(this.terrain.sizeX), tiles(this.terrain.sizeZ));
   }
 
   /** Rebuild every piece of geometry whose resolution follows the grid. */
   private rebuildGridGeometry(): void {
-    const { sizeM, width, height } = this.terrain;
+    const { sizeM, sizeX, sizeZ, width, height } = this.terrain;
 
     this.terrainMesh.geometry.dispose();
-    this.terrainMesh.geometry = new THREE.PlaneGeometry(sizeM, sizeM, width, height);
+    this.terrainMesh.geometry = new THREE.PlaneGeometry(sizeX, sizeZ, width, height);
 
-    const waterGeometry = new THREE.PlaneGeometry(sizeM, sizeM, width, height);
+    const waterGeometry = new THREE.PlaneGeometry(sizeX, sizeZ, width, height);
     const sourceIndices = waterGeometry.index!.array;
     // Mirror whatever index width Three.js chose rather than assuming one.
     // 201x201 = 40 401 vertices still fits Uint16 (max 65 535), so the doubled
@@ -761,14 +846,14 @@ export class SceneManager {
     this.waterMesh.geometry.dispose();
     this.waterMesh.geometry = waterGeometry;
 
-    this.gridCell.value = sizeM / width;
+    this.gridCell.value = this.terrain.cellSize;
 
     // camera framing, fog and the sun's shadow frustum follow the world, see
     // the constructor note and configureSun()
     this.configureSun();
     this.scene.fog = new THREE.Fog(SKY_HORIZON, sizeM * 1.2, sizeM * 4);
     this.updateSkyDome(sizeM);
-    this.updateGroundTextureRepeat(sizeM);
+    this.updateGroundTextureRepeat();
     this.camera.far = sizeM * 6;
     this.camera.position.set(sizeM * 0.6, sizeM * 0.55, sizeM * 0.6);
     this.camera.updateProjectionMatrix();
@@ -829,7 +914,7 @@ export class SceneManager {
     }
     const heightAttribute = this.waterMesh.geometry.attributes.position as THREE.BufferAttribute;
     const grid = this.terrain.width + 1;
-    const half = this.terrain.sizeM / 2;
+    const halfX = this.terrain.sizeX / 2, halfZ = this.terrain.sizeZ / 2;
     const cell = this.terrain.cellSize;
     let emitted = 0;
     // stride keeps the scan cheap and the sampling even; the phase walks so the
@@ -844,9 +929,9 @@ export class SceneManager {
       if (u * u + v * v < SceneManager.SPRAY_SPEED_SQ) continue;
       const gx = i % grid;
       const gz = (i / grid) | 0;
-      this.sprayPositions[emitted * 3] = gx * cell - half + (Math.random() - 0.5) * cell;
+      this.sprayPositions[emitted * 3] = gx * cell - halfX + (Math.random() - 0.5) * cell;
       this.sprayPositions[emitted * 3 + 1] = heightAttribute.getZ(i) + 0.05 + Math.random() * 0.3;
-      this.sprayPositions[emitted * 3 + 2] = gz * cell - half + (Math.random() - 0.5) * cell;
+      this.sprayPositions[emitted * 3 + 2] = gz * cell - halfZ + (Math.random() - 0.5) * cell;
       emitted++;
     }
     (this.sprayPoints.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
@@ -919,10 +1004,9 @@ export class SceneManager {
   private lavaTempAt(x: number, z: number): number {
     if (!this.waterLavaTemp.length) return 0;
     const grid = this.terrain.width + 1;
-    const half = this.terrain.sizeM / 2;
-    const gx = Math.round((x + half) / this.terrain.cellSize);
-    const gz = Math.round((z + half) / this.terrain.cellSize);
-    if (gx < 0 || gx >= grid || gz < 0 || gz >= grid) return 0;
+    const gx = Math.round((x + this.terrain.sizeX / 2) / this.terrain.cellSize);
+    const gz = Math.round((z + this.terrain.sizeZ / 2) / this.terrain.cellSize);
+    if (gx < 0 || gx >= grid || gz < 0 || gz > this.terrain.height) return 0;
     return this.waterLavaTemp[gz * grid + gx];
   }
 
@@ -1048,7 +1132,11 @@ export class SceneManager {
       group = undefined;
       rebuilt = true;
     }
-    if (group && obj.type === 'BUILDING' && group.userData.floors !== obj.metadata.floors) {
+    // floors, or a surveyed outline and its height, shape the whole mesh
+    const buildingKey = obj.type === 'BUILDING'
+      ? JSON.stringify([obj.metadata.floors, obj.metadata.footprint ?? null,
+                        obj.metadata.height_m ?? null]) : null;
+    if (group && buildingKey !== null && group.userData.buildingKey !== buildingKey) {
       this.objectsRoot.remove(group);
       SceneManager.disposeSubtree(group);
       group = undefined;
@@ -1056,7 +1144,7 @@ export class SceneManager {
     }
     if (!group) {
       group = buildObjectMesh(obj);
-      if (obj.type === 'BUILDING') group.userData.floors = obj.metadata.floors;
+      if (buildingKey !== null) group.userData.buildingKey = buildingKey;
       if (pipeKey !== null) group.userData.pipeKey = pipeKey;
       if (sectionKey !== null) group.userData.sectionKey = sectionKey;
       if (pierKey !== null) group.userData.pierKey = pierKey;

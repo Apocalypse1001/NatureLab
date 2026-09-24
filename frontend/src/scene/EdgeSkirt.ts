@@ -57,7 +57,8 @@ export class EdgeSkirt {
   // per skirt-grid vertex, filled by buildGrid
   private nx = 0;
   private nz = 0;
-  private sizeM = 0;
+  private sizeX = 0;
+  private sizeZ = 0;
   private ground = new Float32Array(0);
   private mapIndex = new Int32Array(0);     // the map vertex this one continues
   private sideX = new Int8Array(0);         // -1 west, 0 inside, +1 east
@@ -217,7 +218,8 @@ export class EdgeSkirt {
    */
   private buildGrid(terrain: TerrainGrid): void {
     const W = terrain.width, H = terrain.height, cell = terrain.cellSize;
-    const size = terrain.sizeM, half = size / 2;
+    const size = terrain.sizeM;
+    const sizeX = terrain.sizeX, sizeZ = terrain.sizeZ;
     const reach = size * REACH_FACTOR;
     const cap = size * SLOPE_CAP_FACTOR;
     const n = STEPS;
@@ -226,10 +228,12 @@ export class EdgeSkirt {
     // Size, not only vertex count: the River (1 m cells) and Tsunami (10 m)
     // worlds are both 201 x 201, and reusing the water geometry across them
     // would leave its x/z at the other world's scale.
-    const resized = NX !== this.nx || NZ !== this.nz || size !== this.sizeM;
+    const resized = NX !== this.nx || NZ !== this.nz
+      || sizeX !== this.sizeX || sizeZ !== this.sizeZ;
     this.nx = NX;
     this.nz = NZ;
-    this.sizeM = size;
+    this.sizeX = sizeX;
+    this.sizeZ = sizeZ;
     const positions = new Float32Array(count * 3);
     const uvs = new Float32Array(count * 2);
     const colors = new Float32Array(count * 3);
@@ -238,7 +242,7 @@ export class EdgeSkirt {
     this.sideX = new Int8Array(count);
     this.sideZ = new Int8Array(count);
     this.outward = new Float32Array(count);
-    const axis = (t: number, cells: number) => {
+    const axis = (t: number, cells: number, half: number) => {
       if (t < n) {
         const out = this.offsets[n - t];
         return { coord: -(half + out), map: 0, out, side: -1 };
@@ -248,9 +252,9 @@ export class EdgeSkirt {
       return { coord: half + out, map: cells, out, side: 1 };
     };
     for (let b = 0; b < NZ; b++) {
-      const z = axis(b, H);
+      const z = axis(b, H, sizeZ / 2);
       for (let a = 0; a < NX; a++) {
-        const x = axis(a, W);
+        const x = axis(a, W, sizeX / 2);
         let y = terrain.at(x.map, z.map);
         if (x.side > 0) y += this.slopeE[z.map] * Math.min(x.out, cap);
         else if (x.side < 0) y += this.slopeW[z.map] * Math.min(x.out, cap);
@@ -262,8 +266,8 @@ export class EdgeSkirt {
         positions[v * 3 + 2] = z.coord;
         // the same UV mapping as the map's PlaneGeometry, so the grass tiles
         // run across the seam without a jump
-        uvs[v * 2] = (x.coord + half) / size;
-        uvs[v * 2 + 1] = (-z.coord + half) / size;
+        uvs[v * 2] = (x.coord + sizeX / 2) / sizeX;
+        uvs[v * 2 + 1] = (-z.coord + sizeZ / 2) / sizeZ;
         const out = Math.min(1, Math.max(x.out, z.out) / reach);
         colors[v * 3] = colors[v * 3 + 1] = colors[v * 3 + 2] = 1 - 0.25 * out;
         this.ground[v] = y;

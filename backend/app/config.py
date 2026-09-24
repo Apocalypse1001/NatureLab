@@ -74,6 +74,25 @@ FLUID_MANNING_N = 0.03           # s/m^(1/3): a clean, straight natural channel
 # otherwise invisible to the flow. Now a street sheds rain faster than the grass
 # beside it, which is the whole reason a town has streets.
 PAVEMENT_MANNING_N = 0.013       # asphalt in fair repair; Chow's tables: 0.012-0.016
+# Surface classes a surveyed world carries per terrain vertex (TerrainGrid.surface),
+# code -> (name, Manning n). Code 0 means "no class": the world's own baseline n.
+# The n are priors from the middle of the ranges the NL01 site package gives in
+# its simulation/materials.json (grass 0.03-0.15, compacted soil 0.02-0.06,
+# paving 0.011-0.02) -- starting values to calibrate, not measurements. The
+# class map is kept as codes rather than baked n so infiltration can read the
+# same map later.
+SURFACE_CLASSES = {
+    0: ("default", None),
+    1: ("grass", 0.07),
+    2: ("yard", 0.035),           # BGT "erf": a farmyard, mixed compacted ground
+    3: ("unpaved", 0.035),        # "onverhard": a dirt track
+    4: ("half_paved", 0.02),      # "half verhard": gravel, shell
+    5: ("open_paving", 0.015),    # "open verharding": brick pavers with joints
+    6: ("closed_paving", 0.013),  # "gesloten verharding": asphalt, concrete
+    7: ("water", 0.03),           # a ditch or pond bed: FLUID_MANNING_N
+    8: ("bank", 0.07),            # a grassed ditch side
+    9: ("planted", 0.1),          # "groenvoorziening": shrubs and borders
+}
 # Depth floor for the friction term -- a physics knob, not a guard against
 # dividing by zero. Held at 0.02 up to v0.18.1, which was a tuned number: every
 # cell of the street that has to carry rain to a storm grate is thinner than

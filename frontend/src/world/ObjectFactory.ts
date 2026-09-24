@@ -94,6 +94,37 @@ const METAL = () => new THREE.MeshStandardMaterial({
   color: 0x9aa3ad, roughness: 0.35, metalness: 0.7,
 });
 
+/**
+ * A BUILDING with a surveyed outline (a site world, tools/make_site_nl01.py):
+ * the footprint polygon extruded to `metadata.height_m`, flat-roofed. The
+ * outline is in the object's own frame, [x, z] metres, and is the same polygon
+ * the backend rasterizes into the obstacle mask -- so the walls drawn are the
+ * walls the water meets. Plain on purpose: these are stand-ins until a
+ * modelled building replaces them.
+ */
+function surveyedBuilding(obj: ObjectData, outline: number[][]): THREE.Group {
+  const height = Math.max(0.5, Number(obj.metadata.height_m ?? 6));
+  // shape y is -z: rotateX(-90 deg) below turns shape (x, y, extrude) into
+  // world (x, extrude, -y), so the extrusion rises and z comes out right
+  const shape = new THREE.Shape(outline.map(([x, z]) => new THREE.Vector2(x, -z)));
+  const walls = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false });
+  walls.rotateX(-Math.PI / 2);
+  const g = new THREE.Group();
+  const seed = variant(obj.id);
+  const body = new THREE.Mesh(walls, new THREE.MeshStandardMaterial({
+    color: tinted(OBJECT_COLORS.BUILDING, 0.10, seed), roughness: 0.85,
+  }));
+  body.castShadow = true;
+  body.receiveShadow = true;
+  const roofGeometry = new THREE.ShapeGeometry(shape);
+  roofGeometry.rotateX(-Math.PI / 2);
+  const roof = new THREE.Mesh(roofGeometry,
+    new THREE.MeshStandardMaterial({ color: 0x55504a, roughness: 0.9 }));
+  roof.position.y = height + 0.01;
+  g.add(body, roof);
+  return g;
+}
+
 const builders: Record<string, Builder> = {
   HOUSE: (obj) => {
     // 4 x 4 m base, 3 m walls, pyramid roof to 5 m. The base is exactly the
@@ -173,6 +204,8 @@ const builders: Record<string, Builder> = {
   // (the solver is depth-averaged; every SOLID_OBSTACLE_TYPES body is an
   // infinitely tall wall regardless of floors).
   BUILDING: (obj) => {
+    const outline = obj.metadata.footprint as number[][] | undefined;
+    if (Array.isArray(outline) && outline.length >= 3) return surveyedBuilding(obj, outline);
     const FLOOR_HEIGHT_M = 3.0;
     const ROOF_HEIGHT_M = 1.5;
     const BASE_HALF_EXTENT_M = 2.0;

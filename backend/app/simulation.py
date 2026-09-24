@@ -614,6 +614,7 @@ class SimulationManager:
         if self.status == self.RUNNING:
             raise ValueError("terrain editing is disabled while simulation is RUNNING")
         effective = river_valley(self.world.terrain, params)
+        self.world.terrain.surface = None   # a new valley is not the surveyed ground
         self.terrain_revision += 1
         # v0.18.0: keep the river's inlet and outlet bands on the channel, which
         # a meander moves off z = 0 at the edges (terrain_gen.river_valley)
@@ -630,6 +631,7 @@ class SimulationManager:
         if self.status == self.RUNNING:
             raise ValueError("terrain editing is disabled while simulation is RUNNING")
         effective = volcano_cone(self.world.terrain, params)
+        self.world.terrain.surface = None
         self.terrain_revision += 1
         return {"heights": self.world.terrain.to_list(),
                 "checksum": self.world.terrain.checksum(),

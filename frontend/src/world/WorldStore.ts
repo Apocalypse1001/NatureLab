@@ -40,6 +40,7 @@ export class WorldStore {
     this.terrain = new TerrainGrid(world.terrain.width, world.terrain.height,
                                    world.terrain.cell_size);
     this.terrain.loadHeights(world.terrain.heights);
+    this.terrain.surface = world.terrain.surface ? Uint8Array.from(world.terrain.surface) : null;
     this.objects = new Map(world.objects.map((o) => [o.id, o]));
     this.waterLevel = world.water.level;
     this.erosionEnabled = world.water.erosion_enabled ?? false;

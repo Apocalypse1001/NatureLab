@@ -1577,6 +1577,21 @@ ROCK_BASE_RADIUS_M = 1.5
 BRIDGE_SPAN_M = 24.0
 
 
+
+def _points_in_polygon(xs: np.ndarray, zs: np.ndarray, polygon) -> np.ndarray:
+    """Even-odd ray casting, vectorized over the points: True where (x, z) lies
+    inside `polygon` ([[x, z], ...], closed implicitly)."""
+    poly = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
+    inside = np.zeros(np.shape(xs), dtype=bool)
+    x0, z0 = poly[-1]
+    for x1, z1 in poly:
+        crosses = (z1 > zs) != (z0 > zs)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            at_x = (x0 - x1) * (zs - z1) / (z0 - z1) + x1
+        inside ^= crosses & (xs < at_x)
+        x0, z0 = x1, z1
+    return inside
+
 class FluidSolver:
     def initialize(self, world) -> None: ...
     def set_boundaries(self, terrain, obstacles: dict, terrain_revision=0,
@@ -1755,6 +1770,7 @@ class WarpShallowWaterSolver(FluidSolver):
         self._tsunami_period = 60.0
         self._seen_terrain_revision = -1
         self._seen_obstacle_revision = -1
+        self._seen_surface = None
         self.terrain_gpu_uploads = 0
         self.obstacle_gpu_uploads = 0
         self.last_substeps = 0
@@ -1913,6 +1929,7 @@ class WarpShallowWaterSolver(FluidSolver):
         self._sediment_in_m3 = 0.0
         self._seen_terrain_revision = -1
         self._seen_obstacle_revision = -1
+        self._seen_surface = None
         self.terrain_gpu_uploads = 1
         self.obstacle_gpu_uploads = 1
         self.last_substeps = 0
@@ -1972,6 +1989,7 @@ class WarpShallowWaterSolver(FluidSolver):
         piers = obstacles.get("pier_counts", [])
         pier_radii = obstacles.get("pier_radii", [])
         half_extents = obstacles.get("half_extents", [])
+        footprints = obstacles.get("footprints", [])
         for n, position in enumerate(positions):
             if n >= len(types) or not self._is_solid(types[n], bed_heights, n):
                 continue
@@ -2009,6 +2027,17 @@ class WarpShallowWaterSolver(FluidSolver):
                                                         / terrain.cell_size
                                                         + terrain.height / 2)))
             epsilon = 1.0e-6 * max(1.0, half_x, half_z, terrain.cell_size)
+            footprint = footprints[n] if n < len(footprints) else None
+            if footprint is not None and lo_i <= hi_i and lo_j <= hi_j:
+                # a surveyed outline: the cells whose centre lies inside it
+                rows, columns = np.mgrid[lo_j:hi_j + 1, lo_i:hi_i + 1]
+                dx = (columns - terrain.width / 2) * terrain.cell_size - center_x
+                dz = (rows - terrain.height / 2) * terrain.cell_size - center_z
+                local_x = (cos_yaw * dx + sin_yaw * dz) / float(scale[0])
+                local_z = (-sin_yaw * dx + cos_yaw * dz) / float(scale[2])
+                inside = _points_in_polygon(local_x, local_z, footprint)
+                mask[(rows * self._width + columns)[inside]] = 1
+                continue
             for row in range(lo_j, hi_j + 1):
                 world_z = (row - terrain.height / 2) * terrain.cell_size
                 for column in range(lo_i, hi_i + 1):
@@ -2049,6 +2078,15 @@ class WarpShallowWaterSolver(FluidSolver):
         """
         base = getattr(self, "_base_manning", config.FLUID_MANNING_N)
         field = np.full(self._count, base, dtype=np.float32)
+        surface = getattr(terrain, "surface", None)
+        if surface is not None and surface.size == self._count:
+            # a surveyed world's surface classes set the base, cell by cell;
+            # the objects below (a ROAD) still overwrite their own footprint
+            table = np.full(max(config.SURFACE_CLASSES) + 1, base, dtype=np.float32)
+            for code, (_, n) in config.SURFACE_CLASSES.items():
+                if n is not None:
+                    table[code] = n
+            field = table[surface.ravel()].astype(np.float32)
         positions = obstacles.get("positions", []) if obstacles else []
         if len(positions) == 0:
             return field
@@ -2271,21 +2309,30 @@ class WarpShallowWaterSolver(FluidSolver):
             if not np.array_equal(new_offset, self._bed_offset_host):
                 self._bed_offset_host = new_offset
                 self._bed_offset = wp.array(new_offset, dtype=float, device=self.device)
-            new_manning = self._build_manning_map(terrain, obstacles)
-            if not np.array_equal(new_manning, self._manning_host):
-                self._manning_host = new_manning
-                # While lava runs, `_lava_manning` owns this array and rewrites
-                # every cell each substep from mu(T); the surface map is kept on
-                # the host and handed back when lava stops. The two never apply
-                # at once, which costs nothing real: a volcano has no asphalt.
-                if not self._lava_enabled:
-                    self._manning.assign(new_manning)
+            self._update_manning(terrain, obstacles)
             self._seen_obstacle_revision = obstacle_revision
             self.obstacle_gpu_uploads += 1
             changed = True
+        elif getattr(terrain, "surface", None) is not self._seen_surface:
+            # a surveyed world's surface classes set the roughness too, and a
+            # generator that replaces the map drops them (without an obstacle
+            # revision, which is the only other thing that rebuilds this)
+            self._update_manning(terrain, obstacles)
+        self._seen_surface = getattr(terrain, "surface", None)
         if changed:
             self._recombine_bed()
             self._measure()
+
+    def _update_manning(self, terrain, obstacles: dict) -> None:
+        new_manning = self._build_manning_map(terrain, obstacles)
+        if not np.array_equal(new_manning, self._manning_host):
+            self._manning_host = new_manning
+            # While lava runs, `_lava_manning` owns this array and rewrites
+            # every cell each substep from mu(T); the surface map is kept on
+            # the host and handed back when lava stops. The two never apply
+            # at once, which costs nothing real: a volcano has no asphalt.
+            if not self._lava_enabled:
+                self._manning.assign(new_manning)
 
     def _measure_outlet_slope(self, heights, cell: float) -> None:
         """Per row, the bed slope falling toward the east edge (positive = down).

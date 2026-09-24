@@ -247,7 +247,8 @@ export class EditorController {
     // them apart, which is a far smaller problem than an object placed off
     // the terrain.
     const idx = this.store.objects.size;
-    const size = this.store.terrain.sizeM;
+    // the shorter side, so a grid sized on a 70 x 90 m site stays on it
+    const size = Math.min(this.store.terrain.sizeX, this.store.terrain.sizeZ);
     const spacing = size * 0.18;
     const margin = spacing * 0.5;
     const columns = Math.max(3, Math.floor((size - 2 * margin) / spacing) + 1);

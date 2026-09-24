@@ -341,6 +341,9 @@ class TerrainGrid:
     cell_size: float = config.TERRAIN_CELL_SIZE
     heights: np.ndarray = field(
         default_factory=lambda: np.zeros((config.TERRAIN_CELLS + 1, config.TERRAIN_CELLS + 1), dtype=np.float32))
+    # Optional per-vertex surface class (config.SURFACE_CLASSES), same shape as
+    # `heights`. None on every generated world; a surveyed site carries one.
+    surface: Optional[np.ndarray] = None
 
     @property
     def size_m(self) -> float:
@@ -397,6 +400,15 @@ class TerrainGrid:
             if not np.isfinite(arr).all():
                 raise ValueError("terrain heights must be finite")
             grid.heights = arr.reshape(grid.height + 1, grid.width + 1)
+        surface = data.get("surface")
+        if surface is not None:
+            expected = (grid.width + 1) * (grid.height + 1)
+            if not isinstance(surface, list) or len(surface) != expected:
+                raise ValueError(f"terrain.surface must contain {expected} values")
+            codes = np.asarray(surface, dtype=np.int64)
+            if not np.isin(codes, list(config.SURFACE_CLASSES)).all():
+                raise ValueError("terrain.surface holds an unknown surface class")
+            grid.surface = codes.astype(np.uint8).reshape(grid.height + 1, grid.width + 1)
         return grid
 
 
@@ -549,6 +561,7 @@ class WorldState:
     water: WaterState = field(default_factory=WaterState)
     objects: Dict[str, WorldObject] = field(default_factory=dict)
     environment: EnvironmentState = field(default_factory=EnvironmentState)
+    site: Optional[Dict[str, Any]] = None
     _counters: "itertools.count[int]" = field(default_factory=itertools.count, repr=False)
 
     # ------------------------------------------------------------------ objects
@@ -588,10 +601,15 @@ class WorldState:
             "version": 3,
             "terrain": {"width": self.terrain.width, "height": self.terrain.height,
                         "cell_size": self.terrain.cell_size,
-                        "heights": self.terrain.to_list()},
+                        "heights": self.terrain.to_list(),
+                        **({"surface": self.terrain.surface.ravel().tolist()}
+                           if self.terrain.surface is not None else {})},
             "water": self.water.to_dict(),
             "environment": self.environment.to_dict(),
             "objects": [o.to_dict() for o in self.objects.values()],
+            # Where a surveyed world came from (origin, datum, vertical offset,
+            # sources); carried through untouched, None on generated worlds.
+            **({"site": copy.deepcopy(self.site)} if self.site is not None else {}),
         }
 
     @staticmethod
@@ -600,6 +618,10 @@ class WorldState:
             raise ValueError("world must be a JSON object")
         state = WorldState()
         state.terrain = TerrainGrid.from_dict(data.get("terrain", {}))
+        site = data.get("site")
+        if site is not None and not isinstance(site, dict):
+            raise ValueError("site must be an object")
+        state.site = copy.deepcopy(site)
         water = data.get("water", {})
         # Everything under `water` is restored, including the two toggles that
         # were written to file but silently dropped on load before v0.12.0 --

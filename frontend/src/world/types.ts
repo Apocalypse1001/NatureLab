@@ -64,6 +64,9 @@ export interface TerrainData {
   height: number;
   cell_size: number;
   heights: number[];    // (width+1) * (height+1), row-major, z rows
+  /** Surface class per vertex (backend config.SURFACE_CLASSES), same order as
+   *  heights; only on a surveyed site. */
+  surface?: number[];
 }
 
 /** Beyond the open east edge: a sea or pool (free overfall), or a river running on. */
@@ -72,6 +75,9 @@ export type OutletKind = 'overfall' | 'river';
 export interface WorldData {
   version: number;
   terrain: TerrainData;
+  /** A surveyed world's provenance (tools/make_site_nl01.py); `parcel` is the
+   *  plot boundary as [x, z] metres. Absent on generated worlds. */
+  site?: { id?: string; parcel?: number[][]; [key: string]: unknown };
   water: { level: number; visible: boolean; erosion_enabled?: boolean;
            outflow_enabled?: boolean;
            // v0.12.0 river boundaries: part of the world, so a loaded world has

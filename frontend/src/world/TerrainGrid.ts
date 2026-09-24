@@ -5,6 +5,8 @@ export class TerrainGrid {
   readonly height: number;
   readonly cellSize: number;
   readonly heights: Float32Array; // (width+1) x (height+1), row-major by z
+  /** Surface class per vertex (a surveyed site), same order; null elsewhere. */
+  surface: Uint8Array | null = null;
 
   constructor(width = 100, height = 100, cellSize = 1) {
     this.width = width;
@@ -13,8 +15,20 @@ export class TerrainGrid {
     this.heights = new Float32Array((width + 1) * (height + 1));
   }
 
-  get sizeM(): number {
+  /** East-west extent, metres. */
+  get sizeX(): number {
     return this.width * this.cellSize;
+  }
+
+  /** North-south extent, metres. Equal to sizeX on every generated world; a
+   *  surveyed site (NL01, 70 x 90 m) is not square. */
+  get sizeZ(): number {
+    return this.height * this.cellSize;
+  }
+
+  /** The map's longer side: what fog, sun, sky and camera framing scale by. */
+  get sizeM(): number {
+    return Math.max(this.sizeX, this.sizeZ);
   }
 
   at(i: number, j: number): number {

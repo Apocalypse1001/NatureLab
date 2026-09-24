@@ -179,7 +179,25 @@ NON_COLLIDING_TYPES = frozenset({"GAUGE", "SECTION", "STORM_INLET", "OUTFALL", "
                                  "PIPE"})
 
 
+def building_footprint(obj: WorldObject):
+    """A BUILDING's surveyed outline, [[x, z], ...] metres in its own frame, or
+    None. Set by a site builder (tools/make_site_nl01.py) from a real footprint
+    that is no rectangle; a BUILDING without one is the parametric box."""
+    if obj.type != "BUILDING":
+        return None
+    points = obj.metadata.get("footprint")
+    if not isinstance(points, list) or len(points) < 3:
+        return None
+    return np.asarray(points, dtype=np.float64).reshape(-1, 2)
+
+
 def footprint_half_extents(obj: WorldObject) -> np.ndarray:
+    footprint = building_footprint(obj)
+    if footprint is not None:
+        # A surveyed outline: the box that holds it, in the object's own frame
+        # (the outline is centred on the object's position by its builder).
+        half = np.abs(footprint).max(axis=0)
+        return np.asarray((half[0] * obj.scale[0], half[1] * obj.scale[2]), dtype=np.float32)
     if obj.type == "BUILDING":
         # Parametric on `floors`, not a fixed lookup -- see config.py's BUILDING
         # section for why footprint (rather than a height-blind wall) is the
@@ -251,7 +269,9 @@ class PlaceholderRigidBodySystem(RigidBodySystem):
                  # (fluid_solver._build_obstacle_mask), so a BUILDING's
                  # floors-dependent extent reaches the solver instead of the
                  # rasterizer recomputing (and duplicating) it from scale alone.
-                 "half_extents": self.buffer.half_extents.copy()}
+                 "half_extents": self.buffer.half_extents.copy(),
+                 # a surveyed BUILDING's outline, rasterized as the polygon it is
+                 "footprints": [building_footprint(obj) for obj in objects]}
 
     def _resolve_collisions(self, dynamic: np.ndarray) -> None:
         count = len(self.buffer.ids)
