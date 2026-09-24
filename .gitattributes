@@ -1,0 +1,3 @@
+# Site packages are checked byte for byte against their MANIFEST.sha256
+# (tools/make_site_nl01.py): never convert their line endings.
+data/sites/** -text
