@@ -1,0 +1,19 @@
+{
+  "sample_point_rd_epsg28992_m": [
+    150375,
+    482925
+  ],
+  "soil": {
+    "code": "Mn35Av",
+    "name_nl": "Kalkrijke poldervaaggronden; lichte klei, profielverloop 5",
+    "map_collection": "Actualisatie met digitale bodemkartering 2018",
+    "scope_warning": "Regional soil map; not a parcel borehole or foundation investigation."
+  },
+  "groundwater_depth_below_ground_cm": {
+    "GHG_average_high": 67,
+    "GLG_average_low": 122,
+    "GVG_average_spring": null,
+    "GT_raw_class_value": "14",
+    "scope_warning": "50 m model cell; use as a prior/range, not as an on-site measurement."
+  }
+}

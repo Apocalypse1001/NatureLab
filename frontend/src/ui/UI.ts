@@ -110,6 +110,17 @@ export const SCENARIOS: { name: string; label: string; hint: string;
         + 'wait, to push the flow further' },
   // The sea the wave comes in over is the subject, and no object is on it:
   // kept on the whole-map view it always had.
+  // A surveyed plot (tools/make_site_nl01.py): the whole 70 x 90 m window
+  // is the subject, so the whole-map view.
+  { name: 'scenario_nl01', label: 'Plot NL01', frame: 'map', sections: ['Rain'],
+    hint: 'A real parcel: Buitenplaats Oosterwold 178, Almere (NL), 70 x 90 m '
+        + 'at 0.5 m from the AHN terrain model, its lowest point set to 0 '
+        + '(-5.07 m NAP). Surfaces and buildings come from the Dutch BGT map; '
+        + 'the yellow line is the parcel boundary. Nothing enters from the '
+        + 'edges -- rain is the only water: try 30 mm/h for an hour (R30_60) '
+        + "or 90 mm/h for 15 minutes (R90_15). The four gauges sit in the parcel's "
+        + 'hollows. Not modelled yet: soaking into the soil, the beds of the '
+        + 'pond and the ditch (they read as flat ground), drains' },
   { name: 'scenario_tsunami', label: 'Tsunami', frame: 'map',
     hint: 'The only kilometre-scale world here: 2 km across at 10 m cells, '
         + 'because how far the sea goes out is the drawdown divided by the '
@@ -1101,7 +1112,14 @@ export class UI {
        (v) => this.cb.updateObject(obj.id,
          { metadata: { ...obj.metadata, pier_radius: Math.max(0.3, Math.min(3, v)) } })],
     );
-    if (obj.type === 'BUILDING') fields.push(
+    // A surveyed outline (a site world) has a measured height instead of a
+    // floor count; drawn only -- to the solver every wall is infinitely tall.
+    if (obj.type === 'BUILDING' && Array.isArray(obj.metadata.footprint)) fields.push(
+      ['Height (m)', 'height_m', obj.metadata.height_m ?? 6,
+       (v) => this.cb.updateObject(obj.id,
+         { metadata: { ...obj.metadata, height_m: Math.max(0.5, Math.min(100, v)) } })],
+    );
+    else if (obj.type === 'BUILDING') fields.push(
       ['Floors', 'floors', obj.metadata.floors ?? 1,
        (v) => this.cb.updateObject(obj.id,
          { metadata: { ...obj.metadata, floors: Math.max(1, Math.round(v)) } })],

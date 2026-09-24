@@ -1,0 +1,23 @@
+{
+  "width_px": 140,
+  "height_px": 180,
+  "grid_resolution_m": [
+    0.5,
+    0.5
+  ],
+  "bounds_rd_epsg28992_m": [
+    150340.0,
+    482880.0,
+    150410.0,
+    482970.0
+  ],
+  "local_origin_rd_m": [
+    150340.0,
+    482880.0
+  ],
+  "z_min_nap_m": -5.070000171661377,
+  "z_max_nap_m": -3.3956000804901123,
+  "decode_formula": "z_nap_m = z_min_nap_m + pixel_uint16 / 65535 * (z_max_nap_m - z_min_nap_m)",
+  "nodata_handling": "Nearest valid AHN DTM sample; raw GeoTIFF remains unchanged in source/.",
+  "orientation": "PNG row 0 is north; x increases east; local y increases north."
+}

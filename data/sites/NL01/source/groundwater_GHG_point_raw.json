@@ -1,0 +1,1 @@
+{"type":"FeatureCollection","features":[{"type":"Feature","bbox":[150375,482925,150375,482925],"geometry":{"type":"Point","coordinates":[150375,482925]},"properties":{"value_list":"67"}}],"crs":{"properties":{"name":"urn:ogc:def:crs:EPSG::28992"},"type":"name"}}

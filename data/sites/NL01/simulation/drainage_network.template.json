@@ -1,0 +1,12 @@
+{
+  "schema": "naturelab.drainage-network.v0.1",
+  "site_id": "NL01",
+  "status": "not_surveyed",
+  "nodes": [],
+  "links": [],
+  "storage": [],
+  "outfalls": [],
+  "assumptions": [],
+  "warning": "No underground drainage geometry was found in the open dataset. Do not infer pipes from surface imagery."
+}
+

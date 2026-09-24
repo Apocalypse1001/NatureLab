@@ -30,6 +30,7 @@ export const RU: Record<string, string> = {
   'Dam': 'Плотина',
   'Volcano': 'Вулкан',
   'Tsunami': 'Цунами',
+  'Plot NL01': 'Участок NL01',
   'Scenario: {name}': 'Сценарий: {name}',
   'Loads a prepared world. Everything stays editable: brush the terrain, move objects, change the discharge.':
     'Загружает готовый мир. Всё остаётся редактируемым: правьте рельеф кистью, '
@@ -215,6 +216,7 @@ export const RU: Record<string, string> = {
   'Piers': 'Опоры',
   'Pier radius (m)': 'Радиус опоры (м)',
   'Floors': 'Этажи',
+  'Height (m)': 'Высота (м)',
   'Continue the pipe': 'Продолжить трубу',
 
   // -------------------------------------------------------------- readouts
@@ -310,4 +312,6 @@ export const RU: Record<string, string> = {
   'gpu_force_below_friction': 'сила меньше трения',
   'lava_contact': 'контакт с лавой',
   'water_reached_deck': 'вода дошла до настила',
+  "A real parcel: Buitenplaats Oosterwold 178, Almere (NL), 70 x 90 m at 0.5 m from the AHN terrain model, its lowest point set to 0 (-5.07 m NAP). Surfaces and buildings come from the Dutch BGT map; the yellow line is the parcel boundary. Nothing enters from the edges -- rain is the only water: try 30 mm/h for an hour (R30_60) or 90 mm/h for 15 minutes (R90_15). The four gauges sit in the parcel's hollows. Not modelled yet: soaking into the soil, the beds of the pond and the ditch (they read as flat ground), drains":
+    "Реальный участок: Buitenplaats Oosterwold 178, Алмере (Нидерланды), 70 × 90 м с шагом 0,5 м по модели рельефа AHN, нижняя точка принята за 0 (−5,07 м NAP). Покрытия и здания — из нидерландской карты BGT; жёлтая линия — граница участка. С краёв вода не поступает — единственный источник дождь: попробуйте 30 мм/ч в течение часа (R30_60) или 90 мм/ч 15 минут (R90_15). Четыре датчика стоят в понижениях участка. Пока не моделируется: впитывание в почву, дно пруда и канавы (они выглядят ровной землёй), дренаж",
 };

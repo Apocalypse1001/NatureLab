@@ -1,0 +1,25 @@
+schema: naturelab.expected-results.v0.1
+site_id: NL01
+baseline:
+  terrain_hash_required: true
+  deterministic_reset: true
+  initial_water_depth_m: 0.0
+acceptance:
+  no_phantom_water: true
+  mass_balance_relative_error_max: 0.01
+  negative_depth_tolerance_m: 1.0e-6
+  dry_cells_must_remain_finite: true
+  report_cfl_or_stability_metric: true
+  report_boundary_fluxes: true
+outputs:
+  - water_depth
+  - velocity_xy
+  - flow_direction
+  - infiltration
+  - boundary_outflow
+  - mass_balance
+  - sensor_timeseries
+notes:
+  - Thresholds are development acceptance targets, not regulatory certification.
+  - Add scenario-specific expected ranges only after a validated baseline run.
+

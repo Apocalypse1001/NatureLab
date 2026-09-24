@@ -4247,5 +4247,178 @@ class SewerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({"STORM_INLET", "OUTFALL", "PIPE"} <= NON_COLLIDING_TYPES)
 
 
+
+class SiteWorldTests(unittest.IsolatedAsyncioTestCase):
+    """A surveyed plot: a non-square half-metre grid, surface classes, surveyed
+    building outlines, and the NL01 baseline (tools/make_site_nl01.py)."""
+
+    # sha256 of the terrain and the surface map in data/scenario_nl01.json. The
+    # site package's rule is that the measured DTM is the baseline and does not
+    # move; a change here means the builder or its inputs changed.
+    NL01_TERRAIN_SHA256 = "c7ca069bae73d1455a34d6f0feb645f018a8919178e4471c7eba62f40f09dacf"
+    NL01_SURFACE_SHA256 = "f57c4f630e3c0b7608ab376c7a8e7fba3aaf42c3a7343c5fd0641f31adff0194"
+
+    async def asyncSetUp(self) -> None:
+        self.manager = SimulationManager()
+
+    async def asyncTearDown(self) -> None:
+        self.manager.stop()
+        await asyncio.sleep(0)
+
+    @staticmethod
+    def _plot(width: int = 139, height: int = 179, cell: float = 0.5) -> WorldState:
+        from app.world_state import TerrainGrid
+        world = WorldState()
+        world.terrain = TerrainGrid(width=width, height=height, cell_size=cell)
+        jj, ii = np.mgrid[0:height + 1, 0:width + 1]
+        world.terrain.heights = (1.5 - 0.005 * ii - 0.0025 * jj).astype(np.float32)
+        world.water.level = 0.0
+        world.water.edge_inflow_enabled = False
+        return world
+
+    async def test_non_square_world_runs_edits_and_round_trips(self) -> None:
+        self.manager.world = self._plot()
+        self.manager.apply_rain({"intensity_mm_h": 90.0})
+        self.manager.start()
+        for _ in range(120):
+            self.manager._step_once()
+        # rain over (w+1)(h+1) cells of 0.25 m2 for 2 s, all of it on the map
+        expected = 90.0 / 3600.0 / 1000.0 * 140 * 180 * 0.25 * 2.0
+        diagnostics = self.manager.fluid.diagnostics()
+        self.assertAlmostEqual(diagnostics["volume_m3"], expected, delta=0.01 * expected)
+        before = self.manager.world.terrain.height_at(10.25, 30.25)
+        self.manager.apply_terrain_brush(10.25, 30.25, 2.0, -0.3)
+        self.assertAlmostEqual(self.manager.world.terrain.height_at(10.25, 30.25), before - 0.3, places=3)
+        again = WorldState.from_dict(json.loads(json.dumps(self.manager.world.to_dict())))
+        self.assertEqual((again.terrain.width, again.terrain.height), (139, 179))
+        self.assertEqual(again.terrain.checksum(), self.manager.world.terrain.checksum())
+        self.manager.reset()
+        self.assertAlmostEqual(self.manager.world.terrain.height_at(10.25, 30.25), before, places=4)
+
+    async def test_surveyed_outline_rasterizes_as_its_shape(self) -> None:
+        world = self._plot(100, 100, 0.5)
+        building = world.add_object("BUILDING", [0.0, 0.0, 0.0])
+        # an L: 10 x 10 m with the north-east 5 x 5 m quarter missing
+        building.metadata["footprint"] = [[-5, -5], [5, -5], [5, 0], [0, 0], [0, 5], [-5, 5]]
+        building.metadata["height_m"] = 4.0
+        self.manager.world = world
+        self.manager.start()
+        mask = self.manager.fluid._obstacle_host.reshape(101, 101)
+
+        def solid(x: float, z: float) -> int:
+            return int(mask[int(round(z / 0.5 + 50)), int(round(x / 0.5 + 50))])
+
+        self.assertEqual(solid(-2.5, -2.5), 1)
+        self.assertEqual(solid(2.5, -2.5), 1)
+        self.assertEqual(solid(-2.5, 2.5), 1)
+        self.assertEqual(solid(2.5, 2.5), 0, "the missing quarter of the L is solid")
+        # 75 m2 of L at 0.25 m2 per cell, give or take the outline's own cells
+        self.assertAlmostEqual(int(mask.sum()) * 0.25, 75.0, delta=6.0)
+
+    async def test_surface_classes_set_the_roughness_and_a_road_still_wins(self) -> None:
+        world = self._plot(100, 100, 0.5)
+        surface = np.full((101, 101), 1, dtype=np.uint8)          # grass
+        surface[:, 60:] = 6                                          # asphalt east of x = 5
+        world.terrain.surface = surface
+        world.add_object("ROAD", [-15.0, 0.0, 0.0])
+        self.manager.world = world
+        self.manager.start()
+        n = self.manager.fluid._manning_host.reshape(101, 101)
+        self.assertAlmostEqual(float(n[50, 70]), config.SURFACE_CLASSES[6][1], places=6)
+        self.assertAlmostEqual(float(n[10, 45]), config.SURFACE_CLASSES[1][1], places=6)
+        self.assertAlmostEqual(float(n[50, 20]), config.PAVEMENT_MANNING_N, places=6)
+        # a generator replaces the map, and its surface goes with it -- in the
+        # solver's roughness too, not only in the world
+        self.manager.pause()
+        self.manager.reset()
+        self.manager.apply_terrain_river({})
+        self.assertIsNone(self.manager.world.terrain.surface)
+        self.manager.start()
+        self.manager._step_once()
+        n = self.manager.fluid._manning_host.reshape(101, 101)
+        self.assertNotAlmostEqual(float(n[50, 70]), config.SURFACE_CLASSES[6][1], places=6)
+
+    async def test_surface_and_site_survive_save_load_and_reset(self) -> None:
+        world = self._plot()
+        world.terrain.surface = np.full((180, 140), 2, dtype=np.uint8)
+        world.site = {"id": "T", "parcel": [[0, 0], [1, 0], [1, 1]]}
+        again = WorldState.from_dict(json.loads(json.dumps(world.to_dict())))
+        self.assertTrue(np.array_equal(again.terrain.surface, world.terrain.surface))
+        self.assertEqual(again.site, world.site)
+        self.manager.world = world
+        self.manager.start()
+        self.manager.reset()
+        self.assertTrue(np.array_equal(self.manager.world.terrain.surface, world.terrain.surface))
+        self.assertEqual(self.manager.world.site["id"], "T")
+        bad = world.to_dict()
+        bad["terrain"]["surface"][0] = 99
+        with self.assertRaises(ValueError):
+            WorldState.from_dict(bad)
+
+    async def test_nl01_baseline_is_the_measured_terrain(self) -> None:
+        import csv
+        import hashlib
+        from shapely import contains_xy
+        from shapely.geometry import Polygon
+        self.manager.load("scenario_nl01")
+        world = self.manager.world
+        terrain = world.terrain
+        self.assertEqual((terrain.width, terrain.height, terrain.cell_size), (139, 179, 0.5))
+        self.assertEqual(terrain.checksum(), self.NL01_TERRAIN_SHA256)
+        self.assertEqual(hashlib.sha256(np.ascontiguousarray(terrain.surface).tobytes()).hexdigest(),
+                         self.NL01_SURFACE_SHA256)
+        # every vertex is the package's NAP height, shifted by the stated offset
+        offset = world.site["vertical_offset_m"]
+        grid = ROOT / "data" / "sites" / "NL01" / "processed" / "terrain_grid_local.csv"
+        parcel = Polygon([(x + 35.0, 45.0 - z) for x, z in world.site["parcel"]])
+        worst = 0.0
+        east, north, height = [], [], []
+        with open(grid, encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                x_local, y_local = float(row["x_local_m"]), float(row["y_local_m"])
+                i, j = int(round((x_local - 35.0) / 0.5 + 69.5)), int(round((45.0 - y_local) / 0.5 + 89.5))
+                h = float(terrain.heights[j, i])
+                worst = max(worst, abs(h + offset - float(row["z_nap_m"])))
+                if row["source_valid"] == "1" and contains_xy(parcel, x_local, y_local):
+                    east.append(x_local)
+                    north.append(y_local)
+                    height.append(h)
+        self.assertLess(worst, 1e-5)
+        # not mirrored: the plane through the parcel, in world terms, falls the
+        # way the package says (processed/site_summary.json)
+        design = np.column_stack([east, north, np.ones(len(east))])
+        (a, b, _), *_ = np.linalg.lstsq(design, np.array(height), rcond=None)
+        grade = math.hypot(a, b)
+        self.assertAlmostEqual(-a / grade, 0.744684, places=4)
+        self.assertAlmostEqual(-b / grade, 0.667417, places=4)
+        self.assertAlmostEqual(grade * 100.0, 1.2471, places=3)
+        self.assertAlmostEqual(max(height) - min(height), 1.6465, places=3)
+        # and the world's own axes agree: north is -z, so going north (z down)
+        # from the parcel's south-west to its north-east corner goes downhill
+        self.assertGreater(terrain.height_at(-10.0, 20.0), terrain.height_at(10.0, -10.0))
+
+    async def test_nl01_builder_reproduces_the_scenario(self) -> None:
+        sys.path.insert(0, str(ROOT / "tools"))
+        import make_site_nl01
+        built = make_site_nl01.build()
+        self.assertEqual(built.terrain.checksum(), self.NL01_TERRAIN_SHA256)
+        self.manager.load("scenario_nl01")
+        self.assertEqual(json.dumps(built.to_dict(), sort_keys=True),
+                         json.dumps(self.manager.world.to_dict(), sort_keys=True))
+
+    async def test_nl01_rain_keeps_its_mass_balance(self) -> None:
+        # the package's acceptance: relative mass balance error <= 1 %
+        self.manager.load("scenario_nl01")
+        self.manager.apply_rain({"intensity_mm_h": 90.0})
+        self.manager.start()
+        for _ in range(int(60 / config.FIXED_DT)):
+            self.manager._step_once()
+        volume = self.manager.fluid.diagnostics()["volume_m3"]
+        rain = float(self.manager.fluid._rain_added_m3)
+        out = float(self.manager.fluid._removed_m3)
+        self.assertAlmostEqual(rain, 90.0 / 3600.0 / 1000.0 * 140 * 180 * 0.25 * 60.0, delta=0.01)
+        self.assertLess(abs(rain - out - volume) / rain, 0.01)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

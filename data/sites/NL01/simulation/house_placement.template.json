@@ -1,0 +1,19 @@
+{
+  "schema": "naturelab.house-placement.v0.1",
+  "site_id": "NL01",
+  "model_file": null,
+  "model_format": null,
+  "transform_local_m": {
+    "translation_xyz": [0.0, 0.0, 0.0],
+    "rotation_xyz_deg": [0.0, 0.0, 0.0],
+    "scale_xyz": [1.0, 1.0, 1.0]
+  },
+  "foundation": {
+    "type": null,
+    "footprint_file": null,
+    "finished_floor_level_local_m": null
+  },
+  "roof_catchments": [],
+  "notes": "Populate only after terrain baseline validation. Keep model in metres and document finished floor level."
+}
+

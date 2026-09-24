@@ -1,0 +1,46 @@
+{
+  "site_id": "NL01",
+  "site_name": "NatureLab Reference Plot NL-01",
+  "address": "Buitenplaats Oosterwold 178, 1349 CP Almere, Netherlands",
+  "cadastral_id": "AMR04-C-2426",
+  "centroid_wgs84": [
+    5.31934583,
+    52.33421731
+  ],
+  "source_crs": "EPSG:28992",
+  "local_origin_rd_m": [
+    150340.0,
+    482880.0
+  ],
+  "registered_area_m2": 1120,
+  "polygon_area_from_geometry_m2": 1120.292,
+  "perimeter_from_geometry_m": 140.541,
+  "bbox_span_m": [
+    35.376,
+    58.737
+  ],
+  "maximum_span_m": 58.794,
+  "dtm": {
+    "resolution_m": 0.5,
+    "plot_valid_fraction": 0.907874,
+    "min_nap_m": -5.07,
+    "p05_nap_m": -4.603,
+    "median_nap_m": -3.926,
+    "mean_nap_m": -4.0055,
+    "p95_nap_m": -3.7667,
+    "max_nap_m": -3.4235,
+    "relief_m": 1.6465,
+    "best_fit_plane_grade_percent": 1.2471,
+    "best_fit_plane_angle_deg": 0.7145,
+    "downhill_unit_vector_xy": [
+      0.744684,
+      0.667417
+    ]
+  },
+  "quality_notes": [
+    "Cadastral geometry is suitable for simulation but not a legal boundary survey.",
+    "Raw AHN NoData cells are preserved in source and nearest-neighbour filled only in processed assets.",
+    "Soil and groundwater products are regional models, not geotechnical boreholes on the parcel.",
+    "Existing structures visible in current data are not automatically removed from the measured terrain baseline."
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "schema": "naturelab.scene.v0.1",
+  "scene_id": "NL01_BASELINE",
+  "coordinate_system": {
+    "source_crs": "EPSG:28992",
+    "local_origin_rd_m": [
+      150340.0,
+      482880.0
+    ],
+    "axis": "x=east, y=north, z=up",
+    "units": "m",
+    "vertical_datum": "NAP"
+  },
+  "terrain": {
+    "raw_dtm": "../source/terrain_AHN_DTM_0.5m.tif",
+    "heightmap": "../processed/heightmap_16bit.png",
+    "heightmap_metadata": "../processed/heightmap_metadata.json",
+    "mesh": "../processed/terrain_context.obj",
+    "parcel_mesh": "../processed/terrain_parcel_only.obj",
+    "parcel": "../processed/parcel_local.geojson"
+  },
+  "surface_layers": {
+    "orthophoto": "../source/orthophoto_current_HR.png",
+    "buildings": "../source/bgt_pand_context.geojson",
+    "water": [
+      "../source/bgt_waterdeel_context.geojson",
+      "../source/bgt_ondersteunendwaterdeel_context.geojson"
+    ],
+    "roads": [
+      "../source/bgt_wegdeel_context.geojson",
+      "../source/bgt_ondersteunendwegdeel_context.geojson"
+    ],
+    "vegetation": "../source/bgt_begroeidterreindeel_context.geojson"
+  },
+  "objects": {
+    "house": null,
+    "foundation": null,
+    "roof_catchments": [],
+    "drainage_network": null
+  },
+  "baseline_policy": "Keep measured terrain immutable. Store grading, house, foundation and drainage as explicit scenario layers."
+}

@@ -1,0 +1,36 @@
+{
+  "units": {
+    "intensity": "mm/h",
+    "duration": "min"
+  },
+  "synthetic_test_storms": [
+    {
+      "id": "R10_60",
+      "intensity": 10,
+      "duration": 60
+    },
+    {
+      "id": "R30_60",
+      "intensity": 30,
+      "duration": 60
+    },
+    {
+      "id": "R60_30",
+      "intensity": 60,
+      "duration": 30
+    },
+    {
+      "id": "R90_15",
+      "intensity": 90,
+      "duration": 15
+    }
+  ],
+  "observed_weather_file": "../processed/weather_KNMI_269_hourly.csv",
+  "observed_extremes": {
+    "1h": 26.0,
+    "3h": 37.3,
+    "6h": 51.8,
+    "24h": 53.7
+  },
+  "warning": "Synthetic storms are diagnostic scenarios, not statutory Dutch design events."
+}

@@ -207,6 +207,7 @@ function applyWorld(world: WorldData, simStatus: string, op?: string,
   currentSimStatus = simStatus;
   currentGravity = world.environment?.gravity ?? 9.81;
   store.replaceWorld(world);
+  sceneManager.setSiteOutline(world.site?.parcel ?? null);
   sceneManager.rebuildTerrain(store.terrain);
   tsunamiWorld = world.water.tsunami_enabled ?? false;
   const modes = edgeWaterModes(world.water.outflow_enabled ?? true, world.water.outlet_kind,

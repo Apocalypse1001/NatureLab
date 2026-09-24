@@ -1,0 +1,47 @@
+{
+  "soil_source": "../processed/soil_and_groundwater_summary.json",
+  "surface_defaults": {
+    "grass": {
+      "manning_n_range": [
+        0.03,
+        0.15
+      ],
+      "infiltration_m_s_range": [
+        1e-07,
+        5e-06
+      ]
+    },
+    "compacted_soil": {
+      "manning_n_range": [
+        0.02,
+        0.06
+      ],
+      "infiltration_m_s_range": [
+        1e-08,
+        1e-06
+      ]
+    },
+    "paving": {
+      "manning_n_range": [
+        0.011,
+        0.02
+      ],
+      "infiltration_m_s_range": [
+        0.0,
+        1e-08
+      ]
+    },
+    "roof": {
+      "manning_n_range": [
+        0.01,
+        0.02
+      ],
+      "infiltration_m_s_range": [
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "calibration_required": true,
+  "warning": "Ranges are initial sensitivity bounds, not measured parcel parameters."
+}

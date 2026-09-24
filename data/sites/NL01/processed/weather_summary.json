@@ -1,0 +1,22 @@
+{
+  "station": {
+    "id": 269,
+    "name": "Lelystad Airport",
+    "lon": 5.52,
+    "lat": 52.458,
+    "altitude_m": -3.7
+  },
+  "period_requested": [
+    "2025-01-01T01:00:00Z",
+    "2026-09-23T00:00:00Z"
+  ],
+  "rows": 15072,
+  "total_precipitation_mm": 1153.1,
+  "maximum_rolling_precipitation_mm": {
+    "1h": 26.0,
+    "3h": 37.3,
+    "6h": 51.8,
+    "24h": 53.7
+  },
+  "warning": "Observed station data are not a design storm and KNMI notes possible inhomogeneity for trend analysis."
+}
