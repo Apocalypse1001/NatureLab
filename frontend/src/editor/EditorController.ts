@@ -12,7 +12,6 @@ export class EditorController {
   tool: Tool = 'select';
   brushRadius = 6;
   brushStrength = 0.4;
-  terrainEditingEnabled = true;
   /** v0.17.0: diameter of the next pipe laid, metres. */
   pipeDiameter = 0.2;
   /** Told of every tool change -- a click, Esc, a finished pipe -- for the HUD. */
@@ -137,9 +136,13 @@ export class EditorController {
       return;
     }
     if (e.key === 'Delete' || e.key === 'Backspace') this.deleteSelected();
-    else if (e.key === 'w') this.transform.setMode('translate');
-    else if (e.key === 'e') this.transform.setMode('rotate');
-    else if (e.key === 'r') this.transform.setMode('scale');
+    // By physical key, not by character: with a Russian layout W/E/R type
+    // ц/у/к, and with Caps Lock or Shift they type W/E/R -- `e.key` matched
+    // neither, so the gizmo never changed mode. Ctrl+R (reload) is not a mode.
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.code === 'KeyW') this.transform.setMode('translate');
+    else if (e.code === 'KeyE') this.transform.setMode('rotate');
+    else if (e.code === 'KeyR') this.transform.setMode('scale');
   }
 
   // ------------------------------------------------------------------ actions
@@ -264,7 +267,6 @@ export class EditorController {
   }
 
   private applyBrush(): void {
-    if (!this.terrainEditingEnabled) return;
     const point = this.scene.pickTerrain(this.pointer);
     if (!point) return;
     const sign = this.tool === 'raise' ? 1 : -1;

@@ -538,10 +538,78 @@ class Physics04Tests(unittest.IsolatedAsyncioTestCase):
         finally:
             still.stop()
 
-    async def test_running_terrain_edit_is_rejected(self) -> None:
+    async def test_running_terrain_brush_reaches_the_solver(self) -> None:
+        # v0.19.1: the brush works while RUNNING and the solver has the new bed
+        # before the next step, not at the next resync
+        self.manager.start()
+        for _ in range(5):
+            self.manager._step_once()
+        before = self.manager.world.terrain.height_at(10, 0)
+        self.manager.apply_terrain_brush(10, 0, 5, -1.0)
+        after = self.manager.world.terrain.height_at(10, 0)
+        self.assertAlmostEqual(after, before - 1.0, places=3)
+        bed = self.manager.fluid.get_terrain_heights()
+        np.testing.assert_allclose(
+            bed, self.manager.world.terrain.heights.ravel(), atol=1e-6)
+
+    async def test_running_terrain_brush_keeps_erosion(self) -> None:
+        # the stroke lands on the GPU bed, so erosion outside it survives
+        self.manager.apply_water_level(1.5)
+        self.manager.apply_water_erosion(True)
+        self.manager.start()
+        for _ in range(600):
+            self.manager._step_once()
+        eroded = self.manager.fluid.get_terrain_heights().copy()
+        self.assertGreater(float(np.abs(eroded - self.manager.initial.terrain.heights.ravel()).max()),
+                           1e-5, "no erosion happened, the test measures nothing")
+        self.manager.apply_terrain_brush(40, 40, 4, -0.5)
+        now = self.manager.fluid.get_terrain_heights()
+        grid = now.reshape(self.manager.world.terrain.heights.shape)
+        far = np.ones_like(grid, dtype=bool)
+        width = self.manager.world.terrain.width
+        ci = 40 / self.manager.world.terrain.cell_size + width / 2
+        far[int(ci) - 6:int(ci) + 7, int(ci) - 6:int(ci) + 7] = False
+        np.testing.assert_allclose(grid[far], eroded.reshape(grid.shape)[far], atol=1e-6)
+
+    async def test_running_terrain_generators_are_rejected(self) -> None:
         self.manager.start()
         with self.assertRaisesRegex(ValueError, "disabled"):
-            self.manager.apply_terrain_brush(0, 0, 5, 0.2)
+            self.manager.apply_terrain_river({})
+        with self.assertRaisesRegex(ValueError, "disabled"):
+            self.manager.apply_terrain_volcano({})
+
+    async def test_terrain_brush_reseats_resting_objects(self) -> None:
+        house = self.manager.apply_object_add({"type": "HOUSE", "position": [0, 0, 0]})
+        bridge = self.manager.apply_object_add({"type": "BRIDGE", "position": [0, 0, 8]})
+        lifted = self.manager.apply_object_add({"type": "BOX", "position": [-4, 3, 0]})
+        patch = self.manager.apply_terrain_brush(0, 0, 14, -2.0)
+        moved = {m["id"]: m["position"] for m in patch["moved"]}
+        ground = self.manager.world.terrain.height_at(0, 0)
+        self.assertLess(ground, -1.9)
+        self.assertIn(house["id"], moved)
+        self.assertAlmostEqual(moved[house["id"]][1], ground, places=4)
+        self.assertAlmostEqual(self.manager.world.objects[house["id"]].position[1], ground, places=4)
+        self.assertNotIn(bridge["id"], moved)       # a deck spans what is dug under it
+        self.assertNotIn(lifted["id"], moved)       # it was not standing on the ground
+
+    async def test_paused_terrain_brush_flushes_the_water_on_the_new_bed(self) -> None:
+        # the old surface used to hang over a dug trench until PLAY
+        self.manager.apply_water_level(1.5)
+        self.manager.start()
+        for _ in range(300):
+            self.manager._step_once()
+        self.manager.pause()
+        await self.manager._stream()
+        self.binary_frames.clear()
+        self.manager.apply_terrain_brush(-90, 0, 6, -2.0)
+        await self.manager._stream()
+        self.assertTrue(self.binary_frames, "no frame after a paused brush stroke")
+        field = self.manager.fluid.get_water_height_field()
+        terrain = self.manager.world.terrain
+        idx = int(terrain.height / 2) * (terrain.width + 1) + int(-90 / terrain.cell_size + terrain.width / 2)
+        depth = float(self.manager.fluid._h.numpy()[idx])
+        self.assertGreater(depth, 0.1)
+        self.assertAlmostEqual(float(field[idx]), float(terrain.heights.ravel()[idx]) + depth, places=4)
 
     async def test_dry_runtime_edge_source_creates_flow(self) -> None:
         self.manager.apply_water_level(0.0)

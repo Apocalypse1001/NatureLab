@@ -208,9 +208,12 @@ Writes `releases/NatureLab_v<version>.zip` (frontend `dist/` included, `.git`/
   hidden by *dropping their triangles from the index*, not by a Z nudge or an alpha fade.
   There is no render-side exaggeration constant any more — if the water looks wrong,
   suspect the physics, not a display multiplier.
-- **Terrain edits are rejected while RUNNING.** `test_running_terrain_edit_is_rejected`
-  asserts this. It becomes a live question once erosion lands (erosion mutates terrain
-  every tick by definition) — the ban should then apply to the user's brush, not the solver.
+- **The brush works while RUNNING (v0.19.1); the generators do not.** A stroke reads the
+  GPU bed back first (`get_terrain_heights`), so erosion and lava crust survive it, then
+  calls `set_boundaries` and flushes one water frame -- without that flush a PAUSED view
+  kept the old water surface hanging over a dug trench. Objects resting on the ground in
+  the stroke are re-seated and come back in the reply as `moved`.
+  `test_running_terrain_brush_*` assert all of it.
 - **`terrain_revision` / `obstacle_revision` gate every GPU upload.** A test asserts the
   upload counters stay at 2/2 across 600 unchanged steps. Anything that needs to mutate
   `bed` per tick (erosion) must own the GPU array rather than bumping the revision.

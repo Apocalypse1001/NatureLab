@@ -14,7 +14,10 @@ interface Handlers {
   onSaved?: (name: string, path: string) => void;
   onError?: (message: string) => void;
   onObjectAdded?: (obj: ObjectData) => void;
-  onTerrainPatch?: (heights: number[], checksum: string) => void;
+  /** `moved`: objects that stood on the ground inside a brush stroke and
+   *  were set back on it (absent for erosion resyncs and generators). */
+  onTerrainPatch?: (heights: number[], checksum: string,
+                    moved: { id: string; position: number[] }[]) => void;
   // v0.17.0: a pipe edit, with every object it created or changed
   onPipe?: (objects: ObjectData[], sewer: SewerLinkState[]) => void;
 }
@@ -95,7 +98,8 @@ export class BackendClient {
         break;
       case 'terrain_patch':
         if (Array.isArray(msg.heights) && typeof msg.checksum === 'string') {
-          this.handlers.onTerrainPatch?.(msg.heights as number[], msg.checksum);
+          this.handlers.onTerrainPatch?.(msg.heights as number[], msg.checksum,
+            (msg.moved ?? []) as { id: string; position: number[] }[]);
         }
         break;
       case 'pipe':

@@ -530,10 +530,31 @@ class SimulationManager:
             self.obstacle_revision += 1
             self._obstacle_snapshot = None
 
+    # What a brush stroke carries down with the ground: things that stand on it.
+    # A BRIDGE spans a channel and must not drop into the one being dug under
+    # it; a PIPE is its route (redrawn against the terrain by the frontend), and
+    # the sewer nodes it joins keep their pipe ends where they are.
+    _BRUSH_SKIPS = frozenset({"BRIDGE", "PIPE"}) | frozenset(sewer.SEWER_TYPES)
+    _RESTING_TOLERANCE_M = 0.05
+
     def apply_terrain_brush(self, x: float, z: float, radius: float,
                             strength: float) -> Dict[str, Any]:
-        if self.status == self.RUNNING:
-            raise ValueError("terrain editing is disabled while simulation is RUNNING")
+        """A brush stroke -- IDLE, PAUSED and, since v0.19.1, RUNNING.
+
+        While a run exists the solver owns the bed on the GPU: erosion and
+        frozen lava change it every tick and the host copy is only refreshed
+        once a second (TERRAIN_RESYNC_INTERVAL_S). So the GPU bed is read back
+        first and the stroke lands on THAT; brushing the host copy and
+        re-uploading it would wipe up to a second of erosion. The new bed then
+        goes to the solver at once, and one water frame is flushed, so a PAUSED
+        view shows the water on the new ground (`bed + h`, what resume will
+        use) instead of the old surface hanging over a dug trench.
+
+        Objects standing on the ground inside the stroke follow it, so a house
+        does not hover over a cut or sink into a mound.
+        """
+        if getattr(self, "_settling", False):
+            raise ValueError("the river is settling; wait for it to finish")
         x = finite_number(x, "terrain.x")
         z = finite_number(z, "terrain.z")
         radius = finite_number(radius, "terrain.radius")
@@ -542,10 +563,46 @@ class SimulationManager:
             raise ValueError("terrain.radius out of range")
         if abs(strength) > 10.0:
             raise ValueError("terrain.strength out of range")
-        self.world.terrain.brush(x, z, radius, strength)
+        terrain = self.world.terrain
+        solver_live = getattr(self.fluid, "_h", None) is not None
+        if solver_live and hasattr(self.fluid, "get_terrain_heights"):
+            bed = self.fluid.get_terrain_heights()
+            if bed.size == terrain.heights.size:
+                terrain.heights = bed.reshape(terrain.heights.shape)
+        ground_before = {oid: terrain.height_at(obj.position[0], obj.position[2])
+                         for oid, obj in self.world.objects.items()}
+        terrain.brush(x, z, radius, strength)
         self.terrain_revision += 1
-        return {"heights": self.world.terrain.to_list(),
-                "checksum": self.world.terrain.checksum()}
+        moved = self._reseat_on_terrain(ground_before)
+        if solver_live:
+            if self._obstacle_snapshot is None:
+                self._obstacle_snapshot = self.rigid.obstacle_snapshot()
+            self.fluid.set_boundaries(terrain, self._obstacle_snapshot,
+                                      self.terrain_revision, self.obstacle_revision)
+            self._flush_final_frame = True
+        return {"heights": terrain.to_list(),
+                "checksum": terrain.checksum(),
+                "moved": moved}
+
+    def _reseat_on_terrain(self, ground_before: Dict[str, float]) -> List[Dict[str, Any]]:
+        """Put the objects that stood on the ground back on it after an edit."""
+        moved: List[Dict[str, Any]] = []
+        for oid, obj in self.world.objects.items():
+            if obj.type in self._BRUSH_SKIPS or obj.state != "INTACT":
+                continue
+            before = ground_before.get(oid)
+            if before is None or abs(obj.position[1] - before) > self._RESTING_TOLERANCE_M:
+                continue
+            ground = self.world.terrain.height_at(obj.position[0], obj.position[2])
+            if abs(ground - obj.position[1]) < 1e-4:
+                continue
+            obj.position = [obj.position[0], ground, obj.position[2]]
+            self.rigid.update_body(obj)
+            if self._affects_fluid_boundary(obj):
+                self.obstacle_revision += 1
+                self._obstacle_snapshot = None
+            moved.append({"id": oid, "position": obj.position})
+        return moved
 
     def apply_terrain_river(self, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """Replace the terrain with a generated river valley.

@@ -60,7 +60,6 @@ const net = new BackendClient(wsUrl, {
   onWorld: (world, simStatus, op, name) => applyWorld(world, simStatus, op, name),
   onSimState: (state) => {
     currentSimStatus = state.status;
-    editor.terrainEditingEnabled = state.status !== 'RUNNING';
     ui.setClock(state.time, state.status);
     ui.setSimStats(state);
     // the streaks draw what the solver applies, never the slider position
@@ -106,9 +105,17 @@ const net = new BackendClient(wsUrl, {
     ui.updateSewerReadout(sewer);
     if (pipeId) store.select(pipeId);
   },
-  onTerrainPatch: (heights, checksum) => {
+  onTerrainPatch: (heights, checksum, moved) => {
     store.terrain.loadHeights(heights);
     sceneManager.rebuildTerrain(store.terrain);
+    for (const m of moved) {
+      store.updateObject(m.id, { position: m.position });
+      const obj = store.objects.get(m.id);
+      if (obj) {
+        sceneManager.setObject(obj);
+        ui.updatePropertyInputs(obj);
+      }
+    }
     sceneManager.redrawPipes(store.objects.values());
     (globalThis as Record<string, unknown>).__terrainChecksum = checksum;
   },
@@ -199,7 +206,6 @@ function applyWorld(world: WorldData, simStatus: string, op?: string,
                     name?: string): void {
   currentSimStatus = simStatus;
   currentGravity = world.environment?.gravity ?? 9.81;
-  editor.terrainEditingEnabled = simStatus !== 'RUNNING';
   store.replaceWorld(world);
   sceneManager.rebuildTerrain(store.terrain);
   tsunamiWorld = world.water.tsunami_enabled ?? false;

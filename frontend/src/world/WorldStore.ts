@@ -47,10 +47,13 @@ export class WorldStore {
     this.waterVisible = world.water.visible;
     this.waterFrameTime = 0;
     this.waterFrameCount = 0;
-    this.selectedId = null;
     this.gauges.clear();
     this.gaugeHistory.clear();
     this.emit('world-replaced');
+    // Through select(), not a bare `selectedId = null`: the editor detaches its
+    // gizmo on selection-changed, and without the event it stayed on the old
+    // object's group -- which the world just replaced -- after RESET or LOAD.
+    this.select(null);
   }
 
   // ------------------------------------------------------------------ objects

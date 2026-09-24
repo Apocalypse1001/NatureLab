@@ -75,8 +75,10 @@ Coulomb friction. Semi-implicit integration drives INTACT/MOVING/FLOATING/SETTLE
 
 The map starts dry except for two prescribed source columns at the left boundary (`x=-50 m`).
 The selected Edge inflow level is enforced only there; every downstream cell becomes wet
-through physical flux. Terrain commands are rejected while RUNNING and accepted while
-IDLE/PAUSED.
+through physical flux. The terrain brush works in every state: while a run exists it reads
+the solver's GPU bed back first (erosion and frozen lava live there), brushes that, and
+hands the solver the new bed at once; objects resting on the ground inside the stroke are
+re-seated. The whole-map generators (river valley, volcano) are rejected while RUNNING.
 
 ## Protocol
 
