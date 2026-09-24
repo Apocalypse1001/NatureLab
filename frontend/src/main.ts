@@ -28,14 +28,16 @@ let tsunamiWorld = false;
  * East: only across an edge the solver treats as open; a "river" outlet runs
  * on at its depth, anything else (sea, pool) holds its level. West: a river
  * inlet arrives from upstream at its depth, a held edge inflow is a level.
- * North/south are walls in the solver; only a coast's sea runs on past them.
+ * North/south are walls in the solver; only a coast's sea runs on past them --
+ * and a surveyed site's open sides, where water runs off at its depth.
  */
 function edgeWaterModes(eastOpen: boolean, kind: OutletKind | undefined,
-                        inlet: boolean, edgeInflow: boolean, lava: boolean) {
+                        inlet: boolean, edgeInflow: boolean, lava: boolean,
+                        openSides = false) {
   if (lava) return { east: null, west: null, sides: null };
   const east = eastOpen || tsunamiWorld ? (kind === 'river' ? 'depth' : 'level') : null;
-  const west = inlet ? 'depth' : edgeInflow ? 'level' : null;
-  const sides = tsunamiWorld ? 'level' : null;
+  const west = inlet || openSides ? 'depth' : edgeInflow ? 'level' : null;
+  const sides = openSides ? 'depth' : tsunamiWorld ? 'level' : null;
   return { east, west, sides } as
     { east: EdgeWaterMode; west: EdgeWaterMode; sides: EdgeWaterMode };
 }
@@ -67,7 +69,8 @@ const net = new BackendClient(wsUrl, {
     const fluid = state.fluid;
     if (fluid && fluid.outflow_columns !== undefined) {
       const modes = edgeWaterModes(fluid.outflow_columns > 0, fluid.outlet_kind,
-        fluid.inlet_enabled ?? false, fluid.edge_inflow ?? false, fluid.lava_enabled ?? false);
+        fluid.inlet_enabled ?? false, fluid.edge_inflow ?? false, fluid.lava_enabled ?? false,
+        fluid.open_sides ?? false);
       sceneManager.setEdgeWater(modes.east, modes.west, modes.sides);
     }
     store.applyGaugeStates(state.gauges ?? [], state.gauge_history_capacity ?? 600);
@@ -211,7 +214,8 @@ function applyWorld(world: WorldData, simStatus: string, op?: string,
   sceneManager.rebuildTerrain(store.terrain);
   tsunamiWorld = world.water.tsunami_enabled ?? false;
   const modes = edgeWaterModes(world.water.outflow_enabled ?? true, world.water.outlet_kind,
-    world.water.inlet_enabled ?? false, world.water.edge_inflow_enabled ?? true, false);
+    world.water.inlet_enabled ?? false, world.water.edge_inflow_enabled ?? true, false,
+    world.water.open_sides ?? false);
   sceneManager.setEdgeWater(modes.east, modes.west, modes.sides);
   sceneManager.setWater(store.waterLevel, store.waterVisible);
   sceneManager.clearTracers();

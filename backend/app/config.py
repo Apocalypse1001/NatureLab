@@ -74,6 +74,10 @@ FLUID_MANNING_N = 0.03           # s/m^(1/3): a clean, straight natural channel
 # otherwise invisible to the flow. Now a street sheds rain faster than the grass
 # beside it, which is the whole reason a town has streets.
 PAVEMENT_MANNING_N = 0.013       # asphalt in fair repair; Chow's tables: 0.012-0.016
+# A surveyed site's open west/north/south edges (fluid_solver._apply_side_outflow)
+# drain on the bed slope measured over this much ground inward from the edge --
+# short, because on a 70 m window a longer fit reaches into the next feature.
+SIDE_OUTFLOW_REACH_M = 2.0
 # Surface classes a surveyed world carries per terrain vertex (TerrainGrid.surface),
 # code -> (name, Manning n). Code 0 means "no class": the world's own baseline n.
 # The n are priors from the middle of the ranges the NL01 site package gives in

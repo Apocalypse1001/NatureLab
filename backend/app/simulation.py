@@ -745,6 +745,8 @@ class SimulationManager:
         if hasattr(self.fluid, "set_erosion"):
             # read live, so the RiverLab toggle takes effect while RUNNING
             self.fluid.set_erosion(self.world.water.erosion_enabled)
+        if hasattr(self.fluid, "set_open_sides"):
+            self.fluid.set_open_sides(self.world.water.open_sides)
         if hasattr(self.fluid, "set_outflow"):
             water = self.world.water
             self.fluid.set_outflow(

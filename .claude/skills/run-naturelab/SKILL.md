@@ -233,6 +233,13 @@ Writes `releases/NatureLab_v<version>.zip` (frontend `dist/` included, `.git`/
   process spawns and kills its own backend, so every run starts at `IDLE, t=0.0s, 0
   objects`. `data/` is empty by default — nothing is auto-loaded.
 
+- **A surveyed site (Plot NL01) is not square and has no walls.** 139 x 179 cells of
+  0.5 m (`tools/make_site_nl01.py`, inputs in `data/sites/NL01/`, checked against the
+  package's MANIFEST). North is -z. `water.open_sides` opens W/N/S on the local ground
+  slope (`_apply_side_outflow`) and the east edge runs as a `"river"` outlet; per-side
+  outflow is `fluid.side_out_m3` [W, N, S]. The terrain checksum is pinned in
+  `SiteWorldTests` -- the measured DTM is the baseline; put grading, ditches and a
+  house in their own layers, not into the builder's terrain.
 - **Storm sewer (v0.17.0; manholes, chains and pipe depth v0.18.0): a pipe carries
   water, it does not hold it.** `STORM_INLET`, `MANHOLE`, `PIPE`, `OUTFALL`
   (`backend/app/sewer.py`). Fall is invert to invert: every node's

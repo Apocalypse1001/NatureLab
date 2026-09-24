@@ -93,6 +93,7 @@ export interface WorldData {
            // RainLab-1 (docs/14_rain_plan.md): rain in mm/h (= L/m² per hour),
            // and whether the west edge holds its inflow level at all
            rain_intensity_mm_h?: number; edge_inflow_enabled?: boolean;
+           open_sides?: boolean;
            tsunami_enabled?: boolean };
   environment: { gravity: number; wind: number[]; temperature: number };
   objects: ObjectData[];
@@ -126,6 +127,7 @@ export interface SimStateMessage {
             wet_cells?: number; volume_m3?: number; cfl_dt?: number;
             max_depth?: number; max_velocity?: number;
             erosion?: boolean; outflow_columns?: number; cfl_limited?: boolean;
+            open_sides?: boolean;
             outlet_kind?: OutletKind; lava_enabled?: boolean;
             // v0.12.0 river boundaries and their volume ledger
             inlet_enabled?: boolean; inlet_request_m3s?: number;

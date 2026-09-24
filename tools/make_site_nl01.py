@@ -273,10 +273,15 @@ def build() -> WorldState:
         gauges.append({"id": obj.id, "x": x, "z": z, "hollow_depth_m": round(depth, 3),
                        "hollow_volume_m3": round(volume, 2)})
 
-    # water: nothing enters from the edges; rain is the only source
+    # water: nothing enters from the edges; rain is the only source. Every
+    # edge lets water out on the ground's own slope there -- the survey stops
+    # at the window, the land does not (east: the "river" outlet, which is the
+    # same normal-depth rule; west, north, south: open_sides)
     world.water.level = 0.0
     world.water.edge_inflow_enabled = False
     world.water.outflow_enabled = True
+    world.water.outlet_kind = "river"
+    world.water.open_sides = True
     world.water.rain_intensity_mm_h = 0.0
 
     classes = {config.SURFACE_CLASSES[c][0]: int((surface == c).sum())
@@ -308,6 +313,7 @@ def build() -> WorldState:
         "soil": json.loads((SITE / "processed" / "soil_and_groundwater_summary.json")
                            .read_text(encoding="utf-8")),
         "input_sha256": hashes,
+        "edges": "all four open: water leaves at normal depth on the local ground slope",
         "not_modelled": ["infiltration", "pond and ditch beds", "underground drainage",
                          "run-on from outside the window"],
     }

@@ -515,6 +515,10 @@ class WaterState:
     # before RainLab behaves as it did); a rain-only world turns it off, or the
     # edge columns are rewritten every substep and rain falling there is lost.
     edge_inflow_enabled: bool = True
+    # A surveyed site: water leaves across the west, north and south edges too,
+    # on the ground's own slope there. Off everywhere else -- those edges are
+    # the walls a generated scene was built against.
+    open_sides: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {"level": self.level, "visible": self.visible,
@@ -541,6 +545,7 @@ class WaterState:
                 "tsunami_wave3_scale": self.tsunami_wave3_scale,
                 "rain_intensity_mm_h": self.rain_intensity_mm_h,
                 "edge_inflow_enabled": self.edge_inflow_enabled,
+                "open_sides": self.open_sides,
                 "initial_flow": self.initial_flow}
 
 
@@ -663,7 +668,8 @@ class WorldState:
             tsunami_wave3_scale=finite_number(water.get("tsunami_wave3_scale", 0.6),
                                               "water.tsunami_wave3_scale"),
             rain_intensity_mm_h=rain_intensity(water.get("rain_intensity_mm_h", 0.0)),
-            edge_inflow_enabled=bool(water.get("edge_inflow_enabled", True)))
+            edge_inflow_enabled=bool(water.get("edge_inflow_enabled", True)),
+            open_sides=bool(water.get("open_sides", False)))
         flow = water.get("initial_flow")
         if flow is not None:
             if (not isinstance(flow, dict) or not all(isinstance(flow.get(k), str)

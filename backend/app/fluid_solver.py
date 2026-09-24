@@ -537,6 +537,66 @@ if WARP_IMPORTED:
 
 
     @wp.kernel
+    def _apply_side_outflow(h: wp.array(dtype=float), h_start: wp.array(dtype=float),
+                            bed: wp.array(dtype=float),
+                            solid: wp.array(dtype=wp.int32),
+                            manning: wp.array(dtype=float),
+                            width: int, height: int, reach: int,
+                            dx: float, dt: float, gravity: float, dry: float,
+                            max_velocity: float, area: float,
+                            removed: wp.array(dtype=float),
+                            side_out: wp.array(dtype=float)):
+        """Let water leave across the west, north and south edges too (a site).
+
+        A surveyed plot is a window cut out of land that carries on past it, so
+        a wall there is wrong: water that runs to the edge ponds against it
+        (measured on NL01 in R90_15: 0.44 m standing at the west edge, in a
+        ditch that in reality runs on out of the window). What lies outside is
+        unknown, but the ground at the edge is not: each edge cell drains at
+        Manning normal-depth velocity on the bed slope falling toward the edge
+        over `reach` cells -- the terrain carrying on as it goes -- or on the
+        water surface's own slope if that is steeper, capped at critical,
+        sqrt(g h), which is the most a free edge can pass. Where neither falls
+        outward nothing leaves, so a lake at rest against the edge stays.
+
+        Reads depths from `h_start` (the depths before this kernel) so a corner
+        cell's neighbour is not read half-drained; removes from `h`, never more
+        than is there.
+        """
+        idx = wp.tid()
+        if solid[idx] != 0:
+            return
+        depth = h_start[idx]
+        if depth <= dry:
+            return
+        i = idx % width
+        j = idx // width
+        for side in range(3):
+            step = int(0)
+            if side == 0 and i == 0:
+                step = 1                  # west edge: inward is +x
+            elif side == 1 and j == 0:
+                step = width              # north edge (z = -max): inward is +z
+            elif side == 2 and j == height - 1:
+                step = -width             # south edge: inward is -z
+            if step != 0:
+                far = idx + reach * step
+                bed_slope = (bed[far] - bed[idx]) / (float(reach) * dx)
+                inner = idx + step
+                surface_slope = ((bed[inner] + h_start[inner]) - (bed[idx] + depth)) / dx
+                slope = wp.max(bed_slope, surface_slope)
+                if slope > 0.0:
+                    n = wp.max(manning[idx], 1.0e-3)
+                    speed = wp.pow(depth, 0.6666667) * wp.sqrt(slope) / n
+                    speed = wp.min(speed, wp.min(wp.sqrt(gravity * depth), max_velocity))
+                    volume = wp.min(h[idx] * area, speed * depth * dx * dt)
+                    if volume > 0.0:
+                        h[idx] = h[idx] - volume / area
+                        wp.atomic_add(removed, 0, volume)
+                        wp.atomic_add(side_out, side, volume)
+
+
+    @wp.kernel
     def _apply_point_sources(h: wp.array(dtype=float), bed: wp.array(dtype=float),
                              solid: wp.array(dtype=wp.int32),
                              centres: wp.array(dtype=wp.vec3),
@@ -1710,6 +1770,7 @@ class WarpShallowWaterSolver(FluidSolver):
         self._inlet_request = {"discharge_m3s": 0.0, "width_m": 0.0, "centre_z": 0.0}
         self._added_m3 = 0.0
         self._removed_m3 = 0.0
+        self._side_out_m3 = [0.0, 0.0, 0.0]
         self._sediment_out_m3 = 0.0
         self._sediment_in_m3 = 0.0
         self._volume_at_start = 0.0
@@ -1771,6 +1832,8 @@ class WarpShallowWaterSolver(FluidSolver):
         self._seen_terrain_revision = -1
         self._seen_obstacle_revision = -1
         self._seen_surface = None
+        self._open_sides = False
+        self._side_reach = 1
         self.terrain_gpu_uploads = 0
         self.obstacle_gpu_uploads = 0
         self.last_substeps = 0
@@ -1874,6 +1937,8 @@ class WarpShallowWaterSolver(FluidSolver):
         self._diag_stats = wp.zeros(STAT_COUNT, dtype=float, device=self.device)
         self._diag_added = wp.zeros(1, dtype=float, device=self.device)
         self._diag_removed = wp.zeros(1, dtype=float, device=self.device)
+        self._diag_side_out = wp.zeros(3, dtype=float, device=self.device)
+        self._side_scratch = wp.zeros(self._count, dtype=float, device=self.device)
         self._diag_sediment_out = wp.zeros(1, dtype=float, device=self.device)
         self._diag_sediment_in = wp.zeros(1, dtype=float, device=self.device)
         self._diag_solidified = wp.zeros(1, dtype=float, device=self.device)
@@ -1925,11 +1990,14 @@ class WarpShallowWaterSolver(FluidSolver):
         self._outflow_rows = (0, self._height - 1)
         self._added_m3 = 0.0
         self._removed_m3 = 0.0
+        self._side_out_m3 = [0.0, 0.0, 0.0]
         self._sediment_out_m3 = 0.0
         self._sediment_in_m3 = 0.0
         self._seen_terrain_revision = -1
         self._seen_obstacle_revision = -1
         self._seen_surface = None
+        self._open_sides = False
+        self._side_reach = 1
         self.terrain_gpu_uploads = 1
         self.obstacle_gpu_uploads = 1
         self.last_substeps = 0
@@ -2354,6 +2422,18 @@ class WarpShallowWaterSolver(FluidSolver):
         self._outlet_slope_host = slope.astype(np.float32)
         self._outlet_slope = wp.array(self._outlet_slope_host, dtype=float,
                                       device=self.device)
+
+    def set_open_sides(self, enabled: bool) -> None:
+        """Open the west, north and south edges as well (_apply_side_outflow).
+
+        Off on every generated world, where those edges are the walls the
+        scene was built against; on for a surveyed site, whose edges are just
+        where the survey stopped.
+        """
+        self._open_sides = bool(enabled)
+        cell = float(self._terrain.cell_size) if self._terrain is not None else 1.0
+        self._side_reach = max(1, min(self._width - 1, self._height - 1,
+                                      int(round(config.SIDE_OUTFLOW_REACH_M / cell))))
 
     def set_outflow(self, columns: int, centre_z: float = 0.0,
                     width_m: float = 0.0, kind: str = "overfall") -> None:
@@ -3026,6 +3106,16 @@ class WarpShallowWaterSolver(FluidSolver):
                                   float(self._terrain.cell_size), dt, area,
                                   self._diag_removed, self._diag_sediment_out],
                           device=self.device)
+            if self._open_sides:
+                wp.copy(self._side_scratch, self._h)
+                wp.launch(_apply_side_outflow, dim=self._count,
+                          inputs=[self._h, self._side_scratch, self._bed, self._obstacles,
+                                  self._manning, self._width, self._height,
+                                  self._side_reach, float(self._terrain.cell_size), dt,
+                                  gravity, config.FLUID_DRY_DEPTH,
+                                  config.FLUID_MAX_VELOCITY, area,
+                                  self._diag_removed, self._diag_side_out],
+                          device=self.device)
             if self._tsunami_enabled and tsunami_active:
                 # The sea level outside the map, now. An N-shape in TIME:
                 # negative (the sea withdrawing) before the centre, positive
@@ -3158,6 +3248,11 @@ class WarpShallowWaterSolver(FluidSolver):
             return
         self._added_m3 += float(self._diag_added.numpy()[0])
         self._removed_m3 += float(self._diag_removed.numpy()[0])
+        if self._open_sides:
+            side = self._diag_side_out.numpy()
+            for k in range(3):
+                self._side_out_m3[k] += float(side[k])
+            self._diag_side_out.zero_()
         self._sediment_out_m3 += float(self._diag_sediment_out.numpy()[0])
         self._sediment_in_m3 += float(self._diag_sediment_in.numpy()[0])
         self._diag_sediment_in.zero_()
@@ -3373,6 +3468,7 @@ class WarpShallowWaterSolver(FluidSolver):
         return {"solver": "warp_shallow_water", "device": self.device,
                 "erosion": self._erosion_enabled,
                 "outflow_columns": self._outflow_columns,
+                "open_sides": self._open_sides,
                 # v0.12.0 volume ledger. Without it a boundary condition cannot
                 # be shown to work: "water appears at the inlet" and "the right
                 # amount of water appears at the inlet" look identical on
@@ -3380,6 +3476,9 @@ class WarpShallowWaterSolver(FluidSolver):
                 # conservation error and should stay at numerical noise.
                 "added_m3": self._added_m3,
                 "removed_m3": self._removed_m3,
+                # per open side, west / north / south (the east edge's share is
+                # removed_m3 minus these and the drains); zeros when closed
+                "side_out_m3": [round(v, 4) for v in self._side_out_m3],
                 # Solidified lava leaves `h` exactly like outflow or a drain
                 # does, so it is added on the same side of the equation as
                 # `removed_m3` -- otherwise a correctly working solidification

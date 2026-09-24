@@ -4419,6 +4419,63 @@ class SiteWorldTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(rain, 90.0 / 3600.0 / 1000.0 * 140 * 180 * 0.25 * 60.0, delta=0.01)
         self.assertLess(abs(rain - out - volume) / rain, 0.01)
 
+    async def test_open_sides_leave_a_lake_at_rest(self) -> None:
+        # flat bed, level water to every edge: no slope falls outward anywhere
+        world = self._plot(60, 80, 0.5)
+        world.terrain.heights[:] = 0.0
+        world.water.open_sides = True
+        world.water.outflow_enabled = False
+        self.manager.world = world
+        self.manager.start()
+        self.manager.fluid._h.assign(np.full(61 * 81, 0.3, dtype=np.float32))
+        for _ in range(600):
+            self.manager._step_once()
+        self.assertEqual(self.manager.fluid.diagnostics()["side_out_m3"], [0.0, 0.0, 0.0])
+        still = 0.3 * 61 * 81 * 0.25
+        self.assertLess(abs(self.manager.fluid.diagnostics()["volume_m3"] - still) / still, 1e-4)
+
+    async def test_open_sides_drain_a_slope_off_the_west_edge(self) -> None:
+        world = self._plot(60, 80, 0.5)
+        jj, ii = np.mgrid[0:81, 0:61]
+        world.terrain.heights = (0.02 * ii * 0.5).astype(np.float32)   # falls west, 2 %
+        world.water.outflow_enabled = False                            # east is a wall
+        world.water.open_sides = True
+        self.manager.world = world
+        self.manager.apply_rain({"intensity_mm_h": 100.0})
+        self.manager.start()
+        for _ in range(int(120 / config.FIXED_DT)):
+            self.manager._step_once()
+        d = self.manager.fluid.diagnostics()
+        west, north, south = d["side_out_m3"]
+        rain = float(self.manager.fluid._rain_added_m3)
+        # the sheet is still running down 30 m of slope after two minutes, so a
+        # share of the rain has left, not all of it
+        self.assertGreater(west, 0.1 * rain)
+        self.assertGreater(west, 10.0 * (north + south))  # the sides fall west, not out
+        self.assertLess(abs(rain - self.manager.fluid._removed_m3 - d["volume_m3"]) / rain, 0.01)
+        # and nothing piles up against the west edge: its water is no deeper
+        # than the sheet running down the slope a few metres in
+        h = np.asarray(self.manager.fluid._h.numpy()).reshape(81, 61)
+        self.assertLess(float(h[5:-5, 0].mean()), 2.0 * float(h[5:-5, 10].mean()))
+
+    async def test_open_sides_are_off_unless_asked(self) -> None:
+        world = self._plot(60, 80, 0.5)
+        jj, ii = np.mgrid[0:81, 0:61]
+        world.terrain.heights = (0.02 * ii * 0.5).astype(np.float32)
+        world.water.outflow_enabled = False
+        self.manager.world = world
+        self.assertFalse(world.water.open_sides)
+        self.manager.apply_rain({"intensity_mm_h": 100.0})
+        self.manager.start()
+        for _ in range(600):
+            self.manager._step_once()
+        self.assertEqual(self.manager.fluid.diagnostics()["side_out_m3"], [0.0, 0.0, 0.0])
+        self.assertEqual(self.manager.fluid._removed_m3, 0.0)
+        again = WorldState.from_dict(json.loads(json.dumps({**world.to_dict()})))
+        self.assertFalse(again.water.open_sides)
+        world.water.open_sides = True
+        self.assertTrue(WorldState.from_dict(world.to_dict()).water.open_sides)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
