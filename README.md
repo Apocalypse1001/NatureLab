@@ -15,7 +15,9 @@ The backend is authoritative. The frontend draws, edits and measures — it neve
 motion. That distinction is the whole project: a prettier picture that hid the physics
 would defeat the point, so if the simulation is wrong, the screen shows it.
 
-Version 0.14.2. Backend suite 117/117, browser E2E 20/20, on an RTX 5090.
+Version 0.19.0, plus unreleased work on `master` — see
+[what is new since 0.14.2](README.ru.md#в-работе-после-0190--ещё-не-выпущено) (in Russian).
+Backend suite 173/173, browser E2E 25/25, on an RTX 5090.
 
 ---
 
@@ -37,7 +39,7 @@ drag coefficient and a friction coefficient, and the car moves when the numbers 
 
 ## Scenarios
 
-Four prepared worlds ship with it, in the **Scenarios** panel. All stay completely
+Seven prepared worlds ship with it, in the **Scenarios** panel. All stay completely
 editable: brush the terrain, move objects, change the discharge, press PLAY. River and
 Dam share the same small town — ten houses, a street, figures, a wood and a rubbish dump.
 
@@ -47,6 +49,9 @@ Dam share the same small town — ten houses, a street, figures, a wood and a ru
 | **Dam** | The same town, below a dam holding a reservoir. At the discharge it ships with, the spillway carries the river and the dam holds. Push Q past about 60 m³/s and the crest is overtopped after roughly six minutes of simulated time — or cut the crest with the terrain brush and watch it go at once. |
 | **Volcano** | A settlement on the flank of a generated cone, 36 m high on a 90 m base. Lava leaves the summit vent at 20 m³/s and 1150 °C, cools, thickens as it cools, and stops — the front settles at 48 m, measured on the real solver across three slopes. What it stops as is new ground the next flow runs over. Buildings inside the flow take damage; the village just past the measured front does not, until you raise the discharge. |
 | **Tsunami** | The one kilometre-scale world: 2 km across at 10 m cells, because how far the sea goes out is the drawdown divided by the beach slope, and a real gentle shore does not fit in 200 m. The wave is not seeded on the map — it arrives through the seaward edge. The sea withdraws about 110 m and bares the sea bed — the gauge that stood in shallow water is left holding under 2 mm, which this solver can neither soak away nor evaporate — and then the wave floods about 350 m inland and stands metres deep where it was dry. Water damages nothing in this build, so things are carried, not broken. |
+| **Bridge** | The river town with the road carried over the river on five piers, and a gauging line above and below it. Between the piers the water narrows from 15 to 6 m and speeds up to about critical flow; upstream it rises only about 3 cm. A real bridge narrowing a river this much would back it up by tens of centimetres, and the scene says so: this solver has no momentum advection, so it cannot. |
+| **Sewer** | A street in a storm at 50 mm/h, with storm grates and pipes into the river. The roofs shed their rain onto the street, the pipe behind the north row runs full at its 11 l/s after about six minutes, and a pond grows over its grate. Pipes are laid by clicking, can chain through manholes, and each node has its own depth. |
+| **Plot NL01** | A real 70 × 90 m parcel in Almere, from the Dutch open survey: AHN terrain at 0.5 m as measured, BGT surfaces (each with its own Manning roughness) and building outlines, heights from DSM − DTM. The edges are open on every side, because the survey window is not a wall. Not modelled yet, and the scenario card says so: infiltration, the pond and ditch beds, drains, run-on from outside. |
 
 The dam is **terrain, not an object**, and that is a physics decision. Solid obstacles are
 rasterized as infinitely tall walls, so an object dam could never be overtopped — and
@@ -60,11 +65,13 @@ the reservoir surface against the crest, `docs/probe_lava_v013.py` the lava run-
 where the drawback genuinely precedes the wave. The river figures come from the same
 headless path on the shipped world.
 
-All four are ordinary saved worlds, rebuilt with:
+The first six are ordinary saved worlds, rebuilt with:
 
 ```bat
 python tools\make_scenarios.py
 ```
+
+Plot NL01 is built from its survey package by `python tools\make_site_nl01.py`.
 
 The rubbish dump sits **upstream** of the town on purpose. Everything in it is light and
 draggy, so when the water arrives the rubbish is what moves first — and it moves into the
@@ -157,8 +164,8 @@ cd backend && python -m uvicorn app.main:app --host 127.0.0.1 --port 8756
 Node.js ≥ 22.12 and Chrome/Edge.
 
 ```bat
-python tests\test_backend.py     # 117 CUDA/Warp physics and regression tests
-node tests\e2e.mjs               # 20 browser + WebSocket checks, own backend on 8756
+python tests\test_backend.py     # 173 CUDA/Warp physics and regression tests
+node tests\e2e.mjs               # 25 browser + WebSocket checks, own backend on 8756
 ```
 
 The physics suite covers lake-at-rest, 1D symmetry, volume conservation, terrain barriers,
@@ -174,7 +181,7 @@ delivered Q, the drain's measured circulation, and the scenarios' layout rules.
 
 ```bat
 cd frontend && npm run build && cd ..
-python tools\make_release.py 0.14.2
+python tools\make_release.py 0.19.0
 ```
 
 Writes `releases\NatureLab_v<version>.zip` and records its SHA-256 in
@@ -206,8 +213,11 @@ build always reports which one it is.
 
 - **Lava meets water.** The one part of the volcano still unbuilt, and deliberately not
   rushed: two fields sharing a cell rather than one, quenching, steam, and evaporation.
-- **River and flood.** The 2Δx sawtooth mode still latent in the solver, erosion
-  calibration, a Q(t) hydrograph, and a gauging section with a Froude number.
+- **Plot NL01.** The real parcel needs its ditch and pond beds and their water level —
+  the survey has no ground under water — and then infiltration, read from the same
+  surface-class map.
+- **River.** Erosion calibration: measured on a long run, three defects named, off in
+  every shipped scenario.
 - **Soil moisture.** Swales, infiltration and roots — planned in full, not yet built.
 - **Debris flow.** A mountain valley, a cloudburst, and a mudflow that carries everything
   away. It shares the volcano's shape exactly — a transported scalar that drives viscosity
@@ -229,7 +239,11 @@ Stated plainly, because a teaching tool that overstates itself teaches the wrong
   a wave sweeps loose objects away, but it cannot break a house.
 - The evolved `h/u/v` field is not serialized by SAVE — a saved world restores its
   terrain, objects and boundary settings, not the water in flight.
-- No rain, no destruction, no vegetation physics, no replay.
+- No infiltration or evaporation: water leaves only over the map edge, into a drain or
+  into the storm sewer, so a sub-millimetre film stays on ground the sea has bared.
+- The solver is local-inertial (no momentum advection), so a bridge backs the river up
+  by centimetres where a real one would by tens of centimetres.
+- No destruction by water, no vegetation physics, no replay.
 - Erosion is off by default: the long-run incision feedback is not calibrated yet, and
   `docs/07_river_plan.md` records the measurement that has to come first.
 
